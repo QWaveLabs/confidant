@@ -72,3 +72,20 @@ export {
   SimulatedGoogleDriveConnector,
   SimulatedGoogleDrivePlugin
 } from "./connectors/simulated-google-drive-plugin.mjs";
+
+export {
+  OFFICIAL_WHATSAPP_BUSINESS_VERIFICATION_PROTOCOL,
+  WhatsAppSnapshotError,
+  beginWhatsAppPersonalSnapshot,
+  beginWhatsAppSnapshotImport,
+  confirmWhatsAppPersonalExport,
+  fetchApprovedWhatsAppSnapshotContent,
+  getWhatsAppOfficialBusinessStatus,
+  getWhatsAppSnapshotStatus,
+  grantWhatsAppSnapshotContent,
+  revokeWhatsAppSnapshotContent,
+  selectWhatsAppSnapshotMedia,
+  verifyWhatsAppOfficialBusinessConnection
+} from "./connectors/whatsapp-snapshot.mjs";
+
+export { SimulatedWhatsAppSnapshotConnector } from "./connectors/simulated-whatsapp-snapshot-adapter.mjs";
