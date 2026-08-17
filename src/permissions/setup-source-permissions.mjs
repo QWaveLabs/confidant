@@ -470,6 +470,12 @@ function normalizedScope(inputScope, review, kind, now) {
   const finalConversations = applyExclusions(selectedConversations, explicitConversationExclusions)
     .filter((conversationId) => !allowedBlockedGroupIds.includes(conversationId) || exceptions.includes(conversationId));
 
+  // `people.allowed` is an allowlist, not merely a display preference.  An
+  // omitted Allowed person must be excluded before a connector receives the
+  // grant; otherwise a caller could appear to narrow people while still
+  // receiving every Allowed participant's records.
+  const finalAllowedPeople = applyExclusions(allowedPeople, exclusions.people);
+
   const scope = {
     accountId: metadata.account.id,
     areas: applyExclusions(assertSubset(requested.areas, metadata.areas, "areas"), exclusions.areas),
@@ -478,7 +484,7 @@ function normalizedScope(inputScope, review, kind, now) {
     conversations: finalConversations,
     categories: finalCategories,
     people: {
-      allowed: applyExclusions(allowedPeople, exclusions.people),
+      allowed: finalAllowedPeople,
       // These two lists are persisted as privacy boundaries, never content allowlists.
       restricted: uniqueStrings([...restrictedPeople, ...metadata.people.filter((person) => person.accessLevel === "restricted").map((person) => person.id)]),
       blocked: uniqueStrings([...blockedPeople, ...metadata.people.filter((person) => person.accessLevel === "blocked").map((person) => person.id)])
@@ -488,7 +494,14 @@ function normalizedScope(inputScope, review, kind, now) {
       areas: uniqueStrings(exclusions.areas),
       folders: uniqueStrings(exclusions.folders),
       channels: uniqueStrings(exclusions.channels),
-      people: uniqueStrings([...exclusions.people ?? [], ...requested.people?.restricted ?? [], ...requested.people?.blocked ?? [], ...metadata.people.filter((person) => person.accessLevel !== "allowed").map((person) => person.id), ...metadata.unknownParticipantIds]),
+      people: uniqueStrings([
+        ...exclusions.people ?? [],
+        ...allPeople.filter((personId) => !finalAllowedPeople.includes(personId)),
+        ...requested.people?.restricted ?? [],
+        ...requested.people?.blocked ?? [],
+        ...metadata.people.filter((person) => person.accessLevel !== "allowed").map((person) => person.id),
+        ...metadata.unknownParticipantIds
+      ]),
       conversations: uniqueStrings([...explicitConversationExclusions, ...allowedBlockedGroupIds.filter((id) => !exceptions.includes(id))]),
       categories: uniqueStrings([...exclusions.categories ?? [], ...excludedSensitive]),
       dateRanges: []

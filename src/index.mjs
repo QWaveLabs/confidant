@@ -56,3 +56,20 @@ export {
   SimulatedIMessageLocalAdapter,
   SimulatedIMessageSnapshotConnector
 } from "./connectors/simulated-imessage-adapter.mjs";
+
+export {
+  SlackLifecycleError,
+  approveSlackBlockedGroupException,
+  authorizeSlackOfficialPlugin,
+  beginSlackConnection,
+  fetchApprovedSlackContent,
+  getSlackConnectionStatus,
+  grantSlackContent,
+  requestSlackBlockedGroupException,
+  revokeSlackContent
+} from "./connectors/slack.mjs";
+
+export {
+  SimulatedSlackOfficialPlugin,
+  SlackPluginError
+} from "./connectors/simulated-slack-plugin.mjs";
