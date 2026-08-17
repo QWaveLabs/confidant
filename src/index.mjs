@@ -89,3 +89,25 @@ export {
 } from "./connectors/gmail-readonly.mjs";
 
 export { SimulatedGmailPlugin } from "./connectors/simulated-gmail-plugin.mjs";
+
+export {
+  LIVE_CONNECTOR_RELEASE_GATE,
+  SOURCE_ADAPTER_NAMES,
+  SOURCE_HANDOFF_CATEGORIES,
+  SOURCE_STATE_VOCABULARY,
+  SOURCE_STATUS_STATES,
+  SourceStatusError,
+  beginSimulatedExportPreview,
+  buildSimulatedExportPermissionScope,
+  explainUnsupportedSource,
+  getSourceStatus,
+  getSourceStatusHandoff,
+  grantSimulatedExportPermission,
+  importSimulatedExportSnapshot,
+  normalizeAdapterSourceStatus,
+  resumeOptionalSource,
+  revokeSimulatedExportPermission,
+  skipOptionalSource
+} from "./source-status.mjs";
+
+export { SimulatedGenericExportAdapter } from "./connectors/simulated-generic-export.mjs";
