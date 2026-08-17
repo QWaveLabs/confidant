@@ -27,15 +27,29 @@ The included `SimulatedGenericExportAdapter` has no source SDK, no body-read ope
 3. One-time, snapshot-labelled import that returns only opaque references.
 4. Immediate close/revocation of the simulated one-time permission.
 
+If registration or import fails after the adapter may have seen a grant, the
+local record becomes `needs-attention` with a durable revocation generation.
+It cannot be skipped, restarted, or granted again until revocation is
+confirmed. A concurrent revoke wins over a stale import response; the stale
+response returns no snapshot references and cannot overwrite the persisted
+revoked state.
+
 Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, and the release-gate result.
 
 ## Release gate
 
-`at-least-one-live-verified-connector` is deliberately **unsatisfied** in this slice. Neither a simulation nor an adapter-reported state can label a source as live. The gate can only be satisfied by separately supplied, structured evidence of an independently verified read-only live connector; QWA-149 itself produces no such evidence.
+`at-least-one-live-verified-connector` is deliberately **unsatisfied** in this slice. Neither a simulation, an adapter-reported state, nor a caller-supplied evidence object can label a source as live. QWA-149 has no trusted persisted connector, grant, and independent-read verification record; a separately reviewed live-connector lifecycle must persist that evidence before the gate can change.
+
+## Verified checks
+
+- `npm run test:qwa-149` — **15/15** focused checks passed.
+- `npm test` — **73/73** repository checks passed.
+- `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
 
 ## Boundaries and limitations
 
 - No Gmail, Google Drive, Calendar, Slack, iMessage, WhatsApp, or real export source is accessed.
 - No source bodies, customer records, attachments, links, staging data, or secrets are stored in this proof.
 - Unsupported sources receive a safe explanation instead of a made-up connection, link, or live status.
+- Final handoff and the Gmail, Drive, and iMessage status lookups use saved local lifecycle state only. A provider denial or cancellation remains unfinished with its exact authorization outcome; it is never silently presented as a customer skip.
 - This is a status and simulated-export vertical slice, not a live connector release.

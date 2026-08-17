@@ -15,6 +15,7 @@ import {
   grantSourcePermission,
   revokeSourcePermission
 } from "../permissions/setup-source-permissions.mjs";
+import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
 const STATE_KEY = "imessageBetaLifecycle";
 const SOURCE = "imessage";
@@ -536,5 +537,9 @@ export async function getIMessageBetaStatus({ stateStore, accountId = "local-ime
   const entry = lifecycle(state).entries[entryKey(accountId)];
   if (!entry) return null;
   const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-  return { iMessageBeta: publicView(entry, languageFor(state, language), permission?.permissionReview) };
+  const locale = languageFor(state, language);
+  return {
+    iMessageBeta: publicView(entry, locale, permission?.permissionReview),
+    sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.IMESSAGE, accountId, language: locale })
+  };
 }

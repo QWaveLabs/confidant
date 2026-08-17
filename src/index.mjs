@@ -100,6 +100,7 @@ export {
   beginSimulatedExportPreview,
   buildSimulatedExportPermissionScope,
   explainUnsupportedSource,
+  getPersistedAdapterSourceStatus,
   getSourceStatus,
   getSourceStatusHandoff,
   grantSimulatedExportPermission,

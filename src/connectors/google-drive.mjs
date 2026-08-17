@@ -16,6 +16,7 @@ import {
   PermissionLifecycleError,
   revokeSourcePermission
 } from "../permissions/setup-source-permissions.mjs";
+import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
 const STATE_KEY = "googleDriveLifecycle";
 const SOURCE = "drive";
@@ -675,5 +676,9 @@ export async function getGoogleDriveConnectionStatus({ stateStore, accountId = "
   const entry = lifecycle(state).entries[entryKey(accountId)];
   if (!entry) return null;
   const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-  return { drive: publicView(entry, languageFor(state, language), permission?.permissionReview) };
+  const locale = languageFor(state, language);
+  return {
+    drive: publicView(entry, locale, permission?.permissionReview),
+    sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, accountId, language: locale })
+  };
 }

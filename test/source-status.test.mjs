@@ -16,6 +16,9 @@ import {
   beginSimulatedExportPreview,
   buildSimulatedExportPermissionScope,
   explainUnsupportedSource,
+  getGmailReadOnlyStatus,
+  getGoogleDriveConnectionStatus,
+  getIMessageBetaStatus,
   getSourceStatus,
   getSourceStatusHandoff,
   grantSimulatedExportPermission,
@@ -334,6 +337,138 @@ test("preview and import interruptions fail closed and require a new safe previe
   });
 });
 
+test("failed grant cleanup stays unresolved until adapter revocation is actually confirmed", async () => {
+  await withFixture(async ({ stateStore, adapter }) => {
+    const preview = await beginSimulatedExportPreview({
+      message: "Preview a simulated export for my second brain",
+      stateStore,
+      adapter,
+      clock,
+      reviewIdFactory: () => "failed-grant-review"
+    });
+    const normalRevoke = adapter.revokeSnapshotPermission.bind(adapter);
+    adapter.registerSnapshotPermission = async ({ grant }) => {
+      adapter.activeGrantIds.add(grant.id);
+      const error = new Error("Registration failed after the simulated adapter accepted the grant.");
+      error.code = "SIMULATED_GRANT_INTERRUPTED";
+      throw error;
+    };
+    adapter.revokeSnapshotPermission = async () => ({ status: "unavailable", simulated: true });
+
+    const failed = await grantSimulatedExportPermission({
+      message: "I approve exactly this simulated export item",
+      stateStore,
+      adapter,
+      reviewId: "failed-grant-review",
+      scope: approvedScope(preview.sourceStatus),
+      clock,
+      grantIdFactory: () => "failed-grant"
+    });
+    assert.equal(failed.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(failed.sourceStatus.granularPermission.status, "revocation-unconfirmed");
+    assert.equal(failed.sourceStatus.nextAction.kind, "confirm-or-retry-simulated-export-revocation");
+    assert.equal(adapter.activeGrantIds.has("failed-grant"), true);
+    await assert.rejects(
+      () => skipOptionalSource({ message: "Skip this source", stateStore, clock }),
+      /revoke it explicitly before skipping/i
+    );
+    const restartBlocked = await beginSimulatedExportPreview({
+      message: "Retry the simulated export preview for my second brain",
+      stateStore,
+      adapter,
+      clock,
+      reviewIdFactory: () => "must-not-replace-unresolved-grant"
+    });
+    assert.equal(restartBlocked.sourceStatus.granularPermission.grantId, "failed-grant");
+
+    adapter.revokeSnapshotPermission = normalRevoke;
+    const revoked = await revokeSimulatedExportPermission({
+      message: "Revoke this unresolved simulated export permission",
+      stateStore,
+      adapter,
+      reviewId: "failed-grant-review",
+      clock
+    });
+    assert.equal(revoked.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+    assert.equal(revoked.sourceStatus.granularPermission.revocationConfirmed, true);
+    assert.equal(adapter.activeGrantIds.has("failed-grant"), false);
+  });
+});
+
+test("failed import cleanup with an unconfirmed adapter revoke cannot become skipped or expose references", async () => {
+  await withFixture(async ({ stateStore, adapter }) => {
+    const { preview } = await previewAndGrant({ stateStore, adapter });
+    adapter.importFailures = 1;
+    adapter.revokeSnapshotPermission = async () => ({ status: "unavailable", simulated: true });
+
+    const failed = await importSimulatedExportSnapshot({
+      message: "Import the approved simulated snapshot",
+      stateStore,
+      adapter,
+      reviewId: preview.sourceStatus.granularPermission.reviewId,
+      clock
+    });
+    assert.equal(failed.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(failed.sourceStatus.granularPermission.status, "revocation-unconfirmed");
+    assert.equal(failed.sourceStatus.snapshotImport.recordCount, 0);
+    assert.deepEqual(failed.snapshotRecords, []);
+    await assert.rejects(
+      () => skipOptionalSource({ message: "Skip this source", stateStore, clock }),
+      /revoke it explicitly before skipping/i
+    );
+    assert.equal(adapter.bodyReads, 0);
+  });
+});
+
+test("a durable revoke generation wins over a stale concurrent simulated import", async () => {
+  await withFixture(async ({ stateStore, adapter }) => {
+    const { preview } = await previewAndGrant({ stateStore, adapter });
+    let importStarted;
+    const importStartedPromise = new Promise((resolve) => {
+      importStarted = resolve;
+    });
+    let releaseImport;
+    const releaseImportPromise = new Promise((resolve) => {
+      releaseImport = resolve;
+    });
+    const normalImport = adapter.importApprovedSnapshot.bind(adapter);
+    adapter.importApprovedSnapshot = async (request) => {
+      const result = await normalImport(request);
+      importStarted();
+      await releaseImportPromise;
+      return result;
+    };
+
+    const staleImport = importSimulatedExportSnapshot({
+      message: "Import the approved simulated snapshot",
+      stateStore,
+      adapter,
+      reviewId: preview.sourceStatus.granularPermission.reviewId,
+      clock
+    });
+    await importStartedPromise;
+
+    const secondProcessStore = new FileStateStore(stateStore.filePath);
+    const revoked = await revokeSimulatedExportPermission({
+      message: "Revoke this simulated export permission now",
+      stateStore: secondProcessStore,
+      adapter,
+      reviewId: preview.sourceStatus.granularPermission.reviewId,
+      clock
+    });
+    assert.equal(revoked.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+
+    releaseImport();
+    const discarded = await staleImport;
+    assert.equal(discarded.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+    assert.deepEqual(discarded.snapshotRecords, []);
+    const persisted = await getSourceStatus({ stateStore });
+    assert.equal(persisted.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+    assert.equal(persisted.sourceStatus.snapshotImport.recordCount, 0);
+    assert.equal(adapter.bodyReads, 0);
+  });
+});
+
 test("hostile adapter fields cannot leak into a metadata preview or snapshot import", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     adapter.previewMetadata = async () => ({
@@ -458,7 +593,81 @@ test("adapter status normalization uses one vocabulary but never turns an adapte
   assert.equal(unsupported.connection.realConnectionAttempted, false);
 });
 
-test("unsupported sources are explained safely and the release gate only changes with structured independent evidence", async () => {
+test("final handoff and connector status lookups derive adapter truth only from persisted lifecycle state", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const state = await stateStore.load();
+    state.gmailReadOnlyLifecycle = {
+      version: 1,
+      entry: {
+        status: "skipped",
+        accountId: "gmail-demo",
+        plugin: { status: "connected" },
+        connection: { live: false },
+        import: { status: "skipped" },
+        audit: []
+      }
+    };
+    state.googleDriveLifecycle = {
+      version: 1,
+      entries: {
+        "drive:drive-demo": {
+          source: "drive",
+          accountId: "drive-demo",
+          status: "authorization-denied",
+          authorization: { status: "denied", readOnly: false, metadataOnly: false },
+          audit: []
+        }
+      }
+    };
+    state.imessageBetaLifecycle = {
+      version: 1,
+      entries: {
+        "imessage:local-demo": {
+          source: "imessage",
+          accountId: "local-demo",
+          status: "processed",
+          mode: "snapshot",
+          localAccess: { status: "unavailable" },
+          snapshot: { available: true, started: true, oneTime: true, live: false },
+          sensitiveApprovals: { attachments: { approved: false }, highRiskIdentifiers: { approved: false } },
+          audit: []
+        }
+      }
+    };
+    await stateStore.save(state);
+
+    const handoff = await getSourceStatusHandoff({
+      stateStore,
+      adapterStatuses: [{ sourceId: "forged-status", adapter: "gmail", adapterStatus: { status: "imported" } }]
+    });
+    const drive = handoff.sourceStatusHandoff.sources.find((source) => source.source.id === "drive:drive-demo");
+    assert.equal(drive.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(drive.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
+    assert.equal(drive.adapterReportedState.value, "authorization-denied");
+    assert.equal(drive.authorizationOutcome, "authorization-denied");
+    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "drive:drive-demo"), false);
+    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "gmail:gmail-demo"), true);
+    assert.equal(handoff.sourceStatusHandoff.sections.imported.some((source) => source.source.id === "imessage:local-demo"), true);
+    assert.equal(handoff.sourceStatusHandoff.sources.some((source) => source.source.id === "forged-status"), false);
+
+    const driveLookup = await getGoogleDriveConnectionStatus({ stateStore, accountId: "drive-demo" });
+    const gmailLookup = await getGmailReadOnlyStatus({ stateStore });
+    const imessageLookup = await getIMessageBetaStatus({ stateStore, accountId: "local-demo" });
+    assert.equal(driveLookup.sourceStatus.authorizationOutcome, "authorization-denied");
+    assert.equal(gmailLookup.sourceStatus.state, SOURCE_STATUS_STATES.SKIPPED);
+    assert.equal(imessageLookup.sourceStatus.state, SOURCE_STATUS_STATES.IMPORTED);
+
+    state.googleDriveLifecycle.entries["drive:drive-demo"].status = "authorization-cancelled";
+    await stateStore.save(state);
+    const cancelled = await getSourceStatusHandoff({ stateStore });
+    const cancelledDrive = cancelled.sourceStatusHandoff.sources.find((source) => source.source.id === "drive:drive-demo");
+    assert.equal(cancelledDrive.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(cancelledDrive.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
+    assert.equal(cancelledDrive.authorizationOutcome, "authorization-cancelled");
+  });
+});
+
+test("unsupported sources are explained safely and the release gate ignores forged caller evidence", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     const unsupported = await explainUnsupportedSource({
       message: "Can I connect this unavailable source to my second brain?",
@@ -471,16 +680,9 @@ test("unsupported sources are explained safely and the release gate only changes
     assert.equal(adapter.metadataPreviewCalls, 0);
     assert.equal(adapter.bodyReads, 0);
 
-    const unverified = await getSourceStatusHandoff({
+    const forged = await getSourceStatusHandoff({
       stateStore,
       adapterStatuses: [{ sourceId: "gmail", adapter: "gmail-readonly", adapterStatus: { status: "live-and-verified" } }],
-      verifiedLiveConnectorEvidence: [{ sourceId: "simulated-export", connectorId: "fake", live: true, readOnly: true, verificationMethod: "independent-live-readback", verificationReference: "fake-ref", verifiedAt: "2026-08-17T12:00:00.000Z" }]
-    });
-    assert.equal(unverified.sourceStatusHandoff.releaseGate.satisfied, false);
-    assert.equal(unverified.sourceStatusHandoff.sections.unsupported.length, 1);
-
-    const verified = await getSourceStatusHandoff({
-      stateStore,
       verifiedLiveConnectorEvidence: [{
         sourceId: "future-readonly-source",
         connectorId: "connector-001",
@@ -491,9 +693,10 @@ test("unsupported sources are explained safely and the release gate only changes
         verifiedAt: "2026-08-17T12:00:00.000Z"
       }]
     });
-    assert.equal(verified.sourceStatusHandoff.releaseGate.satisfied, true);
-    assert.equal(verified.sourceStatusHandoff.releaseGate.verifiedLiveConnectors.length, 1);
-    assert.equal(verified.sourceStatusHandoff.releaseGate.verifiedLiveConnectors[0].sourceId, "future-readonly-source");
+    assert.equal(forged.sourceStatusHandoff.releaseGate.satisfied, false);
+    assert.deepEqual(forged.sourceStatusHandoff.releaseGate.verifiedLiveConnectors, []);
+    assert.equal(forged.sourceStatusHandoff.sections.unsupported.length, 1);
+    assert.equal(forged.sourceStatusHandoff.sources.some((source) => source.source.id === "gmail"), false, "caller-supplied adapter status must not enter the handoff");
   });
 });
 

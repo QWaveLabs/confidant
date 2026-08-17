@@ -16,6 +16,7 @@ import {
   grantSourcePermission,
   revokeSourcePermission
 } from "../permissions/setup-source-permissions.mjs";
+import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
 const SOURCE = "gmail";
 const STATE_KEY = "gmailReadOnlyLifecycle";
@@ -987,5 +988,8 @@ export async function getGmailReadOnlyStatus({ stateStore, language } = {}) {
   if (!entry) return null;
   const locale = languageFor(state, language);
   const permission = entry.accountId ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
-  return { gmail: publicView(entry, locale, permission?.permissionReview) };
+  return {
+    gmail: publicView(entry, locale, permission?.permissionReview),
+    sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GMAIL, accountId: entry.accountId, language: locale })
+  };
 }
