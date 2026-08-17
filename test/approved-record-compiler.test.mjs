@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -36,18 +36,30 @@ function scopeForApproval(review) {
   return scope;
 }
 
-async function approveFixtureSource({ stateStore, source, accountId, sourceRecordId, language = "en" }) {
+async function approveFixtureSource({
+  stateStore,
+  source,
+  accountId,
+  sourceRecordId,
+  language = "en",
+  sourceTimestamp = startedAt,
+  participantRefs = [],
+  sourceLabel = "Fixture metadata only",
+  stableLink = null
+}) {
   const connector = new SimulatedReadOnlyConnector({
     source,
     account: { id: accountId, label: "Fixture account" },
+    people: participantRefs.map((id) => ({ id, label: `Fixture ${id}`, accessLevel: "allowed" })),
     items: [{
       id: sourceRecordId,
       kind: "item",
       area: "fixture-area",
       category: "planning",
-      timestamp: startedAt,
-      participantIds: [],
-      label: "Fixture metadata only"
+      timestamp: sourceTimestamp,
+      participantIds: participantRefs,
+      label: sourceLabel,
+      stableLink
     }]
   });
   const reviewId = `${source}-fixture-review`;
@@ -79,7 +91,11 @@ async function approveFixtureSource({ stateStore, source, accountId, sourceRecor
     accountId,
     sourceRecordId,
     reviewId,
-    grantId
+    grantId,
+    sourceTimestamp,
+    participantRefs,
+    sourceLabel,
+    stableLink
   };
 }
 
@@ -107,6 +123,8 @@ async function withCompilerFixture(run, { language = "en" } = {}) {
       source: "gmail",
       accountId: "fixture-gmail-account",
       sourceRecordId: "fixture-mail-001",
+      participantRefs: ["person-fixture-alex"],
+      stableLink: "https://fixture.example.test/mail/fixture-mail-001",
       language
     });
     const calendar = await approveFixtureSource({
@@ -130,10 +148,34 @@ function approvedRecord(permission, assertions, overrides = {}) {
     reviewId: permission.reviewId,
     grantId: permission.grantId,
     processingDisposition: "untrusted-inert-reference",
+    sourceTimestamp: permission.sourceTimestamp,
+    approvedParticipantRefs: permission.participantRefs,
+    sourceLabel: permission.sourceLabel,
+    stableLink: permission.stableLink,
     observedAt: startedAt,
     verifiedAt: laterToday,
     privacyRestrictions: ["private", "no-external-sharing"],
     assertions,
+    ...overrides
+  };
+}
+
+function inertStagingRecord(overrides = {}) {
+  return {
+    source: "fixture",
+    accountId: "fixture-account",
+    sourceRecordId: "fixture-record",
+    reviewId: "fixture-review",
+    grantId: "fixture-grant",
+    processingDisposition: "untrusted-inert-reference",
+    sourceTimestamp: startedAt,
+    approvedParticipantRefs: [],
+    sourceLabel: null,
+    stableLink: null,
+    observedAt: startedAt,
+    verifiedAt: laterToday,
+    privacyRestrictions: ["private"],
+    assertions: [assertion("knowledge", "knowledge-fixture-staging", "Staging", "The direct staging contract is normalized.")],
     ...overrides
   };
 }
@@ -187,6 +229,23 @@ class FailOnceReadStaging {
   async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
 }
 
+class FailNextSaveStateStore {
+  constructor(delegate) {
+    this.delegate = delegate;
+    this.failNextSave = false;
+  }
+
+  async load() { return this.delegate.load(); }
+
+  async save(state) {
+    if (this.failNextSave) {
+      this.failNextSave = false;
+      throw new Error("Simulated private state save interruption.");
+    }
+    return this.delegate.save(state);
+  }
+}
+
 test("approved references compile into sourced canonical notes for every QWA-146 subject category without retaining staging", async () => {
   await withCompilerFixture(async ({ directory, stateStore, staging, gmail, calendar }) => {
     const result = await compileApprovedRecords({
@@ -220,7 +279,18 @@ test("approved references compile into sourced canonical notes for every QWA-146
       assert.equal(claim.verifiedAt, laterToday);
       assert.deepEqual(claim.privacyRestrictions, ["no-external-sharing", "private"]);
       assert.equal(claim.sourceReferences.length, 1);
-      assert.match(claim.sourceReferences[0].sourceRecordId, /^fixture-(mail|event)-001$/);
+      const reference = claim.sourceReferences[0];
+      assert.match(reference.sourceRecordId, /^fixture-(mail|event)-001$/);
+      assert.equal(reference.sourceTimestamp, startedAt);
+      assert.equal(reference.processedAt, laterToday);
+      assert.equal(reference.sourceLabel, "Fixture metadata only");
+      if (reference.source === "gmail") {
+        assert.deepEqual(reference.approvedParticipantRefs, ["person-fixture-alex"]);
+        assert.equal(reference.stableLink, "https://fixture.example.test/mail/fixture-mail-001");
+      } else {
+        assert.deepEqual(reference.approvedParticipantRefs, []);
+        assert.equal(reference.stableLink, null);
+      }
     }
 
     const personNote = result.canonicalNotes.find((note) => note.subject.type === "people");
@@ -230,6 +300,8 @@ test("approved references compile into sourced canonical notes for every QWA-146
     assert.match(personNote.content, /user-owned and is never overwritten/);
     assert.match(personNote.content, /Fixture Alex owns the Atlas project/);
     assert.match(personNote.content, /claim-[a-f0-9]{20}/);
+    assert.match(personNote.content, /Approved participant references: `person-fixture-alex`/);
+    assert.match(personNote.content, /Stable link/);
 
     const gmailIndex = result.sourceIndexes.find((index) => index.source === "gmail");
     assert.match(gmailIndex.path, /^Sources\/gmail--fixture-gmail-account\.md$/);
@@ -237,6 +309,9 @@ test("approved references compile into sourced canonical notes for every QWA-146
     assert.match(gmailIndex.content, /\[\[People\/person-fixture-alex\]\]/);
     assert.equal(gmailIndex.content.includes("Fixture Alex owns the Atlas project."), false, "source indexes navigate but do not duplicate claim authority");
     assert.equal(Object.hasOwn(gmailIndex.entries[0], "assertion"), false);
+    assert.equal(gmailIndex.entries[0].sourceTimestamp, startedAt);
+    assert.deepEqual(gmailIndex.entries[0].approvedParticipantRefs, ["person-fixture-alex"]);
+    assert.equal(gmailIndex.entries[0].stableLink, "https://fixture.example.test/mail/fixture-mail-001");
 
     assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
     assert.equal(JSON.stringify(result).includes(directory), false, "public output never exposes a local staging path");
@@ -256,7 +331,7 @@ test("Spanish output renders unknown evidence explicitly instead of inventing a 
       batchId: "fixture-spanish-unknown",
       approvedRecords: [approvedRecord(gmail, [
         assertion("knowledge", "knowledge-fixture-unknown", "Nota pendiente", null, "uncertain", ["private"])
-      ], { verifiedAt: null })],
+      ], { verifiedAt: null, sourceLabel: null })],
       language: "es",
       clock: clockAt(laterToday)
     });
@@ -267,6 +342,7 @@ test("Spanish output renders unknown evidence explicitly instead of inventing a 
     assert.match(result.canonicalNotes[0].content, /Afirmaciones canónicas generadas/);
     assert.match(result.canonicalNotes[0].content, /Desconocido \(sin evidencia aprobada\)/);
     assert.match(result.canonicalNotes[0].content, /Tus notas/);
+    assert.match(result.canonicalNotes[0].content, /Approved gmail reference/);
     assert.match(result.compilation.message, /notas canónicas/i);
   }, { language: "es" });
 });
@@ -315,6 +391,34 @@ test("raw fields, slash commands, and records without an active granular grant f
   });
 });
 
+test("safe per-source provenance must exactly match the reviewed QWA-139 metadata before staging", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const base = approvedRecord(gmail, [
+      assertion("knowledge", "knowledge-fixture-provenance", "Provenance", "Only reviewed provenance reaches a canonical note.")
+    ]);
+    const mismatches = [
+      { batchId: "fixture-source-time-mismatch", record: { ...base, sourceTimestamp: laterToday } },
+      { batchId: "fixture-participant-mismatch", record: { ...base, approvedParticipantRefs: ["person-fixture-other"] } },
+      { batchId: "fixture-label-mismatch", record: { ...base, sourceLabel: "Different safe metadata label" } },
+      { batchId: "fixture-link-mismatch", record: { ...base, stableLink: "https://fixture.example.test/mail/different-reference" } }
+    ];
+    for (const mismatch of mismatches) {
+      await assert.rejects(
+        () => compileApprovedRecords({
+          message: "Compile my approved notes",
+          stateStore,
+          staging,
+          batchId: mismatch.batchId,
+          approvedRecords: [mismatch.record],
+          clock: clockAt(laterToday)
+        }),
+        (error) => error instanceof KnowledgeCompilationError && error.code === "SOURCE_PROVENANCE_INVALID"
+      );
+    }
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
 test("temporary staging rejects repository roots and symlink escapes", async () => {
   await assert.rejects(
     async () => new LocalTemporaryStaging({ root: path.join(process.cwd(), ".qwave-second-brain-staging") }),
@@ -335,7 +439,7 @@ test("temporary staging rejects repository roots and symlink escapes", async () 
     await symlink(target, symlinkRoot);
     const linked = new LocalTemporaryStaging({ root: symlinkRoot });
     await assert.rejects(
-      () => linked.stage({ batchId: "linked-batch", records: [{}], createdAt: startedAt }),
+      () => linked.stage({ batchId: "linked-batch", records: [inertStagingRecord()], createdAt: startedAt }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_SYMLINK_BLOCKED"
     );
 
@@ -347,6 +451,18 @@ test("temporary staging rejects repository roots and symlink escapes", async () 
       () => safeStaging.stage({ batchId: "raw-shape-batch", records: [{ body: "blocked" }], createdAt: startedAt }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "RAW_SOURCE_FIELD_BLOCKED"
     );
+    await assert.rejects(
+      () => safeStaging.stage({ batchId: "missing-schema-batch", records: [{}], createdAt: startedAt }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "SOURCE_REFERENCE_INVALID"
+    );
+    await assert.rejects(
+      () => safeStaging.stage({
+        batchId: "missing-provenance-batch",
+        records: [inertStagingRecord({ sourceTimestamp: undefined })],
+        createdAt: startedAt
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "SOURCE_TIMESTAMP_REQUIRED"
+    );
     const outside = path.join(directory, "outside.json");
     await writeFile(outside, "{}\n", "utf8");
     await symlink(outside, path.join(safeRoot, "batch-symlink-batch.json"));
@@ -355,13 +471,13 @@ test("temporary staging rejects repository roots and symlink escapes", async () 
       (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_SYMLINK_BLOCKED"
     );
 
-    await safeStaging.stage({ batchId: "tampered-expiry", records: [{ id: "fixture" }], createdAt: startedAt });
+    await safeStaging.stage({ batchId: "tampered-expiry", records: [inertStagingRecord()], createdAt: startedAt });
     await writeFile(path.join(safeRoot, "batch-tampered-expiry.json"), JSON.stringify({
       version: 1,
       batchId: "tampered-expiry",
       createdAt: startedAt,
       expiresAt: "2030-01-01T00:00:00.000Z",
-      records: [{ id: "fixture" }]
+      records: [inertStagingRecord()]
     }), "utf8");
     const tamperCleanup = await safeStaging.cleanupExpired({ now: laterToday });
     assert.deepEqual(tamperCleanup.removedBatchIds, ["symlink-batch", "tampered-expiry"]);
@@ -432,6 +548,92 @@ test("a transient staging interruption resumes the same protected batch and dele
       clock: clockAt("2026-08-17T13:06:00.000Z")
     });
     assert.deepEqual(idempotent.claims, resumed.claims);
+  });
+});
+
+test("a disk-staged batch reconciles after a private state-save interruption instead of reporting STAGING_BATCH_EXISTS", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const interruptedStore = new FailNextSaveStateStore(stateStore);
+    interruptedStore.failNextSave = true;
+    const records = [approvedRecord(gmail, [
+      assertion("projects", "project-fixture-state-retry", "State retry project", "The durable stage can reconcile after a private state interruption.")
+    ])];
+
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Compile my approved notes",
+        stateStore: interruptedStore,
+        staging,
+        batchId: "fixture-state-save-retry",
+        approvedRecords: records,
+        clock: clockAt(laterToday)
+      }),
+      /Simulated private state save interruption/
+    );
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), ["batch-fixture-state-save-retry.json"]);
+
+    // Recreate the adapter to model a restart: recovery comes from the
+    // bounded on-disk batch, not from the prior instance's memory.
+    const restartedStaging = new LocalTemporaryStaging({ root: path.join(directory, ".qwave-second-brain-staging") });
+    const resumed = await compileApprovedRecords({
+      message: "Continue compiling my approved notes",
+      stateStore: interruptedStore,
+      staging: restartedStaging,
+      batchId: "fixture-state-save-retry",
+      clock: clockAt("2026-08-17T13:05:00.000Z")
+    });
+    assert.equal(resumed.compilation.status, "compiled");
+    assert.equal(resumed.claims.length, 1);
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+
+    const state = await stateStore.load();
+    const entry = state.knowledgeCompilationLifecycle.batches["fixture-state-save-retry"];
+    assert.equal(entry.audit.some((event) => event.type === "approved-normalized-records-reconciled-after-state-save-interruption"), true);
+    assert.equal(entry.audit.some((event) => event.reason === "STAGING_BATCH_EXISTS"), false);
+  });
+});
+
+test("an untracked disk stage is discarded if its QWA-139 grant is revoked before recovery", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const interruptedStore = new FailNextSaveStateStore(stateStore);
+    interruptedStore.failNextSave = true;
+    const batchId = "fixture-untracked-revoked";
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Compile my approved notes",
+        stateStore: interruptedStore,
+        staging,
+        batchId,
+        approvedRecords: [approvedRecord(gmail, [
+          assertion("decisions", "decision-fixture-untracked-revoked", "Untracked revoked", "A revoked grant cannot recover an untracked stage.")
+        ])],
+        clock: clockAt(laterToday)
+      }),
+      /Simulated private state save interruption/
+    );
+    await revokeSourcePermission({
+      message: "Revoke this source permission",
+      stateStore,
+      connector: gmail.connector,
+      source: gmail.source,
+      accountId: gmail.accountId,
+      reviewId: gmail.reviewId,
+      clock: clockAt("2026-08-17T13:01:00.000Z")
+    });
+
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Continue compiling my approved notes",
+        stateStore: interruptedStore,
+        staging: new LocalTemporaryStaging({ root: path.join(directory, ".qwave-second-brain-staging") }),
+        batchId,
+        clock: clockAt("2026-08-17T13:02:00.000Z")
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "ACTIVE_GRANT_REQUIRED"
+    );
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "discarded");
   });
 });
 
@@ -506,5 +708,42 @@ test("the 24-hour cleanup deletes interrupted staging and makes resume fail clos
       }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_EXPIRED"
     );
+  });
+});
+
+test("a fresh staging adapter removes an expired durable batch on restart and leaves an expiry tombstone", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const interruptedStaging = new FailOnceReadStaging(staging);
+    const batchId = "fixture-restart-expiry";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: interruptedStaging,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("meetings", "meeting-fixture-restart-expiry", "Restart expiry", "The durable staging expiry is checked after a restart.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedPath = path.join(directory, ".qwave-second-brain-staging", `batch-${batchId}.json`);
+    const stale = JSON.parse(await readFile(stagedPath, "utf8"));
+    stale.createdAt = "2020-01-01T00:00:00.000Z";
+    stale.expiresAt = "2020-01-02T00:00:00.000Z";
+    await writeFile(stagedPath, `${JSON.stringify(stale)}\n`, "utf8");
+
+    const restartedStaging = new LocalTemporaryStaging({ root: path.join(directory, ".qwave-second-brain-staging") });
+    await restartedStaging.initialize();
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: restartedStaging,
+      clock: clockAt("2026-08-17T13:00:00.000Z")
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, [batchId]);
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "expired");
+    assert.equal(status.compilation.staging.status, "expired-deleted");
   });
 });

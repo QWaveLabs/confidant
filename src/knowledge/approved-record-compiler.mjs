@@ -69,6 +69,10 @@ const RECORD_FIELDS = new Set([
   "reviewId",
   "grantId",
   "processingDisposition",
+  "sourceTimestamp",
+  "approvedParticipantRefs",
+  "sourceLabel",
+  "stableLink",
   "observedAt",
   "verifiedAt",
   "privacyRestrictions",
@@ -163,6 +167,12 @@ function wording(language) {
       sourceReference: "Referencia de fuente",
       review: "revisión",
       grant: "concesión",
+      sourceTimestamp: "Fecha de la fuente",
+      participants: "Referencias de participantes aprobadas",
+      sourceLabel: "Etiqueta de fuente aprobada",
+      stableLink: "Enlace estable",
+      noStableLink: "Sin enlace estable aprobado",
+      processed: "Procesado",
       simulated: "Simulación local; no se leyó ninguna fuente real."
     };
   }
@@ -188,6 +198,12 @@ function wording(language) {
     sourceReference: "Source reference",
     review: "review",
     grant: "grant",
+    sourceTimestamp: "Source timestamp",
+    participants: "Approved participant references",
+    sourceLabel: "Approved source label",
+    stableLink: "Stable link",
+    noStableLink: "No approved stable link",
+    processed: "Processed",
     simulated: "Local simulation; no real source was read."
   };
 }
@@ -306,6 +322,7 @@ function validatedStagingPayload(payload, batchId, maxRecords) {
     );
   }
   assertNoRawStagingMaterial(payload.records);
+  const records = normalizeInertStagingRecords(payload.records, { maxRecords });
   const createdAt = canonicalTimestamp(payload.createdAt, "STAGING_TIMESTAMP_INVALID");
   const expiresAt = canonicalTimestamp(payload.expiresAt, "STAGING_TIMESTAMP_INVALID");
   if (expiresAt !== addHours(createdAt, 24)) {
@@ -314,7 +331,7 @@ function validatedStagingPayload(payload, batchId, maxRecords) {
       "The protected temporary batch did not preserve its fixed 24-hour expiry, so it was not compiled."
     );
   }
-  return { batchId, createdAt, expiresAt, records: clone(payload.records) };
+  return { batchId, createdAt, expiresAt, records };
 }
 
 /**
@@ -330,6 +347,7 @@ export class LocalTemporaryStaging {
     this.realRoot = null;
     this.initialization = null;
     this.expiryTimers = new Map();
+    this.startupRemovedBatchIds = new Set();
   }
 
   async initialize() {
@@ -397,6 +415,10 @@ export class LocalTemporaryStaging {
       );
     }
     this.realRoot = rootReal;
+    // The expiry is durable in each staged file. Re-check it whenever this
+    // adapter starts so a restart does not depend on an old in-memory timer.
+    const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow());
+    startupCleanup.removedBatchIds.forEach((batchId) => this.startupRemovedBatchIds.add(batchId));
     return rootReal;
   }
 
@@ -438,7 +460,12 @@ export class LocalTemporaryStaging {
       this.expiryTimers.delete(batchId);
       try {
         const staged = await this.read({ batchId });
-        if (Date.parse(staged.expiresAt) <= Date.now()) await this.delete({ batchId });
+        if (Date.parse(staged.expiresAt) <= Date.now() && await this.delete({ batchId })) {
+          // Carry a path-free expiry signal into the next lifecycle cleanup so
+          // an in-process timer cannot turn an expired batch into a generic
+          // missing-file interruption.
+          this.startupRemovedBatchIds.add(batchId);
+        }
       } catch {
         // Every public compiler entry also performs expiry cleanup. This timer
         // is an additional in-process safeguard and never exposes batch data.
@@ -457,13 +484,14 @@ export class LocalTemporaryStaging {
       );
     }
     assertNoRawStagingMaterial(records);
+    const normalizedRecords = normalizeInertStagingRecords(records, { maxRecords: this.maxRecords });
     const normalizedCreatedAt = canonicalTimestamp(createdAt, "STAGING_TIMESTAMP_INVALID");
     const payload = {
       version: STAGING_VERSION,
       batchId: safeBatchId,
       createdAt: normalizedCreatedAt,
       expiresAt: addHours(normalizedCreatedAt, 24),
-      records: clone(records)
+      records: normalizedRecords
     };
     const serialized = `${JSON.stringify(payload)}\n`;
     if (Buffer.byteLength(serialized, "utf8") > this.maxBytes) {
@@ -567,8 +595,7 @@ export class LocalTemporaryStaging {
     }
   }
 
-  async cleanupExpired({ now }) {
-    const root = await this.#trustedRoot();
+  async #cleanupExpiredInRoot(root, now) {
     const current = Date.parse(canonicalTimestamp(now, "STAGING_TIMESTAMP_INVALID"));
     const removedBatchIds = [];
     const entries = await readdir(root, { withFileTypes: true });
@@ -617,8 +644,18 @@ export class LocalTemporaryStaging {
         if (timer) clearTimeout(timer);
         this.expiryTimers.delete(batchId);
         removedBatchIds.push(batchId);
+      } else {
+        this.#scheduleExpiry(batchId, validated.expiresAt);
       }
     }
+    return { removedBatchIds: [...new Set(removedBatchIds)].sort() };
+  }
+
+  async cleanupExpired({ now }) {
+    const root = await this.#trustedRoot();
+    const cleaned = await this.#cleanupExpiredInRoot(root, now);
+    const removedBatchIds = [...this.startupRemovedBatchIds, ...cleaned.removedBatchIds];
+    this.startupRemovedBatchIds.clear();
     return { removedBatchIds: [...new Set(removedBatchIds)].sort() };
   }
 }
@@ -669,6 +706,38 @@ function safeNormalizedText(value, { allowNull = false, field, maxLength = 360 }
   return normalized;
 }
 
+function normalizedStableLink(value) {
+  if (value == null) return null;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new KnowledgeCompilationError("SOURCE_PROVENANCE_INVALID", "A stable source link must be an approved HTTPS reference or omitted.");
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:"
+      || url.username
+      || url.password
+      || url.port
+      || url.hostname === "localhost"
+      || url.hostname.endsWith(".localhost")
+      || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(url.hostname)
+      || url.hostname.includes(":")
+    ) {
+      throw new Error("unsafe host");
+    }
+    const stable = `${url.origin}${url.pathname}`;
+    if (stable.length > 512 || SENSITIVE_TEXT.test(decodeURIComponent(url.pathname))) {
+      throw new Error("sensitive path");
+    }
+    return stable;
+  } catch {
+    throw new KnowledgeCompilationError(
+      "SOURCE_PROVENANCE_INVALID",
+      "A stable source link must be a short, approved HTTPS reference without credentials, parameters, or sensitive details."
+    );
+  }
+}
+
 function normalizedPrivacy(value, field) {
   if (!Array.isArray(value) || value.length === 0 || value.length > PRIVACY_RESTRICTIONS.size) {
     throw new KnowledgeCompilationError("PRIVACY_RESTRICTION_REQUIRED", `${field} must include at least one recognized privacy restriction.`);
@@ -681,6 +750,13 @@ function normalizedPrivacy(value, field) {
     );
   }
   return normalized;
+}
+
+function normalizedOpaqueReferences(value, field, maxLength = 64) {
+  if (!Array.isArray(value) || value.length > maxLength) {
+    throw new KnowledgeCompilationError("SOURCE_PROVENANCE_INVALID", `${field} must be a bounded list of approved opaque references.`);
+  }
+  return [...new Set(value.map((reference) => assertOpaqueId(reference, "SOURCE_PROVENANCE_INVALID", field)))].sort();
 }
 
 function sourceEntryKey(source, accountId) {
@@ -790,12 +866,12 @@ function assertActiveGrantForRecord(state, record) {
       "A record fell outside the saved granular permission scope, so it was not staged or compiled."
     );
   }
-  return grant;
+  return { grant, entry, metadataItem };
 }
 
-function normalizeApprovedRecords(records, state) {
-  if (!Array.isArray(records) || records.length === 0 || records.length > MAX_BATCH_RECORDS) {
-    throw new KnowledgeCompilationError("APPROVED_RECORDS_REQUIRED", `Provide between 1 and ${MAX_BATCH_RECORDS} approved normalized records.`);
+function normalizeInertStagingRecords(records, { maxRecords = MAX_BATCH_RECORDS } = {}) {
+  if (!Array.isArray(records) || records.length === 0 || records.length > maxRecords) {
+    throw new KnowledgeCompilationError("APPROVED_RECORDS_REQUIRED", `Provide between 1 and ${maxRecords} approved normalized records.`);
   }
   const seenRecords = new Set();
   return records.map((record) => {
@@ -820,6 +896,10 @@ function normalizeApprovedRecords(records, state) {
     }
     seenRecords.add(key);
 
+    const sourceTimestamp = canonicalTimestamp(record.sourceTimestamp, "SOURCE_TIMESTAMP_REQUIRED");
+    const approvedParticipantRefs = normalizedOpaqueReferences(record.approvedParticipantRefs, "approvedParticipantRefs");
+    const sourceLabel = safeNormalizedText(record.sourceLabel, { allowNull: true, field: "sourceLabel", maxLength: 160 });
+    const stableLink = normalizedStableLink(record.stableLink);
     const observedAt = canonicalTimestamp(record.observedAt);
     const verifiedAt = canonicalOptionalTimestamp(record.verifiedAt);
     if (verifiedAt && Date.parse(verifiedAt) < Date.parse(observedAt)) {
@@ -829,7 +909,6 @@ function normalizeApprovedRecords(records, state) {
     if (!Array.isArray(record.assertions) || record.assertions.length === 0 || record.assertions.length > 32) {
       throw new KnowledgeCompilationError("ASSERTIONS_REQUIRED", "Each approved record must contain a bounded list of normalized assertions.");
     }
-    assertActiveGrantForRecord(state, { source, accountId, sourceRecordId, reviewId, grantId });
     const assertions = record.assertions.map((assertion) => {
       assertNoUnexpectedFields(assertion, ASSERTION_FIELDS, "normalized assertion");
       const subjectType = assertion.subjectType;
@@ -865,11 +944,74 @@ function normalizeApprovedRecords(records, state) {
       reviewId,
       grantId,
       processingDisposition: "untrusted-inert-reference",
+      sourceTimestamp,
+      approvedParticipantRefs,
+      sourceLabel,
+      stableLink,
       observedAt,
       verifiedAt,
       privacyRestrictions,
       assertions
     };
+  });
+}
+
+function neutralSourceLabel(source) {
+  return `Approved ${source} reference`;
+}
+
+function approvedParticipantRefsForMetadata(metadataItem) {
+  return normalizedOpaqueReferences(metadataItem.participantIds ?? [], "approved participant metadata");
+}
+
+function validateApprovedProvenance(record, metadataItem) {
+  const sourceTimestamp = canonicalTimestamp(metadataItem.timestamp, "SOURCE_TIMESTAMP_REQUIRED");
+  if (record.sourceTimestamp !== sourceTimestamp) {
+    throw new KnowledgeCompilationError(
+      "SOURCE_PROVENANCE_INVALID",
+      "The source timestamp no longer matches the reviewed metadata, so the record was not compiled."
+    );
+  }
+  const approvedParticipantRefs = approvedParticipantRefsForMetadata(metadataItem);
+  if (JSON.stringify(record.approvedParticipantRefs) !== JSON.stringify(approvedParticipantRefs)) {
+    throw new KnowledgeCompilationError(
+      "SOURCE_PROVENANCE_INVALID",
+      "The participant references do not exactly match the reviewed metadata, so the record was not compiled."
+    );
+  }
+
+  let reviewedLabel = null;
+  try {
+    reviewedLabel = safeNormalizedText(metadataItem.label, { field: "reviewed sourceLabel", maxLength: 160 });
+  } catch {
+    // The caller can still use a neutral label if a reviewed metadata label is
+    // not safe enough to retain in a generated note.
+    reviewedLabel = null;
+  }
+  const neutralLabel = neutralSourceLabel(record.source);
+  const usesNeutralLabel = record.sourceLabel === null || record.sourceLabel === neutralLabel;
+  const sourceLabel = usesNeutralLabel ? neutralLabel : record.sourceLabel;
+  if (!usesNeutralLabel && (!reviewedLabel || record.sourceLabel !== reviewedLabel)) {
+    throw new KnowledgeCompilationError(
+      "SOURCE_PROVENANCE_INVALID",
+      "The source label does not exactly match a safe reviewed metadata label, so it was not compiled."
+    );
+  }
+
+  const approvedStableLink = normalizedStableLink(metadataItem.stableLink);
+  if (record.stableLink !== approvedStableLink) {
+    throw new KnowledgeCompilationError(
+      "SOURCE_PROVENANCE_INVALID",
+      "The stable link does not exactly match the safe reviewed metadata reference, so it was not compiled."
+    );
+  }
+  return { sourceTimestamp, approvedParticipantRefs, sourceLabel, stableLink: approvedStableLink };
+}
+
+function normalizeApprovedRecords(records, state) {
+  return normalizeInertStagingRecords(records).map((record) => {
+    const { metadataItem } = assertActiveGrantForRecord(state, record);
+    return { ...record, ...validateApprovedProvenance(record, metadataItem) };
   });
 }
 
@@ -891,7 +1033,7 @@ function sourceReferenceId(source) {
   return `${source.source}:${source.accountId}:${source.sourceRecordId}`;
 }
 
-function compileProjections(records, language) {
+function compileProjections(records, language, processedAt) {
   const claims = new Map();
   const noteLabels = new Map();
   for (const record of records) {
@@ -931,7 +1073,12 @@ function compileProjections(records, language) {
         accountId: record.accountId,
         sourceRecordId: record.sourceRecordId,
         reviewId: record.reviewId,
-        grantId: record.grantId
+        grantId: record.grantId,
+        sourceTimestamp: record.sourceTimestamp,
+        approvedParticipantRefs: [...record.approvedParticipantRefs],
+        sourceLabel: record.sourceLabel,
+        stableLink: record.stableLink,
+        processedAt
       };
       if (!claim.sourceReferences.some((reference) => sourceReferenceId(reference) === sourceReferenceId(source) && reference.reviewId === source.reviewId && reference.grantId === source.grantId)) {
         claim.sourceReferences.push(source);
@@ -962,7 +1109,20 @@ function noteLink(notePath) {
 }
 
 function renderSourceReference(source, text) {
-  return `${text.sourceReference}: \`${escapeMarkdown(sourceReferenceId(source))}\` (${text.review} \`${escapeMarkdown(source.reviewId)}\`, ${text.grant} \`${escapeMarkdown(source.grantId)}\`)`;
+  const participantRefs = source.approvedParticipantRefs.length > 0
+    ? source.approvedParticipantRefs.map((reference) => `\`${escapeMarkdown(reference)}\``).join(", ")
+    : "—";
+  const stableLink = source.stableLink
+    ? `[${text.stableLink}](<${source.stableLink}>)`
+    : text.noStableLink;
+  return [
+    `${text.sourceReference}: \`${escapeMarkdown(sourceReferenceId(source))}\` (${text.review} \`${escapeMarkdown(source.reviewId)}\`, ${text.grant} \`${escapeMarkdown(source.grantId)}\`)`,
+    `${text.sourceTimestamp}: ${source.sourceTimestamp}`,
+    `${text.participants}: ${participantRefs}`,
+    `${text.sourceLabel}: ${escapeMarkdown(source.sourceLabel)}`,
+    `${text.stableLink}: ${stableLink}`,
+    `${text.processed}: ${source.processedAt}`
+  ].join(" · ");
 }
 
 function buildCanonicalNotes(claims, language) {
@@ -1065,6 +1225,11 @@ function buildSourceIndexes(claims, canonicalNotes, language) {
           sourceReferenceId: sourceReferenceId(source),
           reviewId: source.reviewId,
           grantId: source.grantId,
+          sourceTimestamp: source.sourceTimestamp,
+          approvedParticipantRefs: [...source.approvedParticipantRefs],
+          sourceLabel: source.sourceLabel,
+          stableLink: source.stableLink,
+          processedAt: source.processedAt,
           canonicalNotePaths: new Set(),
           claimIds: new Set()
         });
@@ -1081,6 +1246,11 @@ function buildSourceIndexes(claims, canonicalNotes, language) {
           sourceReferenceId: entry.sourceReferenceId,
           reviewId: entry.reviewId,
           grantId: entry.grantId,
+          sourceTimestamp: entry.sourceTimestamp,
+          approvedParticipantRefs: entry.approvedParticipantRefs,
+          sourceLabel: entry.sourceLabel,
+          stableLink: entry.stableLink,
+          processedAt: entry.processedAt,
           canonicalNotePaths: [...entry.canonicalNotePaths].sort(),
           claimIds: [...entry.claimIds].sort()
         }))
@@ -1088,7 +1258,12 @@ function buildSourceIndexes(claims, canonicalNotes, language) {
       const rows = entries.map((entry) => [
         `- \`${escapeMarkdown(entry.sourceReferenceId)}\``,
         `  - ${entry.canonicalNotePaths.map(noteLink).join(", ")}`,
-        `  - ${text.claimIds}: ${entry.claimIds.map((id) => `\`${id}\``).join(", ")}`
+        `  - ${text.claimIds}: ${entry.claimIds.map((id) => `\`${id}\``).join(", ")}`,
+        `  - ${text.sourceTimestamp}: ${entry.sourceTimestamp}`,
+        `  - ${text.participants}: ${entry.approvedParticipantRefs.length > 0 ? entry.approvedParticipantRefs.map((reference) => `\`${escapeMarkdown(reference)}\``).join(", ") : "—"}`,
+        `  - ${text.sourceLabel}: ${escapeMarkdown(entry.sourceLabel)}`,
+        `  - ${text.stableLink}: ${entry.stableLink ? `[${text.stableLink}](<${entry.stableLink}>)` : text.noStableLink}`,
+        `  - ${text.processed}: ${entry.processedAt}`
       ].join("\n")).join("\n");
       return {
         type: index.type,
@@ -1199,8 +1374,102 @@ function shouldDiscardAfterFailure(error) {
     "STAGING_TIMESTAMP_INVALID",
     "STAGING_PAYLOAD_TOO_DEEP",
     "STAGING_SIZE_LIMIT",
-    "STAGING_SYMLINK_BLOCKED"
+    "STAGING_SYMLINK_BLOCKED",
+    "RAW_SOURCE_FIELD_BLOCKED",
+    "NORMALIZED_RECORD_INVALID",
+    "NORMALIZED_TEXT_INVALID",
+    "NORMALIZED_TEXT_UNSAFE",
+    "SOURCE_REFERENCE_INVALID",
+    "ACCOUNT_REFERENCE_INVALID",
+    "REVIEW_REFERENCE_INVALID",
+    "GRANT_REFERENCE_INVALID",
+    "UNTRUSTED_DISPOSITION_REQUIRED",
+    "SOURCE_TIMESTAMP_REQUIRED",
+    "SOURCE_PROVENANCE_INVALID",
+    "DUPLICATE_SOURCE_RECORD",
+    "VERIFICATION_DATE_INVALID",
+    "ASSERTIONS_REQUIRED",
+    "SUBJECT_TYPE_INVALID",
+    "SUBJECT_ID_INVALID",
+    "CONFIDENCE_INVALID",
+    "UNKNOWN_CONFIDENCE_INVALID",
+    "PRIVACY_RESTRICTION_REQUIRED",
+    "PRIVACY_RESTRICTION_INVALID",
+    "SUBJECT_LABEL_CONFLICT"
   ]).has(safeFailureCode(error));
+}
+
+function stagingReceiptFromBatch(staged) {
+  return {
+    batchId: staged.batchId,
+    createdAt: staged.createdAt,
+    expiresAt: staged.expiresAt,
+    retention: "delete-after-compilation-or-within-24-hours"
+  };
+}
+
+function expiredBatchEntry({ batchId, now, language, staged = null }) {
+  return {
+    batchId,
+    status: "expired",
+    language,
+    createdAt: staged?.createdAt ?? null,
+    staging: {
+      ...(staged ? stagingReceiptFromBatch(staged) : {}),
+      status: "expired-deleted",
+      deletedAt: now
+    },
+    audit: [{ type: "temporary-staging-expired", at: now, recoveredWithoutPersistedState: staged !== null }]
+  };
+}
+
+function discardedBatchEntry({ batchId, now, language, staged = null, reason }) {
+  return {
+    batchId,
+    status: "discarded",
+    language,
+    createdAt: staged?.createdAt ?? null,
+    staging: {
+      ...(staged ? stagingReceiptFromBatch(staged) : {}),
+      status: "discarded",
+      deletedAt: now
+    },
+    audit: [{ type: "temporary-batch-discarded", at: now, reason, recoveredWithoutPersistedState: staged !== null }]
+  };
+}
+
+async function recoverUntrackedStagedBatch({ staging, batchId, state, expectedRecords, now }) {
+  let staged;
+  try {
+    staged = await staging.read({ batchId });
+  } catch (error) {
+    if (error instanceof KnowledgeCompilationError && error.code === "STAGING_BATCH_MISSING") return null;
+    throw error;
+  }
+  if (Date.parse(staged.expiresAt) <= Date.parse(now)) {
+    await staging.delete({ batchId });
+    return { expired: true, staged };
+  }
+  let records;
+  try {
+    records = normalizeApprovedRecords(staged.records, state);
+  } catch (error) {
+    if (!shouldDiscardAfterFailure(error)) throw error;
+    try {
+      await staging.delete({ batchId });
+    } catch {
+      // The lifecycle tombstone below prevents reuse, while later cleanup can
+      // retry a filesystem deletion that was interrupted.
+    }
+    return { discarded: true, staged, error };
+  }
+  if (expectedRecords && JSON.stringify(records) !== JSON.stringify(expectedRecords)) {
+    throw new KnowledgeCompilationError(
+      "STAGING_BATCH_COLLISION",
+      "That protected batch ID already belongs to different approved references. Choose a new opaque batch ID instead of replacing it."
+    );
+  }
+  return { expired: false, staged, records, receipt: stagingReceiptFromBatch(staged) };
 }
 
 async function markExpiredBatches({ lifecycle, staging, now }) {
@@ -1213,6 +1482,13 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
       entry.staging = entry.staging ? { ...entry.staging, status: "expired-deleted", deletedAt: now } : null;
       entry.audit.push({ type: "temporary-staging-expired", at: now });
       lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId });
+      changed = true;
+    } else if (!entry) {
+      // A process may have staged the file successfully but crashed before its
+      // state save. Keep a path-free tombstone so the same batch ID cannot be
+      // revived after durable startup cleanup.
+      lifecycle.batches[batchId] = expiredBatchEntry({ batchId, now, language: "en" });
+      lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId, recoveredWithoutPersistedState: true });
       changed = true;
     }
   }
@@ -1261,18 +1537,119 @@ export async function compileApprovedRecords({
   }
 
   if (!entry) {
-    const records = normalizeApprovedRecords(approvedRecords, state);
-    const receipt = await staging.stage({ batchId: safeBatchId, records, createdAt: now });
+    let records = approvedRecords === undefined ? null : normalizeApprovedRecords(approvedRecords, state);
+    let receipt;
+    let reconciliation = null;
+    if (records === null) {
+      reconciliation = await recoverUntrackedStagedBatch({
+        staging,
+        batchId: safeBatchId,
+        state,
+        expectedRecords: null,
+        now
+      });
+      if (!reconciliation) {
+        // Keep the normal customer path explicit: a new batch must arrive as
+        // approved normalized records, while an interrupted batch can resume
+        // without resubmitting any source material.
+        records = normalizeApprovedRecords(approvedRecords, state);
+      }
+    }
+    if (reconciliation?.expired) {
+      entry = expiredBatchEntry({ batchId: safeBatchId, now, language: resolvedLanguage, staged: reconciliation.staged });
+      lifecycle.batches[safeBatchId] = entry;
+      lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId: safeBatchId, recoveredWithoutPersistedState: true });
+      await stateStore.save(state);
+      throw new KnowledgeCompilationError("STAGING_EXPIRED", wording(resolvedLanguage).expired);
+    }
+    if (reconciliation?.discarded) {
+      entry = discardedBatchEntry({
+        batchId: safeBatchId,
+        now,
+        language: resolvedLanguage,
+        staged: reconciliation.staged,
+        reason: safeFailureCode(reconciliation.error)
+      });
+      lifecycle.batches[safeBatchId] = entry;
+      lifecycle.audit.push({
+        type: "temporary-batch-discarded",
+        at: now,
+        batchId: safeBatchId,
+        reason: safeFailureCode(reconciliation.error),
+        recoveredWithoutPersistedState: true
+      });
+      await stateStore.save(state);
+      throw reconciliation.error;
+    }
+    if (reconciliation) {
+      records = reconciliation.records;
+      receipt = reconciliation.receipt;
+    } else {
+      try {
+        receipt = await staging.stage({ batchId: safeBatchId, records, createdAt: now });
+      } catch (error) {
+        if (!(error instanceof KnowledgeCompilationError) || error.code !== "STAGING_BATCH_EXISTS") throw error;
+        reconciliation = await recoverUntrackedStagedBatch({
+          staging,
+          batchId: safeBatchId,
+          state,
+          expectedRecords: records,
+          now
+        });
+        if (!reconciliation?.expired) {
+          records = reconciliation?.records ?? records;
+          receipt = reconciliation?.receipt ?? receipt;
+        }
+      }
+      if (reconciliation?.expired) {
+        entry = expiredBatchEntry({ batchId: safeBatchId, now, language: resolvedLanguage, staged: reconciliation.staged });
+        lifecycle.batches[safeBatchId] = entry;
+        lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId: safeBatchId, recoveredWithoutPersistedState: true });
+        await stateStore.save(state);
+        throw new KnowledgeCompilationError("STAGING_EXPIRED", wording(resolvedLanguage).expired);
+      }
+      if (reconciliation?.discarded) {
+        entry = discardedBatchEntry({
+          batchId: safeBatchId,
+          now,
+          language: resolvedLanguage,
+          staged: reconciliation.staged,
+          reason: safeFailureCode(reconciliation.error)
+        });
+        lifecycle.batches[safeBatchId] = entry;
+        lifecycle.audit.push({
+          type: "temporary-batch-discarded",
+          at: now,
+          batchId: safeBatchId,
+          reason: safeFailureCode(reconciliation.error),
+          recoveredWithoutPersistedState: true
+        });
+        await stateStore.save(state);
+        throw reconciliation.error;
+      }
+      if (!receipt) {
+        throw new KnowledgeCompilationError("STAGING_BATCH_MISSING", "The protected temporary batch could not be safely reconciled. Approve a new batch before continuing.");
+      }
+    }
     entry = {
       batchId: safeBatchId,
       status: "staged",
       language: resolvedLanguage,
-      createdAt: now,
+      createdAt: receipt.createdAt,
       staging: receipt,
-      audit: [{ type: "approved-normalized-records-staged", at: now, recordCount: records.length }]
+      audit: [{
+        type: reconciliation ? "approved-normalized-records-reconciled-after-state-save-interruption" : "approved-normalized-records-staged",
+        at: now,
+        recordCount: records.length
+      }]
     };
     lifecycle.batches[safeBatchId] = entry;
-    lifecycle.audit.push({ type: "approved-normalized-records-staged", at: now, batchId: safeBatchId, recordCount: records.length });
+    lifecycle.audit.push({
+      type: reconciliation ? "approved-normalized-records-reconciled-after-state-save-interruption" : "approved-normalized-records-staged",
+      at: now,
+      batchId: safeBatchId,
+      recordCount: records.length
+    });
     await stateStore.save(state);
   } else if (approvedRecords !== undefined) {
     throw new KnowledgeCompilationError(
@@ -1293,7 +1670,7 @@ export async function compileApprovedRecords({
       throw new KnowledgeCompilationError("STAGING_EXPIRED", wording(resolvedLanguage).expired);
     }
     const records = normalizeApprovedRecords(staged.records, state);
-    const result = compileProjections(records, resolvedLanguage);
+    const result = compileProjections(records, resolvedLanguage, now);
     await staging.delete({ batchId: safeBatchId });
     entry.status = "compiled";
     entry.completedAt = now;

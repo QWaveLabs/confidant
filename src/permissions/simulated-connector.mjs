@@ -84,7 +84,10 @@ export class SimulatedReadOnlyConnector {
         uncertainSensitivity: item.uncertainSensitivity,
         isGroup: item.isGroup,
         participantIds: item.participantIds,
-        label: item.label
+        label: item.label,
+        stableLink: item.stableLink,
+        webUrl: item.webUrl,
+        url: item.url
       }))
     };
   }

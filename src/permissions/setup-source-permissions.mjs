@@ -176,6 +176,35 @@ function redactUntrustedLabel(value) {
   return withoutTokens.slice(0, 160);
 }
 
+function normalizedMetadataTimestamp(value) {
+  if (typeof value !== "string" || !value.trim() || !Number.isFinite(Date.parse(value))) return null;
+  return new Date(value).toISOString();
+}
+
+function safeMetadataLink(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:"
+      || url.username
+      || url.password
+      || url.port
+      || url.hostname === "localhost"
+      || url.hostname.endsWith(".localhost")
+      || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(url.hostname)
+      || url.hostname.includes(":")
+    ) return null;
+    // Query parameters and fragments can contain credentials or expiring
+    // resource keys. A short canonical HTTPS path is the only retained form.
+    const stable = `${url.origin}${url.pathname}`;
+    if (stable.length > 512 || /(?:\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b(?:\d[ -]?){9,}\b|\b(?:api[ _-]?key|password|passcode|secret|access[ _-]?token|bearer)\b)/i.test(decodeURIComponent(url.pathname))) return null;
+    return stable;
+  } catch {
+    return null;
+  }
+}
+
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : [])
     .filter((value) => typeof value === "string" && value.trim())
@@ -228,13 +257,15 @@ function normalizeMetadata(preflight, source) {
       channel: typeof item.channel === "string" ? item.channel : null,
       conversation: typeof item.conversation === "string" ? item.conversation : null,
       category: typeof item.category === "string" ? item.category : "general",
+      timestamp: normalizedMetadataTimestamp(item.timestamp),
       sensitiveCategories: uniqueStrings([
         ...item.sensitiveCategories ?? [],
         ...(item.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])
       ]).filter((category) => SENSITIVE_CATEGORIES.includes(category)),
       isGroup: item.isGroup === true,
       participantIds: uniqueStrings(item.participantIds),
-      label: redactUntrustedLabel(item.label ?? item.title)
+      label: redactUntrustedLabel(item.label ?? item.title),
+      stableLink: safeMetadataLink(item.stableLink ?? item.webUrl ?? item.url)
     };
   });
   if (new Set(people.map((person) => person.id)).size !== people.length || new Set(items.map((item) => item.id)).size !== items.length) {
