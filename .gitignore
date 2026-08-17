@@ -3,6 +3,9 @@
 customer-state/
 customer-vaults/
 staging/
+.qwave-second-brain-staging/
+private-state/
+generated-vaults/
 *.local.json
 .env
 .env.*

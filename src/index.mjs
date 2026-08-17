@@ -72,3 +72,13 @@ export {
   SimulatedGoogleDriveConnector,
   SimulatedGoogleDrivePlugin
 } from "./connectors/simulated-google-drive-plugin.mjs";
+
+export {
+  CANONICAL_SUBJECT_TYPES,
+  KnowledgeCompilationError,
+  LocalTemporaryStaging,
+  TEMPORARY_STAGING_POLICY,
+  cleanupExpiredKnowledgeStaging,
+  compileApprovedRecords,
+  getKnowledgeCompilationStatus
+} from "./knowledge/approved-record-compiler.mjs";
