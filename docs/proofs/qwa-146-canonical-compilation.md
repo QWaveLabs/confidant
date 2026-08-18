@@ -82,7 +82,13 @@ become a competing authority.
   generation identity, acknowledge that protocol over IPC, and continue moving
   the owner-file heartbeat. A restarted adapter adopts coverage only after
   observing that exact identity advance; an unrelated live PID in a static
-  owner is replaced. Early deletion removes ownership and all workers exit.
+  owner is replaced. Early deletion waits for a generation-bound quiescence
+  proof before it can return: the worker must durably write its exact identity
+  into the completion receipt, remove its matching owner, and perform no later
+  artifact write. A locally spawned worker must additionally emit an actual
+  process exit. The parent then removes only that generation's exact PID-scoped
+  temporary receipt, tombstone, and owner files and verifies that no such
+  temporary artifact or worker remains.
 - A fresh adapter rechecks every durable expiry and re-arms independent cleanup
   for an unexpired batch. If it cannot restore retention coverage, it deletes
   the batch early and marks the lifecycle discarded rather than retaining it
@@ -186,9 +192,11 @@ become a competing authority.
   public or premature call and retires content-free evidence only after an
   exact-version, exact-lease, canonical non-future receipt or verified tombstone
   is present and both the data and lease paths are natively confirmed absent.
-  The exact deletion operation itself disarms retention before it returns
-  certified success; acknowledgement never invokes caller-supplied retention
-  code after terminal lifecycle truth has been durably saved.
+  The exact deletion operation itself quiesces retention before it writes or
+  accepts final completion evidence. It verifies native data, lease, owner,
+  and PID-scoped temporary-artifact absence after quiescence and before it
+  returns certified success; acknowledgement never invokes caller-supplied
+  retention code after terminal lifecycle truth has been durably saved.
 - On a running host, interrupted staging has an independently scheduled fixed
   24-hour deletion attempt. Transient unlink failures are retried until absence
   is verified, and later lifecycle resume fails closed after deletion. Expiry
@@ -248,9 +256,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **59/59 passed**.
+- QWA-146 focused suite: **62/62 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **107/107 passed**.
+- Full repository suite: **110/110 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full

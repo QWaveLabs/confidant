@@ -35,6 +35,7 @@ import {
   sep
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { trustedFileStateStoreFacade } from "../adapters/simulated-dependencies.mjs";
 import {
   assertPersistedSourcePermissionGrantStillMatchesReview,
   SENSITIVE_CATEGORIES,
@@ -56,6 +57,7 @@ const INTERNAL_LOCAL_STAGING_OPERATION = Symbol("qwave-internal-local-staging-op
 const LOCAL_STAGING_OPERATION_TAILS = new Map();
 const LOCAL_STAGING_AUTHORITIES = new WeakMap();
 const TRUSTED_LOCAL_STAGING_FACADES = new WeakSet();
+const TRUSTED_DETACHED_RETENTION_FACADES = new WeakMap();
 let LOCAL_TEMPORARY_STAGING_METHODS = null;
 const CLEANUP_REASONS = new Set([
   "compiled",
@@ -72,6 +74,10 @@ const COMPLETION_CLOCK_SKEW_MS = 60_000;
 const GENERATION_TAG = /^[a-f0-9]{24}$/;
 const RETENTION_OWNER_FRESH_MS = 5_000;
 const RETENTION_OWNER_PROBE_MS = 1_250;
+const RETENTION_QUIESCENCE_POLL_MS = 25;
+const RETENTION_QUIESCENCE_TIMEOUT_MS = 5_000;
+const RETENTION_SIGNAL_GRACE_MS = 500;
+const RETENTION_SIGNAL_TIMEOUT_MS = 2_000;
 const MAX_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_BATCH_RECORDS = 100;
 const MAX_STAGING_BYTES = 256 * 1024;
@@ -336,6 +342,13 @@ function assertDedicatedStagingRoot(root) {
   return normalized;
 }
 
+function assertPositiveSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer.`);
+  }
+  return value;
+}
+
 async function repositoryRealRoot() {
   try {
     return await realpath(REPOSITORY_ROOT);
@@ -391,6 +404,37 @@ function stagingLeaseFileName(batchId, leaseId) { return `${generationArtifactBa
 function stagingReceiptFileName(batchId, leaseId) { return `${generationArtifactBase(batchId, leaseId)}${STAGING_RECEIPT_SUFFIX}`; }
 function stagingTombstoneFileName(batchId, leaseId) { return `${generationArtifactBase(batchId, leaseId)}${STAGING_TOMBSTONE_SUFFIX}`; }
 function stagingOwnerFileName(batchId, leaseId) { return `${generationArtifactBase(batchId, leaseId)}${STAGING_OWNER_SUFFIX}`; }
+
+function generationWorkerArtifactNames(batchId, leaseId) {
+  return [
+    stagingReceiptFileName(batchId, leaseId),
+    stagingTombstoneFileName(batchId, leaseId),
+    stagingOwnerFileName(batchId, leaseId)
+  ];
+}
+
+function isGenerationWorkerTemp(name, artifactNames) {
+  if (typeof name !== "string") return false;
+  return artifactNames.some((artifactName) => {
+    if (!name.startsWith(`${artifactName}.`) || !name.endsWith(".tmp")) return false;
+    return /^[0-9]+$/.test(name.slice(artifactName.length + 1, -4));
+  });
+}
+
+async function nativeGenerationWorkerTempNames(root, batchId, leaseId) {
+  const artifactNames = generationWorkerArtifactNames(batchId, leaseId);
+  const entries = await readdir(root);
+  return entries.filter((entry) => isGenerationWorkerTemp(entry, artifactNames));
+}
+
+async function assertNativeGenerationWorkerTempsAbsent(root, batchId, leaseId) {
+  if ((await nativeGenerationWorkerTempNames(root, batchId, leaseId)).length > 0) {
+    throw new KnowledgeCompilationError(
+      "RETENTION_SERVICE_UNAVAILABLE",
+      "The exact cleanup worker still has an unfinished durable write, so deletion remains pending."
+    );
+  }
+}
 
 function parseGenerationArtifact(name, suffix) {
   if (typeof name !== "string" || !name.startsWith(STAGING_FILE_PREFIX) || !name.endsWith(suffix)) return null;
@@ -671,8 +715,27 @@ export class DetachedLocalRetentionService {
   #workers = new Map();
 
   constructor({ workerPath = RETENTION_WORKER_PATH, fileSystem = {} } = {}) {
+    const fileSystemOverrides = Object.freeze({ ...fileSystem });
     this.#workerPath = workerPath;
-    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem });
+    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystemOverrides });
+    if (
+      new.target === DetachedLocalRetentionService
+      && workerPath === RETENTION_WORKER_PATH
+      && Object.keys(fileSystemOverrides).length === 0
+    ) {
+      const instance = this;
+      TRUSTED_DETACHED_RETENTION_FACADES.set(this, Object.freeze({
+        arm(input) {
+          return instance.#arm(input);
+        },
+        disarm(input) {
+          return instance.#disarm(input);
+        },
+        finalizeDeletion(input) {
+          return instance.#disarm(input, true);
+        }
+      }));
+    }
   }
 
   async #removeOwnerIfMatches({ root, batchId, leaseId, workerId = null }) {
@@ -682,6 +745,241 @@ export class DetachedLocalRetentionService {
     if (owner?.batchId !== batchId || owner?.leaseId !== leaseId || (workerId && owner?.workerId !== workerId)) return false;
     try { await unlinkAndSync(this.#fileSystem, ownerPath); } catch { return false; }
     return true;
+  }
+
+  #sameRunningOwner(left, right) {
+    return Boolean(
+      left?.phase === "running"
+      && right?.phase === "running"
+      && left.batchId === right.batchId
+      && left.leaseId === right.leaseId
+      && left.expiresAt === right.expiresAt
+      && left.workerId === right.workerId
+      && left.claimNonce === right.claimNonce
+      && left.pid === right.pid
+      && left.processNonce === right.processNonce
+      && left.processStartedAt === right.processStartedAt
+    );
+  }
+
+  async #currentMatchingOwner({ root, batchId, leaseId, expectedOwner }) {
+    const ownerPath = join(root, stagingOwnerFileName(batchId, leaseId));
+    let current;
+    try {
+      current = validatedRetentionOwner(
+        await readSmallJson(this.#fileSystem, ownerPath),
+        { batchId, leaseId, expiresAt: expectedOwner.expiresAt }
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    return this.#sameRunningOwner(current, expectedOwner) ? current : false;
+  }
+
+  async #matchingWorkerReceipt({ root, batchId, leaseId, owner }) {
+    const receiptPath = join(root, stagingReceiptFileName(batchId, leaseId));
+    let receipt;
+    try { receipt = await readSmallJson(this.#fileSystem, receiptPath); } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    const valid = (
+      receipt?.version === RETENTION_ARTIFACT_VERSION
+      && receipt.batchId === batchId
+      && receipt.leaseId === leaseId
+      && exactCanonicalTimestamp(receipt.deletedAt)
+      && receipt.writer === "retention-worker"
+      && typeof receipt.workerId === "string"
+      && OPAQUE_ID.test(receipt.workerId)
+      && typeof receipt.claimNonce === "string"
+      && OPAQUE_ID.test(receipt.claimNonce)
+      && Number.isSafeInteger(receipt.pid)
+      && receipt.pid > 0
+      && typeof receipt.processNonce === "string"
+      && OPAQUE_ID.test(receipt.processNonce)
+      && exactCanonicalTimestamp(receipt.processStartedAt)
+    );
+    if (!valid) return null;
+    if (!owner) return receipt;
+    return (
+      receipt.workerId === owner.workerId
+      && receipt.claimNonce === owner.claimNonce
+      && receipt.pid === owner.pid
+      && receipt.processNonce === owner.processNonce
+      && receipt.processStartedAt === owner.processStartedAt
+    ) ? receipt : null;
+  }
+
+  #childExited(descriptor) {
+    if (!descriptor?.child) return Boolean(descriptor?.exited);
+    return Boolean(
+      descriptor.exited
+      || descriptor.child.exitCode !== null
+      || descriptor.child.signalCode !== null
+    );
+  }
+
+  async #waitForChildExit(descriptor, timeoutMs) {
+    if (!descriptor?.child || this.#childExited(descriptor)) return true;
+    const child = descriptor.child;
+    return new Promise((resolveExit) => {
+      let settled = false;
+      const finish = (exited) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        child.removeListener("exit", onExit);
+        child.removeListener("close", onExit);
+        if (exited) descriptor.exited = true;
+        resolveExit(exited);
+      };
+      const onExit = () => finish(true);
+      const timeout = setTimeout(() => finish(this.#childExited(descriptor)), timeoutMs);
+      child.once("exit", onExit);
+      child.once("close", onExit);
+    });
+  }
+
+  #pidIsGone(pid) {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error?.code === "ESRCH") return true;
+      if (error?.code === "EPERM") return false;
+      throw error;
+    }
+  }
+
+  async #waitForPidExit(pid, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      if (this.#pidIsGone(pid)) return true;
+      await new Promise((resolvePoll) => setTimeout(resolvePoll, RETENTION_QUIESCENCE_POLL_MS));
+    }
+    return this.#pidIsGone(pid);
+  }
+
+  async #cleanupExactWorkerTemps({ root, batchId, leaseId, pid }) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "Private cleanup could not validate its worker process identity, so deletion remains pending."
+      );
+    }
+    const artifactNames = generationWorkerArtifactNames(batchId, leaseId);
+    for (const name of artifactNames) {
+      const target = join(root, `${name}.${pid}.tmp`);
+      if (dirname(target) !== root) {
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "Private cleanup could not validate its worker artifacts, so deletion remains pending."
+        );
+      }
+      await unlinkAndSync(this.#fileSystem, target);
+      await assertNativePathsAbsent(
+        [target],
+        "An exact cleanup-worker temporary artifact still exists, so deletion remains pending."
+      );
+    }
+    await assertNativeGenerationWorkerTempsAbsent(root, batchId, leaseId);
+  }
+
+  async #removeExpectedOwner({ root, batchId, leaseId, owner }) {
+    const current = await this.#currentMatchingOwner({ root, batchId, leaseId, expectedOwner: owner });
+    if (current === false) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "Private cleanup ownership changed unexpectedly, so deletion remains pending."
+      );
+    }
+    if (!current) return false;
+    await unlinkAndSync(this.#fileSystem, join(root, stagingOwnerFileName(batchId, leaseId)), { ignoreMissing: false });
+    return true;
+  }
+
+  async #stopKnownWorker(descriptor, { root, batchId, leaseId }) {
+    if (this.#childExited(descriptor)) return;
+    if (await this.#waitForChildExit(descriptor, RETENTION_SIGNAL_GRACE_MS)) return;
+    try { descriptor.child.kill("SIGTERM"); } catch {}
+    if (await this.#waitForChildExit(descriptor, RETENTION_SIGNAL_TIMEOUT_MS)) return;
+    try { descriptor.child.kill("SIGKILL"); } catch {}
+    if (await this.#waitForChildExit(descriptor, RETENTION_SIGNAL_TIMEOUT_MS)) return;
+    throw new KnowledgeCompilationError(
+      "RETENTION_SERVICE_UNAVAILABLE",
+      `The private cleanup worker for ${batchId} did not stop cleanly; deletion remains pending for its exact generation.`
+    );
+  }
+
+  async #runningOwnerForGeneration({ root, batchId, leaseId }) {
+    const ownerPath = join(root, stagingOwnerFileName(batchId, leaseId));
+    let raw;
+    try {
+      raw = await readSmallJson(this.#fileSystem, ownerPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    const expiresAt = exactCanonicalTimestamp(raw?.expiresAt);
+    const owner = expiresAt
+      ? validatedRetentionOwner(raw, { batchId, leaseId, expiresAt })
+      : null;
+    if (owner?.phase !== "running") {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "Private cleanup ownership was not valid, so deletion remains pending."
+      );
+    }
+    return owner;
+  }
+
+  async #quiescedTombstoneExists({ root, batchId, leaseId }) {
+    const target = join(root, stagingTombstoneFileName(batchId, leaseId));
+    let tombstone;
+    try {
+      tombstone = await readSmallJson(this.#fileSystem, target);
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      if (error?.code) throw error;
+      return false;
+    }
+    return Boolean(
+      tombstone?.version === RETENTION_ARTIFACT_VERSION
+      && tombstone.batchId === batchId
+      && tombstone.leaseId === leaseId
+      && tombstone.dataUnlinkVerified === true
+      && exactCanonicalTimestamp(tombstone.dataUnlinkVerifiedAt)
+      && exactCanonicalTimestamp(tombstone.retentionQuiescedAt)
+    );
+  }
+
+  async #rawGenerationExists({ root, batchId, leaseId }) {
+    const targets = [
+      join(root, stagingFileName(batchId, leaseId)),
+      join(root, stagingLeaseFileName(batchId, leaseId))
+    ];
+    for (const target of targets) {
+      if (!await pathIsAbsent(DEFAULT_STAGING_FILE_SYSTEM, target)) return true;
+    }
+    return false;
+  }
+
+  async #finishQuiescedWorker({ root, batchId, leaseId, owner, descriptor, receiptAvailable }) {
+    if (descriptor?.child && !await this.#waitForChildExit(descriptor, RETENTION_SIGNAL_TIMEOUT_MS)) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "The private cleanup worker finished its durable receipt but did not exit cleanly, so deletion remains pending."
+      );
+    }
+    if (!descriptor?.child && !await this.#waitForPidExit(owner.pid, RETENTION_SIGNAL_TIMEOUT_MS)) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "The adopted private cleanup worker finished its durable receipt but did not exit cleanly, so deletion remains pending."
+      );
+    }
+    await this.#cleanupExactWorkerTemps({ root, batchId, leaseId, pid: owner.pid });
+    return { completionReceiptAvailable: receiptAvailable };
   }
 
   async #confirmWorkerProtocol({ root, batchId, leaseId, expiresAt, workerId, claimNonce, message }) {
@@ -781,14 +1079,30 @@ export class DetachedLocalRetentionService {
     );
   }
 
-  async arm({ root, batchId, expiresAt, leaseId = batchId }) {
+  async arm(input) {
+    return this.#arm(input);
+  }
+
+  async #arm({ root, batchId, expiresAt, leaseId = batchId }) {
     const safeRoot = assertDedicatedStagingRoot(root);
     const safeBatchId = assertBatchId(batchId);
     const safeExpiresAt = canonicalTimestamp(expiresAt, "STAGING_TIMESTAMP_INVALID");
     const safeLeaseId = assertOpaqueId(leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     const key = retentionWorkerKey(safeRoot, safeBatchId, safeLeaseId);
     const local = this.#workers.get(key);
-    if (local && local.exitCode === null && !local.killed) return { armed: true, adopted: true };
+    if (local?.child && !this.#childExited(local)) return { armed: true, adopted: true };
+    if (
+      local
+      && !local.child
+      && await this.#ownerShowsLiveProtocol({
+        ownerPath: join(safeRoot, stagingOwnerFileName(safeBatchId, safeLeaseId)),
+        owner: local.owner,
+        batchId: safeBatchId,
+        leaseId: safeLeaseId,
+        expiresAt: safeExpiresAt
+      })
+    ) return { armed: true, adopted: true };
+    if (local) this.#workers.delete(key);
 
     const ownership = await this.#claimOrAdoptOwner({
       root: safeRoot,
@@ -796,7 +1110,15 @@ export class DetachedLocalRetentionService {
       leaseId: safeLeaseId,
       expiresAt: safeExpiresAt
     });
-    if (ownership.adopted) return { armed: true, adopted: true };
+    if (ownership.adopted) {
+      this.#workers.set(key, {
+        child: null,
+        owner: ownership.owner,
+        adopted: true,
+        exited: false
+      });
+      return { armed: true, adopted: true };
+    }
     const workerId = ownership.owner.workerId;
     const claimNonce = ownership.owner.claimNonce;
 
@@ -840,15 +1162,19 @@ export class DetachedLocalRetentionService {
           workerId,
           claimNonce,
           message
-        }).then(() => {
+        }).then((confirmedOwner) => {
           if (settled) return;
           settled = true;
           cleanupPreArmListeners();
-          child.once("exit", () => {
-            if (this.#workers.get(key) === child) this.#workers.delete(key);
-          });
+          const descriptor = {
+            child,
+            owner: confirmedOwner,
+            adopted: false,
+            exited: false
+          };
+          child.once("exit", () => { descriptor.exited = true; });
           child.unref();
-          this.#workers.set(key, child);
+          this.#workers.set(key, descriptor);
           resolveArm({ armed: true, adopted: false });
         }, () => { void failBeforeArm(); });
       };
@@ -871,26 +1197,189 @@ export class DetachedLocalRetentionService {
     });
   }
 
-  async disarm({ root, batchId, leaseId }) {
+  async disarm(input) {
+    return this.#disarm(input);
+  }
+
+  async #disarm({ root, batchId, leaseId }, deletionFinalization = false) {
     const safeRoot = assertDedicatedStagingRoot(root);
     const safeBatchId = assertBatchId(batchId);
     const safeLeaseId = assertOpaqueId(leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     const key = retentionWorkerKey(safeRoot, safeBatchId, safeLeaseId);
-    const child = this.#workers.get(key);
-    this.#workers.delete(key);
-    await this.#removeOwnerIfMatches({ root: safeRoot, batchId: safeBatchId, leaseId: safeLeaseId });
-    if (child && child.exitCode === null && !child.killed) {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // The durable ownership removal makes an adopted/detached worker exit
-        // on its next bounded poll even if this process cannot signal it.
-      }
-      await Promise.race([
-        new Promise((resolveExit) => child.once("exit", resolveExit)),
-        new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1_000))
-      ]);
+    let descriptor = this.#workers.get(key) ?? null;
+    const ownerOnDisk = await this.#runningOwnerForGeneration({
+      root: safeRoot,
+      batchId: safeBatchId,
+      leaseId: safeLeaseId
+    });
+    if (descriptor?.owner && ownerOnDisk && !this.#sameRunningOwner(descriptor.owner, ownerOnDisk)) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "Private cleanup ownership changed unexpectedly, so deletion remains pending."
+      );
     }
+    const expectedOwner = descriptor?.owner ?? ownerOnDisk;
+    if (!descriptor && expectedOwner) {
+      descriptor = {
+        child: null,
+        owner: expectedOwner,
+        adopted: true,
+        exited: false
+      };
+      this.#workers.set(key, descriptor);
+    }
+
+    const rawGenerationExists = await this.#rawGenerationExists({
+      root: safeRoot,
+      batchId: safeBatchId,
+      leaseId: safeLeaseId
+    });
+
+    if (rawGenerationExists) {
+      if (deletionFinalization) {
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "The exact protected generation reappeared before its retention worker was quiescent, so deletion remains pending."
+        );
+      }
+      if (!expectedOwner) {
+        if (
+          await this.#quiescedTombstoneExists({ root: safeRoot, batchId: safeBatchId, leaseId: safeLeaseId })
+          && (await nativeGenerationWorkerTempNames(safeRoot, safeBatchId, safeLeaseId)).length === 0
+        ) {
+          this.#workers.delete(key);
+          return { completionReceiptAvailable: false };
+        }
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "Private cleanup could not prove that its retention worker stopped, so deletion remains pending."
+        );
+      }
+      await this.#removeExpectedOwner({
+        root: safeRoot,
+        batchId: safeBatchId,
+        leaseId: safeLeaseId,
+        owner: expectedOwner
+      });
+      if (descriptor?.child) {
+        await this.#stopKnownWorker(descriptor, {
+          root: safeRoot,
+          batchId: safeBatchId,
+          leaseId: safeLeaseId
+        });
+      } else if (!await this.#waitForPidExit(expectedOwner.pid, RETENTION_QUIESCENCE_TIMEOUT_MS)) {
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "The adopted private cleanup worker did not stop after its exact ownership was removed, so deletion remains pending."
+        );
+      }
+      await this.#cleanupExactWorkerTemps({
+        root: safeRoot,
+        batchId: safeBatchId,
+        leaseId: safeLeaseId,
+        pid: expectedOwner.pid
+      });
+      this.#workers.delete(key);
+      return { completionReceiptAvailable: false };
+    }
+
+    const deadline = Date.now() + RETENTION_QUIESCENCE_TIMEOUT_MS;
+    while (Date.now() <= deadline) {
+      const currentOwner = expectedOwner
+        ? await this.#currentMatchingOwner({
+            root: safeRoot,
+            batchId: safeBatchId,
+            leaseId: safeLeaseId,
+            expectedOwner
+          })
+        : await this.#runningOwnerForGeneration({
+            root: safeRoot,
+            batchId: safeBatchId,
+            leaseId: safeLeaseId
+          });
+      if (currentOwner === false) {
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "Private cleanup ownership changed unexpectedly, so deletion remains pending."
+        );
+      }
+      const receipt = await this.#matchingWorkerReceipt({
+        root: safeRoot,
+        batchId: safeBatchId,
+        leaseId: safeLeaseId,
+        owner: expectedOwner
+      });
+      if (receipt && !currentOwner) {
+        const owner = expectedOwner ?? receipt;
+        const result = await this.#finishQuiescedWorker({
+          root: safeRoot,
+          batchId: safeBatchId,
+          leaseId: safeLeaseId,
+          owner,
+          descriptor,
+          receiptAvailable: true
+        });
+        this.#workers.delete(key);
+        return result;
+      }
+
+      if (descriptor?.child && this.#childExited(descriptor)) {
+        if (currentOwner && expectedOwner) {
+          await this.#removeExpectedOwner({
+            root: safeRoot,
+            batchId: safeBatchId,
+            leaseId: safeLeaseId,
+            owner: expectedOwner
+          });
+        }
+        await this.#cleanupExactWorkerTemps({
+          root: safeRoot,
+          batchId: safeBatchId,
+          leaseId: safeLeaseId,
+          pid: expectedOwner.pid
+        });
+        this.#workers.delete(key);
+        return { completionReceiptAvailable: false };
+      }
+
+      if (!descriptor?.child && expectedOwner && this.#pidIsGone(expectedOwner.pid)) {
+        if (currentOwner) {
+          await this.#removeExpectedOwner({
+            root: safeRoot,
+            batchId: safeBatchId,
+            leaseId: safeLeaseId,
+            owner: expectedOwner
+          });
+        }
+        await this.#cleanupExactWorkerTemps({
+          root: safeRoot,
+          batchId: safeBatchId,
+          leaseId: safeLeaseId,
+          pid: expectedOwner.pid
+        });
+        this.#workers.delete(key);
+        return { completionReceiptAvailable: false };
+      }
+
+      if (!expectedOwner && !currentOwner) {
+        if (
+          await this.#quiescedTombstoneExists({ root: safeRoot, batchId: safeBatchId, leaseId: safeLeaseId })
+          && (await nativeGenerationWorkerTempNames(safeRoot, safeBatchId, safeLeaseId)).length === 0
+        ) {
+          this.#workers.delete(key);
+          return { completionReceiptAvailable: false };
+        }
+        throw new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "Private cleanup could not bind a worker identity to this exact generation, so deletion remains pending."
+        );
+      }
+      await new Promise((resolvePoll) => setTimeout(resolvePoll, RETENTION_QUIESCENCE_POLL_MS));
+    }
+    throw new KnowledgeCompilationError(
+      "RETENTION_SERVICE_UNAVAILABLE",
+      "The private cleanup worker did not finish its exact durable cleanup before the bounded deadline, so deletion remains pending."
+    );
   }
 }
 
@@ -921,21 +1410,41 @@ export class LocalTemporaryStaging {
     fileSystem = {},
     clock = null
   } = {}) {
+    const fileSystemOverrides = Object.freeze({ ...fileSystem });
     this.#root = assertDedicatedStagingRoot(root);
-    this.#maxRecords = maxRecords;
-    this.#maxBytes = maxBytes;
-    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem });
-    this.#clock = clock && typeof clock.now === "function"
-      ? Object.freeze({ now: clock.now.bind(clock) })
+    this.#maxRecords = assertPositiveSafeInteger(maxRecords, "maxRecords");
+    this.#maxBytes = assertPositiveSafeInteger(maxBytes, "maxBytes");
+    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystemOverrides });
+    // A caller-provided clock is a deterministic timestamp seam, not a
+    // retained callback. Snapshot it once before authority is assigned so no
+    // caller code is reachable from later staging or cleanup operations.
+    const capturedClock = clock && typeof clock.now === "function"
+      ? isoNow({ now: clock.now.bind(clock) })
       : null;
-    if (!retentionService || typeof retentionService.arm !== "function" || typeof retentionService.disarm !== "function") {
-      throw new TypeError("A private retentionService with arm() and disarm() is required for temporary staging.");
+    this.#clock = capturedClock
+      ? Object.freeze({ now: () => capturedClock })
+      : null;
+    const trustedRetentionFacade = retentionService && typeof retentionService === "object"
+      ? TRUSTED_DETACHED_RETENTION_FACADES.get(retentionService) ?? null
+      : null;
+    if (trustedRetentionFacade) {
+      this.#retentionService = trustedRetentionFacade;
+    } else {
+      if (!retentionService || typeof retentionService.arm !== "function" || typeof retentionService.disarm !== "function") {
+        throw new TypeError("A private retentionService with arm() and disarm() is required for temporary staging.");
+      }
+      this.#retentionService = Object.freeze({
+        arm: retentionService.arm.bind(retentionService),
+        disarm: retentionService.disarm.bind(retentionService),
+        finalizeDeletion: retentionService.disarm.bind(retentionService)
+      });
     }
-    this.#retentionService = Object.freeze({
-      arm: retentionService.arm.bind(retentionService),
-      disarm: retentionService.disarm.bind(retentionService)
-    });
-    if (new.target === LocalTemporaryStaging) {
+    const hasCallerFileSystemMethods = Object.keys(fileSystemOverrides).length > 0;
+    if (
+      new.target === LocalTemporaryStaging
+      && !hasCallerFileSystemMethods
+      && trustedRetentionFacade
+    ) {
       const instance = this;
       const trusted = Object.freeze({
         stage(input) {
@@ -1127,11 +1636,13 @@ export class LocalTemporaryStaging {
   async #disarmGenerationRetention(batchId, leaseId, knownTrustedRoot = null) {
     try {
       const root = knownTrustedRoot ?? await this.#trustedRoot();
-      await this.#retentionService.disarm({ root, batchId, leaseId });
-    } catch {
-      // A completed filesystem deletion remains authoritative. An independently
-      // detached worker has no records to expose and exits when its filename is
-      // absent, so cancellation failure cannot revive staging.
+      return await this.#retentionService.finalizeDeletion({ root, batchId, leaseId });
+    } catch (error) {
+      if (error instanceof KnowledgeCompilationError) throw error;
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "The private cleanup worker could not be proven stopped, so deletion remains pending."
+      );
     }
   }
 
@@ -1404,6 +1915,7 @@ export class LocalTemporaryStaging {
     const timestampField = kind === "receipt" ? "deletedAt" : "deleteStartedAt";
     const timestamp = exactCanonicalTimestamp(value?.[timestampField]);
     const unlinkVerifiedAt = kind === "tombstone" ? exactCanonicalTimestamp(value?.dataUnlinkVerifiedAt) : null;
+    const retentionQuiescedAt = kind === "tombstone" ? exactCanonicalTimestamp(value?.retentionQuiescedAt) : null;
     if (
       value?.version !== RETENTION_ARTIFACT_VERSION
       || value.batchId !== batchId
@@ -1414,7 +1926,9 @@ export class LocalTemporaryStaging {
         value.cleanupBlockedReason != null
         || value.dataUnlinkVerified !== true
         || !unlinkVerifiedAt
+        || !retentionQuiescedAt
         || Date.parse(unlinkVerifiedAt) > Date.now() + COMPLETION_CLOCK_SKEW_MS
+        || Date.parse(retentionQuiescedAt) > Date.now() + COMPLETION_CLOCK_SKEW_MS
       ))
     ) return null;
     const reason = boundedCleanupReason(value.reason);
@@ -1427,14 +1941,19 @@ export class LocalTemporaryStaging {
     const paths = this.#paths(root, batchId, leaseId);
     const target = kind === "receipt" ? paths.receipt : paths.tombstone;
     let value;
-    try { value = await readSmallJson(this.#fileSystem, target); } catch { return null; }
+    try {
+      value = await readSmallJson(this.#fileSystem, target);
+    } catch (error) {
+      if (error?.code === "ENOENT" || !error?.code) return null;
+      throw error;
+    }
     const validated = this.#validatedCompletionArtifact(value, { batchId, leaseId, kind });
     if (!validated) return null;
-    if (!await pathIsAbsent(this.#fileSystem, paths.data) || !await pathIsAbsent(this.#fileSystem, paths.lease)) return null;
     await assertNativePathsAbsent(
-      [paths.data, paths.lease],
-      "The protected generation still exists, so its cleanup artifact cannot certify deletion."
+      [paths.data, paths.lease, paths.owner],
+      "The protected generation or its cleanup worker still exists, so its cleanup artifact cannot certify deletion."
     );
+    await assertNativeGenerationWorkerTempsAbsent(root, batchId, leaseId);
     return validated;
   }
 
@@ -1445,7 +1964,31 @@ export class LocalTemporaryStaging {
       batchId,
       leaseId,
       deletedAt,
-      reason: boundedCleanupReason(reason)
+      reason: boundedCleanupReason(reason),
+      writer: "compiler"
+    });
+  }
+
+  async #markTombstoneRetentionQuiesced(root, batchId, leaseId) {
+    const paths = this.#paths(root, batchId, leaseId);
+    const existing = await readSmallJson(this.#fileSystem, paths.tombstone);
+    const unlinkVerifiedAt = exactCanonicalTimestamp(existing?.dataUnlinkVerifiedAt);
+    if (
+      existing?.version !== RETENTION_ARTIFACT_VERSION
+      || existing.batchId !== batchId
+      || existing.leaseId !== leaseId
+      || existing.cleanupBlockedReason != null
+      || existing.dataUnlinkVerified !== true
+      || !unlinkVerifiedAt
+    ) {
+      throw new KnowledgeCompilationError(
+        "STAGING_DELETE_RECEIPT_PENDING",
+        "The private batch is absent, but its exact cleanup marker could not be finalized safely."
+      );
+    }
+    await durableJsonWrite(this.#fileSystem, paths.tombstone, {
+      ...existing,
+      retentionQuiescedAt: new Date().toISOString()
     });
   }
 
@@ -1749,52 +2292,43 @@ export class LocalTemporaryStaging {
       [paths.data, paths.lease],
       "The exact protected generation still exists on the local filesystem, so cleanup was not reported complete."
     );
-    let receiptPersisted = false;
-    try {
-      await this.#writeCompletionReceipt(
-        root,
-        batchId,
-        leaseId,
-        new Date().toISOString(),
-        tombstone.value.reason
+    const retentionResult = await this.#disarmGenerationRetention(batchId, leaseId, root);
+    await assertNativePathsAbsent(
+      [paths.data, paths.lease, paths.owner],
+      "The exact protected generation or its cleanup worker reappeared while cleanup was being finalized."
+    );
+    await assertNativeGenerationWorkerTempsAbsent(root, batchId, leaseId);
+
+    let completion = null;
+    if (retentionResult?.completionReceiptAvailable) {
+      completion = await this.#completionArtifactAt(root, batchId, leaseId, "receipt");
+    } else {
+      await this.#markTombstoneRetentionQuiesced(root, batchId, leaseId);
+      try {
+        await this.#writeCompletionReceipt(
+          root,
+          batchId,
+          leaseId,
+          new Date().toISOString(),
+          tombstone.value.reason
+        );
+      } catch {
+        // The finalized tombstone remains generation-bound completion evidence
+        // if the optional canonical receipt cannot be written.
+      }
+      completion = await this.#completionArtifactAt(root, batchId, leaseId, "receipt")
+        ?? await this.#completionArtifactAt(root, batchId, leaseId, "tombstone");
+    }
+    if (!completion) {
+      throw new KnowledgeCompilationError(
+        "STAGING_DELETE_RECEIPT_PENDING",
+        "The private batch is absent, but its exact durable cleanup evidence is still pending and can be resumed."
       );
-      receiptPersisted = true;
-    } catch {
-      // The durable content-free tombstone plus verified path absence is enough
-      // for startup/resume reconciliation. A worker may retry the receipt, but
-      // public status stays pending until one of those durable signals is
-      // consumed by a later locked lifecycle transaction.
     }
     const timerKey = this.#timerKey(batchId, leaseId);
     const timer = this.#expiryTimers.get(timerKey);
     if (timer) clearTimeout(timer);
     this.#expiryTimers.delete(timerKey);
-    if (!receiptPersisted) {
-      throw new KnowledgeCompilationError(
-        "STAGING_DELETE_RECEIPT_PENDING",
-        "The private batch is absent, but its durable cleanup receipt is still pending and can be resumed."
-      );
-    }
-    try {
-      await this.#disarmGenerationRetention(batchId, leaseId, root);
-      // Retention is the last authority-adjacent callback. Re-certify after it
-      // so a mutable or hostile dependency cannot restore bytes while public
-      // lifecycle state advances to a terminal deletion status.
-      await assertNativePathsAbsent(
-        [paths.data, paths.lease],
-        "The exact protected generation reappeared while cleanup was being finalized. Cleanup remains pending and retention will be re-armed."
-      );
-    } catch (error) {
-      try {
-        const manifest = await this.#readManifest(root, batchId, leaseId);
-        this.#scheduleExpiry(batchId, leaseId, manifest.expiresAt);
-        await this.#armRetention(batchId, manifest.expiresAt, leaseId, root);
-      } catch {
-        // The caller still receives a nonterminal failure. A durable lease or
-        // cleanup artifact remains available for a later exact-instance retry.
-      }
-      throw error;
-    }
     return true;
   }
 
@@ -1859,12 +2393,18 @@ export class LocalTemporaryStaging {
     // truth has been durably saved; acknowledgement only retires content-free
     // local evidence after one final native absence check.
     await assertNativePathsAbsent(
-      [paths.data, paths.lease],
+      [paths.data, paths.lease, paths.owner],
       "The exact protected generation reappeared before cleanup evidence could be acknowledged."
     );
+    await assertNativeGenerationWorkerTempsAbsent(root, safeBatchId, safeLeaseId);
     for (const target of [paths.receipt, paths.tombstone]) {
-      try { await unlinkAndSync(this.#fileSystem, target); } catch {}
+      await unlinkAndSync(this.#fileSystem, target);
     }
+    await assertNativePathsAbsent(
+      [paths.data, paths.lease, paths.owner],
+      "The exact protected generation reappeared while cleanup evidence was being acknowledged."
+    );
+    await assertNativeGenerationWorkerTempsAbsent(root, safeBatchId, safeLeaseId);
   }
 
   async #discoverCompletionArtifacts(root) {
@@ -3602,11 +4142,16 @@ function assertStagingAdapter(staging) {
  * temporary failure. The caller never receives a staging path or raw batch.
  */
 export async function compileApprovedRecords(input) {
-  return withSourcePermissionStateLock(input?.stateStore, () => {
-    const authority = localStagingAuthority(input?.staging);
+  const trustedStateStore = trustedFileStateStoreFacade(input?.stateStore);
+  const operationStateStore = trustedStateStore ?? input?.stateStore;
+  return withSourcePermissionStateLock(operationStateStore, () => {
+    // Deletion truth is terminal only when neither side of the transaction can
+    // execute caller code between native removal and the durable state save.
+    const authority = trustedStateStore ? localStagingAuthority(input?.staging) : null;
+    const operationInput = { ...input, stateStore: operationStateStore };
     return authority
-      ? authority.run((trustedStaging) => compileApprovedRecordsLocked({ ...input, staging: trustedStaging }))
-      : compileApprovedRecordsLocked(input);
+      ? authority.run((trustedStaging) => compileApprovedRecordsLocked({ ...operationInput, staging: trustedStaging }))
+      : compileApprovedRecordsLocked(operationInput);
   });
 }
 
@@ -3861,11 +4406,14 @@ async function compileApprovedRecordsLocked({
 
 /** Removes any expired temporary staging batch and makes its private state fail closed. */
 export async function cleanupExpiredKnowledgeStaging(input) {
-  return withSourcePermissionStateLock(input?.stateStore, () => {
-    const authority = localStagingAuthority(input?.staging);
+  const trustedStateStore = trustedFileStateStoreFacade(input?.stateStore);
+  const operationStateStore = trustedStateStore ?? input?.stateStore;
+  return withSourcePermissionStateLock(operationStateStore, () => {
+    const authority = trustedStateStore ? localStagingAuthority(input?.staging) : null;
+    const operationInput = { ...input, stateStore: operationStateStore };
     return authority
-      ? authority.run((trustedStaging) => cleanupExpiredKnowledgeStagingLocked({ ...input, staging: trustedStaging }))
-      : cleanupExpiredKnowledgeStagingLocked(input);
+      ? authority.run((trustedStaging) => cleanupExpiredKnowledgeStagingLocked({ ...operationInput, staging: trustedStaging }))
+      : cleanupExpiredKnowledgeStagingLocked(operationInput);
   });
 }
 
@@ -3895,7 +4443,10 @@ async function cleanupExpiredKnowledgeStagingLocked({ stateStore, staging, clock
 
 /** Read-only status. It never accesses source connectors or temporary batch contents. */
 export async function getKnowledgeCompilationStatus(input) {
-  return withSourcePermissionStateLock(input?.stateStore, () => getKnowledgeCompilationStatusLocked(input));
+  const operationStateStore = trustedFileStateStoreFacade(input?.stateStore) ?? input?.stateStore;
+  return withSourcePermissionStateLock(operationStateStore, () => (
+    getKnowledgeCompilationStatusLocked({ ...input, stateStore: operationStateStore })
+  ));
 }
 
 async function getKnowledgeCompilationStatusLocked({ stateStore, batchId, language }) {

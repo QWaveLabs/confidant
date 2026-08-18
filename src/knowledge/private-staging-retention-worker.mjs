@@ -363,7 +363,13 @@ async function finalizeGenerationDeletion(job, reason) {
       batchId: job.batchId,
       leaseId: job.leaseId,
       deletedAt: new Date().toISOString(),
-      reason: boundedCleanupReason(tombstone.value.reason)
+      reason: boundedCleanupReason(tombstone.value.reason),
+      writer: "retention-worker",
+      workerId: job.workerId,
+      claimNonce: job.claimNonce,
+      pid: process.pid,
+      processNonce: job.processNonce,
+      processStartedAt: job.processStartedAt
     });
   } catch {
     // Paths are already absent and the durable tombstone is content-free.
