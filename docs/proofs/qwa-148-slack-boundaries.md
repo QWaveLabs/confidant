@@ -53,10 +53,22 @@ boundary.
 
 A group containing a Blocked person is listed only as an opaque group ID and
 is skipped by default. It can be included only after a separate review and an
-explicit confirmation for that single group. That exception cannot approve a
-different group or a different Blocked person. The connector receives that
-persisted one-group policy before the fetch, so a generic grant containing an
-exception cannot by itself make a blocked group readable.
+explicit confirmation for that exact reviewed group snapshot. The exception
+cannot approve a different group, and any later participant, privacy, thread,
+or metadata change fails closed and requires a new review. The body-capable
+adapter receives the exact approved metadata snapshot at the fetch boundary,
+revalidates it there, and restricts its source read to those reviewed record
+IDs. The connector also receives the persisted one-group policy before the
+fetch, so a generic grant containing an exception cannot by itself make a
+blocked group readable.
+
+The same atomic boundary binds the completed pagination summary and normalized
+sensitivity snapshot. Pagination that becomes incomplete at fetch time fails
+before body access. Unknown classifications remain `uncertain-sensitivity`:
+they are excluded by default, but an explicit granular inclusion is both
+integrity-checkable after resume and fetchable without exposing the adapter's
+raw classification. If exclusions leave no approved record, the adapter makes
+no body-capable call and the saved/public body-read counter remains zero.
 
 The adapter exposes no write operation. The read-only verification proves that
 posting, reactions, edits, archiving, invitations, and workspace-state changes
@@ -67,7 +79,7 @@ are all unavailable. Its counters remain zero for writes.
 An approved fetch returns only validated, inert references such as:
 
 ```text
-slack:<workspace-id>:<conversation-id>:<thread-id>
+slack:<local-workspace-alias>:<local-conversation-alias>:<local-thread-alias>
 ```
 
 Each reference can include an opaque conversation ID, thread ID, and (when
@@ -81,12 +93,24 @@ change scope or cause a write.
 - An authorization denial becomes `skipped` without reading metadata or a
   message body, and can be retried later.
 - Incomplete metadata pagination becomes `needs-attention`; no permission
-  review or content fetch is created. Once pagination is complete, the saved
-  setup resumes through a fresh metadata-only review.
+  review or content fetch is created. A contradictory adapter claim of zero
+  reviewed pages with a non-empty inventory is also rejected. Once pagination
+  is complete and internally consistent, the saved setup resumes through a
+  fresh metadata-only review.
 - A revoked plugin response deactivates the local simulated grant and reports
   `revoked`, `live: false`, and no approved references.
 - A malformed safe-reference response stops in `needs-attention` and exposes
   no reference payload.
+- A plugin cannot remap an approved opaque record to another conversation,
+  thread, or conversation type; it is rejected before any reference is shown.
+- If reviewed metadata changes, a connector returns an excluded/unreviewed
+  record, connector-side revocation fails, or revocation races a resumed fetch
+  or the final grant save, the local grant is invalidated and the saved state
+  remains fail-closed. A direct customer revoke uses the same local-invalidation
+  fallback if the injected connector's revoke callback fails.
+- Status derives the Slack lifecycle and generic permission view from one
+  loaded root snapshot. Even a re-entrant revoke triggered by a test state
+  store cannot produce a mixed old/new status pair.
 
 ## Automated acceptance evidence
 
@@ -97,30 +121,45 @@ npm run test:qwa-148
 npm test
 ```
 
-The focused suite contains seven passing scenarios:
+The focused suite contains 35 passing scenarios covering:
 
-1. explicit authorization, read-only verification, complete metadata
-   pagination, and no body access;
-2. independent channel, direct-message, group-message, people, and date
-   enforcement before opaque references are exposed;
-3. default blocked-group exclusion plus a separate one-group exception review;
-4. truthful incomplete-pagination recovery and private-channel denial;
-5. revoked access deactivating the local grant without a Slack write; and
-6. malformed stable-reference output failing closed without exposing its
-   injected source text; and
-7. denial/retry plus equivalent Spanish safety language.
+- explicit authorization, read-only verification, body-free metadata
+  pagination, local aliasing, and independent scope enforcement;
+- default private/unknown-channel exclusion, explicit participant
+  classification, unknown-sensitivity exclusion, and a separate blocked-group
+  exception review pinned to one reviewed membership snapshot; a Restricted
+  person cannot be relabeled as Blocked to widen that exception;
+- malformed, rebound, unreviewed, duplicate, or final-scope-excluded records
+  and stable references failing closed, including a contradictory connector
+  receipt that returns records while claiming no body was read;
+- denial, retry, resume, Spanish parity, persisted-grant integrity failure,
+  and generic-API rejection for Slack;
+- incomplete and internally contradictory pagination failing before a grant;
+- participant and public/private-channel drift at the exact adapter-fetch
+  boundary, and pagination becoming incomplete at that boundary, failing
+  before the simulated body-access counter advances;
+- unknown sensitivity staying excluded before body access, even when it is the
+  only otherwise-selected record; a zero-record result preserving zero public
+  body-read/fetch counters; and an explicitly included uncertain record
+  surviving normalized grant-integrity validation and producing one inert
+  reference;
+- connector-side and direct-revoke failures invalidating the local grant; and
+- revoke races against authorization, group approval, grant registration,
+  final grant save, approved fetch, another Slack account, and a generic source
+  save without resurrecting access, plus ordinary and re-entrant status reads
+  that cannot combine two different persisted snapshots.
 
 Captured verification after the final security pass:
 
 ```text
 # QWA-148 focused suite
-1..7
-# pass 7
+1..35
+# pass 35
 # fail 0
 
-# full private suite
-1..46
-# pass 46
+# full branch suite
+1..74
+# pass 74
 # fail 0
 ```
 
@@ -132,3 +171,10 @@ works. It does not satisfy the real-device connector validation gate. Until a
 clean-Mac, interactive official-plugin verification passes, customer-facing
 status must remain **selected but unfinished / simulation-only**, never live
 and verified.
+
+The canonical per-state-file lock used by this implementation is re-entrant
+and process-local. It serializes participating Setup Session writers inside one
+Node.js process; it is not an operating-system lock and does not provide
+cross-process atomicity. Additive integration must also place the real outer
+Gmail, Drive, Calendar, and iMessage full-root lifecycle writers behind this
+same in-process lock before the cross-source race proof applies to primary.

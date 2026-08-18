@@ -8,7 +8,10 @@
  * connector contract.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 
 export const PERMISSION_SOURCE_KINDS = Object.freeze({
   gmail: "communication",
@@ -58,6 +61,17 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+// Every lifecycle writer persists the same Setup Session root object. A
+// source/account-scoped lock cannot protect that shared document: an unrelated
+// source could otherwise save an older root and resurrect a revoked grant.
+// FileStateStore instances can also be reconstructed with equivalent lexical
+// paths, so derive one in-process lock identity from the canonical backing
+// file. The AsyncLocalStorage context makes this lock safely re-entrant for
+// the Slack specialized lifecycle, which calls these shared primitives while
+// holding the same state-store lock.
+const stateStoreOperationTails = new Map();
+const inMemoryStateStoreOperationKeys = new WeakMap();
+const stateStoreLockContext = new AsyncLocalStorage();
 
 export class PermissionLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -76,6 +90,66 @@ function isoNow(clock) {
 function assertStateStore(stateStore) {
   if (!stateStore || typeof stateStore.load !== "function" || typeof stateStore.save !== "function") {
     throw new TypeError("A persistent stateStore with load() and save() is required.");
+  }
+}
+
+function canonicalStateStorePath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return typeof realpathSync.native === "function" ? realpathSync.native(resolved) : realpathSync(resolved);
+  } catch {
+    // The file itself is absent before bootstrap. Canonicalizing an existing
+    // parent still handles symlinked state directories; path.resolve handles
+    // lexical aliases such as ../ until that parent exists.
+    const parent = path.dirname(resolved);
+    try {
+      const canonicalParent = typeof realpathSync.native === "function"
+        ? realpathSync.native(parent)
+        : realpathSync(parent);
+      return path.join(canonicalParent, path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function stateStoreOperationKey(stateStore) {
+  if (typeof stateStore?.filePath === "string" && stateStore.filePath) {
+    return `file:${canonicalStateStorePath(stateStore.filePath)}`;
+  }
+  let key = inMemoryStateStoreOperationKeys.get(stateStore);
+  if (!key) {
+    key = {};
+    inMemoryStateStoreOperationKeys.set(stateStore, key);
+  }
+  return key;
+}
+
+/**
+ * Serializes full read-modify-write lifecycle operations for one persisted
+ * Setup Session, including distinct FileStateStore instances for the same
+ * file. This is intentionally wider than a source or account: stateStore.save
+ * writes the entire root document, so any concurrent lifecycle writer could
+ * otherwise restore stale entries for a different source.
+ */
+export async function withSourcePermissionStateLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  const inherited = stateStoreLockContext.getStore();
+  if (inherited?.keys?.has(key)) return operation();
+
+  const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
+  await previous.catch(() => undefined);
+  const keys = new Set(inherited?.keys ?? []);
+  keys.add(key);
+  try {
+    return await stateStoreLockContext.run({ keys }, operation);
+  } finally {
+    release();
   }
 }
 
@@ -119,6 +193,28 @@ function sourceKind(source) {
     );
   }
   return kind;
+}
+
+// Slack has a connector-specific boundary for independently enforceable
+// channel, DM, group, people, pagination, and stable-reference rules. The
+// generic lifecycle remains public for the other source kinds, but it must
+// never become an alternate public path around that Slack boundary.
+function assertPublicLifecycleSource(source) {
+  if (source === "slack") {
+    throw new PermissionLifecycleError(
+      "SLACK_SPECIALIZED_LIFECYCLE_REQUIRED",
+      "Slack uses its dedicated read-only review flow so its channel, direct-message, group, people, and pagination boundaries stay enforceable. Start the Slack connection from that guided flow."
+    );
+  }
+}
+
+function assertSpecializedSlackSource(source) {
+  if (source !== "slack") {
+    throw new PermissionLifecycleError(
+      "SPECIALIZED_SOURCE_MISMATCH",
+      "This specialized permission bridge is reserved for the Slack lifecycle."
+    );
+  }
 }
 
 function sourceKey(source, accountId) {
@@ -451,12 +547,22 @@ function normalizedScope(inputScope, review, kind, now) {
       throw new PermissionLifecycleError("PERSON_POLICY_CANNOT_BE_BROADENED", "A Blocked person remains blocked unless you begin a separate, explicit review.");
     }
   }
+  for (const personId of blockedPeople) {
+    if (peopleById.get(personId)?.accessLevel !== "blocked") {
+      throw new PermissionLifecycleError("PERSON_POLICY_CANNOT_BE_BROADENED", "Only a person reviewed as Blocked can enter a blocked-group exception boundary.");
+    }
+  }
 
   const sensitiveAllowed = metadata.sensitiveGroups.map((group) => group.category);
   const includedSensitive = assertSubset(requested.sensitiveGroups?.included, sensitiveAllowed, "sensitive categories");
   const excludedSensitive = assertSubset(requested.sensitiveGroups?.excluded, sensitiveAllowed, "sensitive categories");
   const effectiveIncludedSensitive = includedSensitive.filter((category) => !excludedSensitive.includes(category));
-  const selectedCategories = assertSubset(requested.categories, metadata.categories, "categories");
+  // A persisted canonical scope includes every explicitly approved sensitive
+  // group in `categories` as well as in `sensitiveGroups.included`. Accept
+  // only those explicitly included groups here so integrity revalidation is
+  // idempotent without letting a caller smuggle a sensitive category through
+  // the ordinary category list.
+  const selectedCategories = assertSubset(requested.categories, [...metadata.categories, ...includedSensitive], "categories");
   const finalCategories = applyExclusions(
     [...new Set([...selectedCategories, ...effectiveIncludedSensitive])],
     [...uniqueStrings(requested.exclusions?.categories), ...excludedSensitive]
@@ -634,7 +740,7 @@ async function loadRootState(stateStore) {
  * granular permission request. This is the only entry point that starts a
  * source review; connector discovery is never a body fetch.
  */
-export async function beginSourcePermissionReview({
+async function beginSourcePermissionReviewInternal({
   message,
   stateStore,
   connector,
@@ -682,12 +788,25 @@ export async function beginSourcePermissionReview({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function beginSourcePermissionReview(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal(args));
+}
+
+// Deliberately not re-exported from src/index.mjs. The Slack connector owns
+// the public customer flow and invokes this shared persistence primitive only
+// after applying its additional source-specific safeguards.
+export async function beginSpecializedSourcePermissionReview(args) {
+  assertSpecializedSlackSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal(args));
+}
+
 /**
  * Public Setup Session boundary: records one granular immutable grant. A stale
  * review cannot be used after denial or revocation, and a second matching call
  * returns the existing grant rather than widening or duplicating access.
  */
-export async function grantSourcePermission({
+async function grantSourcePermissionInternal({
   message,
   stateStore,
   connector,
@@ -757,8 +876,18 @@ export async function grantSourcePermission({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function grantSourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal(args));
+}
+
+export async function grantSpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal(args));
+}
+
 /** Records an explicit denial without treating it as an error or allowing stale approval UI to revive it. */
-export async function denySourcePermission({ message, stateStore, source, accountId, reviewId, language, clock }) {
+async function denySourcePermissionInternal({ message, stateStore, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "deny");
   assertStateStore(stateStore);
   const state = await loadRootState(stateStore);
@@ -781,8 +910,18 @@ export async function denySourcePermission({ message, stateStore, source, accoun
   };
 }
 
+export async function denySourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal(args));
+}
+
+export async function denySpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal(args));
+}
+
 /** Revokes local permission state only; it never writes to a connected source application. */
-export async function revokeSourcePermission({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function revokeSourcePermissionInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "revoke");
   assertStateStore(stateStore);
   if (!connector || typeof connector.revokePermissionGrant !== "function") {
@@ -819,12 +958,22 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
   };
 }
 
+export async function revokeSourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal(args));
+}
+
+export async function revokeSpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal(args));
+}
+
 /**
  * Public Setup Session boundary for the first bounded content fetch. It sends
  * only a durable active grant to the adapter and returns opaque source refs;
  * it never returns raw source bodies to the conversation, proof, or tests.
  */
-export async function fetchApprovedSourceContent({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function fetchApprovedSourceContentInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "fetch");
   assertStateStore(stateStore);
   assertConnector(connector);
@@ -859,10 +1008,14 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   if (!result || result.rawBodiesReturned === true || !Array.isArray(result.records)) {
     throw new PermissionLifecycleError("CONNECTOR_BODY_BOUNDARY_INVALID", "The simulated connector did not preserve the safe source-body boundary, so I stopped before exposing any content.");
   }
+  const contentBodiesRead = result.contentBodiesRead !== false;
+  if (!contentBodiesRead && result.records.length > 0) {
+    throw new PermissionLifecycleError("CONNECTOR_BODY_BOUNDARY_INVALID", "The simulated connector reported approved records without reading their source bodies, so I stopped before exposing any content.");
+  }
   const now = isoNow(clock);
-  entry.bodyFetches += 1;
-  entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length });
-  pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length });
+  if (contentBodiesRead) entry.bodyFetches += 1;
+  entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length, contentBodiesRead });
+  pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length, contentBodiesRead });
   await stateStore.save(state);
 
   return {
@@ -875,11 +1028,46 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   };
 }
 
-/** Read-only public status boundary for reviews, grants, and revocations. */
-export async function getSourcePermissionStatus({ stateStore, source, accountId, language }) {
-  assertStateStore(stateStore);
-  const state = await stateStore.load();
+export async function fetchApprovedSourceContent(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal(args));
+}
+
+export async function fetchApprovedSpecializedSourceContent(args) {
+  assertSpecializedSlackSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal(args));
+}
+
+function getSourcePermissionStatusFromStateInternal({ state, source, accountId, language }) {
   if (!state?.[STATE_KEY]) return null;
   const entry = state[STATE_KEY].entries[sourceKey(source, accountId)];
   return entry ? { permissionReview: publicReview(entry, languageFor(state, language)) } : null;
+}
+
+/** Shared read-only primitive for public generic and Slack-specialized status views. */
+async function getSourcePermissionStatusInternal({ stateStore, source, accountId, language }) {
+  assertStateStore(stateStore);
+  const state = await stateStore.load();
+  return getSourcePermissionStatusFromStateInternal({ state, source, accountId, language });
+}
+
+/** Read-only public status boundary for non-Slack reviews, grants, and revocations. */
+export async function getSourcePermissionStatus(args) {
+  assertPublicLifecycleSource(args?.source);
+  return getSourcePermissionStatusInternal(args);
+}
+
+// Deliberately not re-exported from src/index.mjs. Slack owns the public
+// status view so adapter identifiers cannot bypass its local opaque aliases.
+export async function getSpecializedSourcePermissionStatus(args) {
+  assertSpecializedSlackSource(args?.source);
+  return getSourcePermissionStatusInternal(args);
+}
+
+// Deliberately not re-exported from src/index.mjs. Slack uses this pure view to
+// compose its public status from the exact same already-loaded root snapshot,
+// avoiding a second read that could otherwise race a re-entrant revoke.
+export function getSpecializedSourcePermissionStatusFromState(args) {
+  assertSpecializedSlackSource(args?.source);
+  return getSourcePermissionStatusFromStateInternal(args);
 }

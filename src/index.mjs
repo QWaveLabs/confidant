@@ -62,6 +62,7 @@ export {
   approveSlackBlockedGroupException,
   authorizeSlackOfficialPlugin,
   beginSlackConnection,
+  denySlackContentReview,
   fetchApprovedSlackContent,
   getSlackConnectionStatus,
   grantSlackContent,
