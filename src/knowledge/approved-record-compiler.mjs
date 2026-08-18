@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import {
   chmod,
@@ -30,6 +31,7 @@ import {
   sep
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SENSITIVE_CATEGORIES, withSourcePermissionStateLock } from "../permissions/setup-source-permissions.mjs";
 
 const STATE_KEY = "knowledgeCompilationLifecycle";
 const STAGING_DIRECTORY_NAME = ".qwave-second-brain-staging";
@@ -40,6 +42,7 @@ const MAX_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_BATCH_RECORDS = 100;
 const MAX_STAGING_BYTES = 256 * 1024;
 const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+const RETENTION_WORKER_PATH = fileURLToPath(new URL("./private-staging-retention-worker.mjs", import.meta.url));
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 const BATCH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SOURCE_NAME = /^[a-z][a-z0-9-]{0,39}$/;
@@ -334,20 +337,117 @@ function validatedStagingPayload(payload, batchId, maxRecords) {
   return { batchId, createdAt, expiresAt, records };
 }
 
+function retentionWorkerKey(root, batchId) {
+  return `${root}\u0000${batchId}`;
+}
+
+/**
+ * Arms one detached, local-only expiry worker before a staging file is
+ * created. The worker receives only the staging root, opaque batch ID, and
+ * fixed deadline — never records, source bodies, credentials, or logging
+ * destinations — and remains alive if the creating compiler process exits.
+ */
+export class DetachedLocalRetentionService {
+  constructor({ workerPath = RETENTION_WORKER_PATH } = {}) {
+    this.workerPath = workerPath;
+    this.workers = new Map();
+  }
+
+  async arm({ root, batchId, expiresAt }) {
+    const safeRoot = assertDedicatedStagingRoot(root);
+    const safeBatchId = assertBatchId(batchId);
+    const safeExpiresAt = canonicalTimestamp(expiresAt, "STAGING_TIMESTAMP_INVALID");
+    const key = retentionWorkerKey(safeRoot, safeBatchId);
+    await this.disarm({ root: safeRoot, batchId: safeBatchId });
+
+    return new Promise((resolveArm, rejectArm) => {
+      let settled = false;
+      let child;
+      const cleanupPreArmListeners = () => {
+        child?.removeListener("error", failBeforeArm);
+        child?.removeListener("exit", exitBeforeArm);
+        child?.removeListener("message", confirmArm);
+      };
+      const failBeforeArm = () => {
+        if (settled) return;
+        settled = true;
+        cleanupPreArmListeners();
+        try {
+          child?.kill("SIGTERM");
+        } catch {
+          // The child already exited before confirming its schedule.
+        }
+        rejectArm(new KnowledgeCompilationError(
+          "RETENTION_SERVICE_UNAVAILABLE",
+          "I could not arm the private 24-hour cleanup service, so no temporary batch was staged."
+        ));
+      };
+      const exitBeforeArm = () => failBeforeArm();
+      const confirmArm = (message) => {
+        if (message?.type !== "qwave-retention-armed" || message?.batchId !== safeBatchId || settled) return;
+        settled = true;
+        cleanupPreArmListeners();
+        child.once("exit", () => {
+          if (this.workers.get(key) === child) this.workers.delete(key);
+        });
+        child.unref();
+        this.workers.set(key, child);
+        resolveArm({ armed: true });
+      };
+      try {
+        child = spawn(process.execPath, [this.workerPath, safeRoot, safeBatchId, safeExpiresAt], {
+          detached: true,
+          stdio: ["ignore", "ignore", "ignore", "ipc"],
+          windowsHide: true
+        });
+      } catch {
+        failBeforeArm();
+        return;
+      }
+      child.once("error", failBeforeArm);
+      child.once("exit", exitBeforeArm);
+      child.on("message", confirmArm);
+    });
+  }
+
+  async disarm({ root, batchId }) {
+    const key = retentionWorkerKey(assertDedicatedStagingRoot(root), assertBatchId(batchId));
+    const child = this.workers.get(key);
+    this.workers.delete(key);
+    if (!child || child.exitCode !== null || child.killed) return;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // The worker never holds source data. If it has already detached beyond
+      // this process, it safely exits when the named batch no longer exists.
+    }
+  }
+}
+
 /**
  * A concrete private local staging adapter. It is intentionally narrow:
  * files are limited to a dedicated root, never follow a staging symlink, and
  * use opaque batch IDs so callers cannot select arbitrary paths.
  */
 export class LocalTemporaryStaging {
-  constructor({ root, maxRecords = MAX_BATCH_RECORDS, maxBytes = MAX_STAGING_BYTES } = {}) {
+  constructor({
+    root,
+    maxRecords = MAX_BATCH_RECORDS,
+    maxBytes = MAX_STAGING_BYTES,
+    retentionService = new DetachedLocalRetentionService()
+  } = {}) {
     this.root = assertDedicatedStagingRoot(root);
     this.maxRecords = maxRecords;
     this.maxBytes = maxBytes;
+    if (!retentionService || typeof retentionService.arm !== "function" || typeof retentionService.disarm !== "function") {
+      throw new TypeError("A private retentionService with arm() and disarm() is required for temporary staging.");
+    }
+    this.retentionService = retentionService;
     this.realRoot = null;
     this.initialization = null;
     this.expiryTimers = new Map();
     this.startupRemovedBatchIds = new Set();
+    this.retentionCoverageUnavailableBatchIds = new Set();
   }
 
   async initialize() {
@@ -475,6 +575,30 @@ export class LocalTemporaryStaging {
     this.expiryTimers.set(batchId, timer);
   }
 
+  async #armRetention(batchId, expiresAt, knownTrustedRoot = null) {
+    const root = knownTrustedRoot ?? await this.#trustedRoot();
+    try {
+      await this.retentionService.arm({ root, batchId, expiresAt });
+    } catch (error) {
+      if (error instanceof KnowledgeCompilationError) throw error;
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "I could not arm the private 24-hour cleanup service, so no temporary batch was staged."
+      );
+    }
+  }
+
+  async #disarmRetention(batchId, knownTrustedRoot = null) {
+    try {
+      const root = knownTrustedRoot ?? await this.#trustedRoot();
+      await this.retentionService.disarm({ root, batchId });
+    } catch {
+      // A completed filesystem deletion remains authoritative. An independently
+      // detached worker has no records to expose and exits when its filename is
+      // absent, so cancellation failure cannot revive staging.
+    }
+  }
+
   async stage({ batchId, records, createdAt }) {
     const safeBatchId = assertBatchId(batchId);
     if (!Array.isArray(records) || records.length === 0 || records.length > this.maxRecords) {
@@ -502,6 +626,22 @@ export class LocalTemporaryStaging {
     }
 
     const filePath = await this.#filePath(safeBatchId);
+    try {
+      await lstat(filePath);
+      throw new KnowledgeCompilationError(
+        "STAGING_BATCH_EXISTS",
+        "A protected temporary batch with that ID already exists. Resume it instead of replacing it."
+      );
+    } catch (error) {
+      if (error instanceof KnowledgeCompilationError) throw error;
+      if (error?.code !== "ENOENT") {
+        throw new KnowledgeCompilationError("STAGING_WRITE_FAILED", "I could not safely inspect the protected temporary batch path.");
+      }
+    }
+    // Arm the independent worker before the file is created. If this process
+    // exits during the write or immediately after it, the named private batch
+    // remains covered by the already-scheduled 24-hour deletion.
+    await this.#armRetention(safeBatchId, payload.expiresAt);
     let handle;
     try {
       handle = await open(
@@ -513,11 +653,13 @@ export class LocalTemporaryStaging {
       await handle.sync();
     } catch (error) {
       if (error?.code === "EEXIST") {
+        await this.#disarmRetention(safeBatchId);
         throw new KnowledgeCompilationError(
           "STAGING_BATCH_EXISTS",
           "A protected temporary batch with that ID already exists. Resume it instead of replacing it."
         );
       }
+      await this.#disarmRetention(safeBatchId);
       throw error instanceof KnowledgeCompilationError
         ? error
         : new KnowledgeCompilationError("STAGING_WRITE_FAILED", "I could not save the protected temporary batch, so no compilation started.");
@@ -589,6 +731,7 @@ export class LocalTemporaryStaging {
       const timer = this.expiryTimers.get(batchId);
       if (timer) clearTimeout(timer);
       this.expiryTimers.delete(batchId);
+      await this.#disarmRetention(batchId);
       return true;
     } catch {
       throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "I could not remove the protected temporary batch.");
@@ -613,6 +756,7 @@ export class LocalTemporaryStaging {
           const timer = this.expiryTimers.get(batchId);
           if (timer) clearTimeout(timer);
           this.expiryTimers.delete(batchId);
+          await this.#disarmRetention(batchId, root);
           removedBatchIds.push(batchId);
           continue;
         }
@@ -631,6 +775,7 @@ export class LocalTemporaryStaging {
           const timer = this.expiryTimers.get(batchId);
           if (timer) clearTimeout(timer);
           this.expiryTimers.delete(batchId);
+          await this.#disarmRetention(batchId, root);
           removedBatchIds.push(batchId);
         } catch {
           // The next cleanup attempt can retry; no caller-visible path leaks.
@@ -643,9 +788,31 @@ export class LocalTemporaryStaging {
         const timer = this.expiryTimers.get(batchId);
         if (timer) clearTimeout(timer);
         this.expiryTimers.delete(batchId);
+        await this.#disarmRetention(batchId, root);
         removedBatchIds.push(batchId);
       } else {
         this.#scheduleExpiry(batchId, validated.expiresAt);
+        // A newly created adapter must re-arm its independent worker for any
+        // durable batch it discovers. This closes the restart/crash gap even
+        // if an earlier worker was interrupted outside the compiler process.
+        try {
+          await this.#armRetention(batchId, validated.expiresAt, root);
+        } catch {
+          // If a restarted process cannot restore independent expiry coverage,
+          // delete this private batch early rather than retain it without the
+          // promised crash-safe cleanup path.
+          try {
+            await unlink(filePath);
+            const timer = this.expiryTimers.get(batchId);
+            if (timer) clearTimeout(timer);
+            this.expiryTimers.delete(batchId);
+            await this.#disarmRetention(batchId, root);
+            this.retentionCoverageUnavailableBatchIds.add(batchId);
+            removedBatchIds.push(batchId);
+          } catch {
+            // A later owner-only cleanup can retry; no content is exposed.
+          }
+        }
       }
     }
     return { removedBatchIds: [...new Set(removedBatchIds)].sort() };
@@ -655,8 +822,13 @@ export class LocalTemporaryStaging {
     const root = await this.#trustedRoot();
     const cleaned = await this.#cleanupExpiredInRoot(root, now);
     const removedBatchIds = [...this.startupRemovedBatchIds, ...cleaned.removedBatchIds];
+    const retentionCoverageUnavailableBatchIds = [...this.retentionCoverageUnavailableBatchIds];
     this.startupRemovedBatchIds.clear();
-    return { removedBatchIds: [...new Set(removedBatchIds)].sort() };
+    this.retentionCoverageUnavailableBatchIds.clear();
+    return {
+      removedBatchIds: [...new Set(removedBatchIds)].sort(),
+      retentionCoverageUnavailableBatchIds: [...new Set(retentionCoverageUnavailableBatchIds)].sort()
+    };
   }
 }
 
@@ -778,16 +950,34 @@ function recordFitsGrantMetadata(item, scope) {
     if ((scope.exclusions?.dateRanges ?? []).some((range) => timestamp >= Date.parse(range.from) && timestamp <= Date.parse(range.to))) return false;
   }
 
-  const excludedPeople = (item.participantIds ?? []).filter((personId) => scope.exclusions?.people?.includes(personId));
+  if (!Array.isArray(item.participantIds)) return false;
+  const participantIds = item.participantIds;
+  const allowedPeople = new Set(Array.isArray(scope.people?.allowed) ? scope.people.allowed : []);
+  const blockedPeople = new Set(Array.isArray(scope.people?.blocked) ? scope.people.blocked : []);
+  const excludedPeople = participantIds.filter((personId) => scope.exclusions?.people?.includes(personId));
   const allowedBlockedGroupException = item.kind === "conversation"
     && item.isGroup === true
     && scope.blockedGroupConversationExceptions?.includes(item.id);
   if (allowedBlockedGroupException) {
-    if (excludedPeople.some((personId) => !scope.people?.blocked?.includes(personId))) return false;
-  } else if (excludedPeople.length > 0) {
+    // A separately reviewed group can include only its explicitly selected
+    // Allowed people plus the known Blocked people that justified the separate
+    // exception. Restricted or unknown participants never hitchhike on it.
+    if (participantIds.some((personId) => !allowedPeople.has(personId) && !blockedPeople.has(personId))) return false;
+    if (excludedPeople.some((personId) => !blockedPeople.has(personId))) return false;
+  } else if (excludedPeople.length > 0 || participantIds.some((personId) => !allowedPeople.has(personId))) {
     return false;
   }
-  const sensitive = [...item.sensitiveCategories ?? [], ...(item.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])];
+  const declaredSensitive = item.sensitiveCategories == null
+    ? []
+    : Array.isArray(item.sensitiveCategories)
+      ? item.sensitiveCategories
+      : [item.sensitiveCategories];
+  // Older/tampered metadata that carries an unrecognized sensitivity label
+  // must never become ordinary content just because a prior normalizer dropped
+  // it. Require a fresh metadata review instead.
+  if (declaredSensitive.some((category) => typeof category !== "string" || !SENSITIVE_CATEGORIES.includes(category))) return false;
+  if (item.uncertainSensitivity !== undefined && typeof item.uncertainSensitivity !== "boolean") return false;
+  const sensitive = [...declaredSensitive, ...(item.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])];
   return !sensitive.some((category) => scope.sensitiveGroups?.excluded?.includes(category));
 }
 
@@ -1474,14 +1664,38 @@ async function recoverUntrackedStagedBatch({ staging, batchId, state, expectedRe
 
 async function markExpiredBatches({ lifecycle, staging, now }) {
   const cleaned = await staging.cleanupExpired({ now });
+  const retentionCoverageUnavailable = new Set(cleaned.retentionCoverageUnavailableBatchIds ?? []);
   let changed = false;
   for (const batchId of cleaned.removedBatchIds) {
     const entry = lifecycle.batches[batchId];
-    if (entry?.status === "staged") {
+    if (retentionCoverageUnavailable.has(batchId) && entry?.status === "staged") {
+      entry.status = "discarded";
+      entry.staging = entry.staging ? { ...entry.staging, status: "discarded-retention-unavailable", deletedAt: now } : null;
+      entry.audit.push({ type: "temporary-batch-discarded", at: now, reason: "RETENTION_SERVICE_UNAVAILABLE" });
+      lifecycle.audit.push({ type: "temporary-batch-discarded", at: now, batchId, reason: "RETENTION_SERVICE_UNAVAILABLE" });
+      changed = true;
+    } else if (entry?.status === "staged") {
       entry.status = "expired";
       entry.staging = entry.staging ? { ...entry.staging, status: "expired-deleted", deletedAt: now } : null;
       entry.audit.push({ type: "temporary-staging-expired", at: now });
       lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId });
+      changed = true;
+    } else if (entry?.status === "compiled" && entry.staging?.status === "result-persisted-pending-deletion") {
+      // The compiled projection was already durable before the retention
+      // service removed its input. Preserve that result and accurately record
+      // cleanup rather than misclassifying it as an expired compilation.
+      entry.staging = { ...entry.staging, status: "deleted-after-compilation", deletedAt: now };
+      entry.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, by: "retention-service" });
+      lifecycle.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, batchId, by: "retention-service" });
+      changed = true;
+    } else if (!entry && retentionCoverageUnavailable.has(batchId)) {
+      lifecycle.batches[batchId] = discardedBatchEntry({
+        batchId,
+        now,
+        language: "en",
+        reason: "RETENTION_SERVICE_UNAVAILABLE"
+      });
+      lifecycle.audit.push({ type: "temporary-batch-discarded", at: now, batchId, reason: "RETENTION_SERVICE_UNAVAILABLE", recoveredWithoutPersistedState: true });
       changed = true;
     } else if (!entry) {
       // A process may have staged the file successfully but crashed before its
@@ -1493,6 +1707,97 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     }
   }
   return changed;
+}
+
+function resultFingerprint(result) {
+  return createHash("sha256").update(JSON.stringify(result)).digest("hex");
+}
+
+function compiledResultWasPersisted(entry, expectedFingerprint) {
+  return entry?.status === "compiled"
+    && entry?.result
+    && resultFingerprint(entry.result) === expectedFingerprint;
+}
+
+async function finalizePersistedCompilationCleanup({ state, lifecycle, entry, stateStore, staging, batchId, now }) {
+  if (entry?.status !== "compiled" || entry.staging?.status !== "result-persisted-pending-deletion") return false;
+  try {
+    await staging.delete({ batchId });
+  } catch {
+    // The result is already durable. Keep the private staging receipt marked
+    // pending so a later resume or the independently armed expiry worker can
+    // complete deletion without losing the compiled projection.
+    return false;
+  }
+
+  const previousStaging = clone(entry.staging);
+  const previousAuditLength = entry.audit.length;
+  const previousLifecycleAuditLength = lifecycle.audit.length;
+  entry.staging = { ...entry.staging, status: "deleted-after-compilation", deletedAt: now };
+  entry.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, by: "compiler" });
+  lifecycle.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, batchId, by: "compiler" });
+  try {
+    await stateStore.save(state);
+    return true;
+  } catch {
+    // Do not report a deletion receipt that was not durably recorded. The
+    // source batch is already gone, and the prior durable compiled result will
+    // reattempt this bookkeeping safely on a later read or resume.
+    entry.staging = previousStaging;
+    entry.audit.length = previousAuditLength;
+    lifecycle.audit.length = previousLifecycleAuditLength;
+    return false;
+  }
+}
+
+async function persistCompiledResultBeforeDeleting({ stateStore, state, lifecycle, entry, batchId, result, now }) {
+  const stagedEntry = clone(entry);
+  const fingerprint = resultFingerprint(result);
+  entry.status = "compiled";
+  entry.completedAt = now;
+  entry.staging = entry.staging ? {
+    ...entry.staging,
+    status: "result-persisted-pending-deletion",
+    resultPersistedAt: now
+  } : null;
+  entry.result = result;
+  entry.audit.push({
+    type: "canonical-result-persisted",
+    at: now,
+    claimCount: result.claims.length,
+    canonicalNoteCount: result.canonicalNotes.length,
+    sourceIndexCount: result.sourceIndexes.length,
+    temporaryBatchDeleted: false
+  });
+  lifecycle.audit.push({ type: "canonical-result-persisted", at: now, batchId, claimCount: result.claims.length });
+
+  try {
+    await stateStore.save(state);
+  } catch {
+    const persistedState = await stateStore.load().catch(() => null);
+    const persistedEntry = persistedState?.[STATE_KEY]?.batches?.[batchId];
+    if (compiledResultWasPersisted(persistedEntry, fingerprint)) {
+      return {
+        persisted: true,
+        state: persistedState,
+        lifecycle: persistedState[STATE_KEY],
+        entry: persistedEntry
+      };
+    }
+    return { persisted: false, stagedEntry };
+  }
+
+  const persistedState = await stateStore.load().catch(() => null);
+  const persistedEntry = persistedState?.[STATE_KEY]?.batches?.[batchId];
+  if (!compiledResultWasPersisted(persistedEntry, fingerprint)) {
+    return { persisted: false, stagedEntry };
+  }
+  return {
+    persisted: true,
+    state: persistedState,
+    lifecycle: persistedState[STATE_KEY],
+    entry: persistedEntry
+  };
 }
 
 function assertStagingAdapter(staging) {
@@ -1512,7 +1817,11 @@ function assertStagingAdapter(staging) {
  * a later call with the same batch ID and no records safely resumes after a
  * temporary failure. The caller never receives a staging path or raw batch.
  */
-export async function compileApprovedRecords({
+export async function compileApprovedRecords(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => compileApprovedRecordsLocked(input));
+}
+
+async function compileApprovedRecordsLocked({
   message,
   stateStore,
   staging,
@@ -1525,13 +1834,16 @@ export async function compileApprovedRecords({
   assertStagingAdapter(staging);
   const safeBatchId = assertBatchId(batchId);
   const now = isoNow(clock);
-  const state = await loadState(stateStore);
-  const lifecycle = compilationState(state);
+  let state = await loadState(stateStore);
+  let lifecycle = compilationState(state);
   if (await markExpiredBatches({ lifecycle, staging, now })) await stateStore.save(state);
 
   let entry = lifecycle.batches[safeBatchId];
   const resolvedLanguage = languageFor(state, language);
-  if (entry?.status === "compiled") return compiledResponse(entry, resolvedLanguage);
+  if (entry?.status === "compiled") {
+    await finalizePersistedCompilationCleanup({ state, lifecycle, entry, stateStore, staging, batchId: safeBatchId, now });
+    return compiledResponse(entry, resolvedLanguage);
+  }
   if (entry?.status === "expired" || entry?.status === "discarded") {
     throw new KnowledgeCompilationError("STAGING_EXPIRED", wording(resolvedLanguage).expired);
   }
@@ -1669,26 +1981,52 @@ export async function compileApprovedRecords({
       await stateStore.save(state);
       throw new KnowledgeCompilationError("STAGING_EXPIRED", wording(resolvedLanguage).expired);
     }
+
+    // Re-load while holding the shared in-process lifecycle lock immediately
+    // before producing a durable result. This catches a revocation completed
+    // before this transaction and prevents same-process stale-root saves.
+    state = await loadState(stateStore);
+    lifecycle = compilationState(state);
+    entry = lifecycle.batches[safeBatchId];
+    if (entry?.status === "compiled") {
+      await finalizePersistedCompilationCleanup({ state, lifecycle, entry, stateStore, staging, batchId: safeBatchId, now });
+      return compiledResponse(entry, resolvedLanguage);
+    }
+    if (!entry || entry.status !== "staged") {
+      throw new KnowledgeCompilationError(
+        "COMPILATION_STATE_CONFLICT",
+        "The protected batch changed while it was being compiled, so no canonical result was written. Resume from the current private state."
+      );
+    }
     const records = normalizeApprovedRecords(staged.records, state);
     const result = compileProjections(records, resolvedLanguage, now);
-    await staging.delete({ batchId: safeBatchId });
-    entry.status = "compiled";
-    entry.completedAt = now;
-    entry.staging = entry.staging ? { ...entry.staging, status: "deleted-after-compilation", deletedAt: now } : null;
-    entry.result = result;
-    entry.audit.push({
-      type: "canonical-notes-compiled",
-      at: now,
-      claimCount: result.claims.length,
-      canonicalNoteCount: result.canonicalNotes.length,
-      sourceIndexCount: result.sourceIndexes.length,
-      temporaryBatchDeleted: true
+    const persisted = await persistCompiledResultBeforeDeleting({
+      stateStore,
+      state,
+      lifecycle,
+      entry,
+      batchId: safeBatchId,
+      result,
+      now
     });
-    lifecycle.audit.push({ type: "canonical-notes-compiled", at: now, batchId: safeBatchId, claimCount: result.claims.length });
-    await stateStore.save(state);
+    if (!persisted.persisted) {
+      // Never delete the staged batch when the derived result is not known to
+      // be durably saved. A normal-language resume will re-read this same
+      // bounded stage instead of losing or inventing a result.
+      return {
+        compilation: publicBatch(persisted.stagedEntry, resolvedLanguage),
+        interruption: { code: "RESULT_STATE_SAVE_FAILED", retryable: true },
+        limitation: wording(resolvedLanguage).simulated
+      };
+    }
+    state = persisted.state;
+    lifecycle = persisted.lifecycle;
+    entry = persisted.entry;
+    await finalizePersistedCompilationCleanup({ state, lifecycle, entry, stateStore, staging, batchId: safeBatchId, now });
     return compiledResponse(entry, resolvedLanguage);
   } catch (error) {
     if (error instanceof KnowledgeCompilationError && error.code === "STAGING_EXPIRED") throw error;
+    if (error instanceof KnowledgeCompilationError && error.code === "COMPILATION_STATE_CONFLICT") throw error;
     if (shouldDiscardAfterFailure(error)) {
       try {
         await staging.delete({ batchId: safeBatchId });
@@ -1714,7 +2052,11 @@ export async function compileApprovedRecords({
 }
 
 /** Removes any expired temporary staging batch and makes its private state fail closed. */
-export async function cleanupExpiredKnowledgeStaging({ stateStore, staging, clock }) {
+export async function cleanupExpiredKnowledgeStaging(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => cleanupExpiredKnowledgeStagingLocked(input));
+}
+
+async function cleanupExpiredKnowledgeStagingLocked({ stateStore, staging, clock }) {
   assertStateStore(stateStore);
   assertStagingAdapter(staging);
   const now = isoNow(clock);
@@ -1735,7 +2077,11 @@ export async function cleanupExpiredKnowledgeStaging({ stateStore, staging, cloc
 }
 
 /** Read-only status. It never accesses source connectors or temporary batch contents. */
-export async function getKnowledgeCompilationStatus({ stateStore, batchId, language }) {
+export async function getKnowledgeCompilationStatus(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => getKnowledgeCompilationStatusLocked(input));
+}
+
+async function getKnowledgeCompilationStatusLocked({ stateStore, batchId, language }) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   if (!state?.[STATE_KEY]) return null;

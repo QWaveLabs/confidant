@@ -75,6 +75,7 @@ export {
 
 export {
   CANONICAL_SUBJECT_TYPES,
+  DetachedLocalRetentionService,
   KnowledgeCompilationError,
   LocalTemporaryStaging,
   TEMPORARY_STAGING_POLICY,

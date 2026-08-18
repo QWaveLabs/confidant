@@ -468,6 +468,79 @@ test("sensitive categories are grouped, excluded by default, and uncertain sensi
   });
 });
 
+test("missing person access policy and unknown sensitivity metadata remain excluded rather than silently allowed", async () => {
+  await withPermissionFixture(async ({ stateStore, connector }) => {
+    const review = await beginSourcePermissionReview({
+      message: "Please review Gmail for my second brain",
+      stateStore,
+      connector,
+      source: "gmail",
+      reviewIdFactory: () => "unknown-metadata-review"
+    });
+    const request = review.permissionReview.permissionRequest.requestedScope;
+    assert.deepEqual(request.people.allowed, ["person-explicitly-allowed"]);
+    assert.deepEqual(request.people.restricted, ["person-policy-missing"]);
+    assert.equal(request.exclusions.people.includes("person-policy-missing"), true);
+    assert.deepEqual(review.permissionReview.metadataPreflight.sensitiveGroups.map((group) => group.category), ["uncertain-sensitivity"]);
+    assert.equal(JSON.stringify(review).includes("unrecognized-sensitive-category"), false);
+
+    const scope = approvedScope(review);
+    await grantSourcePermission({
+      message: "Approve only the default non-sensitive Gmail scope",
+      stateStore,
+      connector,
+      source: "gmail",
+      accountId: "work-account",
+      reviewId: "unknown-metadata-review",
+      scope,
+      grantIdFactory: () => "unknown-metadata-grant"
+    });
+    const fetched = await fetchApprovedSourceContent({
+      message: "Please import the approved Gmail source",
+      stateStore,
+      connector,
+      source: "gmail",
+      accountId: "work-account",
+      reviewId: "unknown-metadata-review"
+    });
+    assert.deepEqual(fetched.approvedRecords, []);
+  }, {
+    connectorOptions: {
+      source: "gmail",
+      account: { id: "work-account", label: "Work account" },
+      people: [
+        { id: "person-explicitly-allowed", label: "Allowed", accessLevel: "allowed" },
+        { id: "person-policy-missing", label: "Needs review" }
+      ],
+      items: [
+        {
+          id: "missing-policy-item",
+          area: "inbox",
+          category: "work",
+          participantIds: ["person-policy-missing"],
+          label: "Missing person policy"
+        },
+        {
+          id: "unknown-sensitivity-item",
+          area: "inbox",
+          category: "work",
+          participantIds: ["person-explicitly-allowed"],
+          sensitiveCategories: ["unrecognized-sensitive-category"],
+          label: "Uncertain metadata"
+        },
+        {
+          id: "malformed-uncertainty-item",
+          area: "inbox",
+          category: "work",
+          participantIds: ["person-explicitly-allowed"],
+          uncertainSensitivity: "unknown",
+          label: "Malformed uncertainty marker"
+        }
+      ]
+    }
+  });
+});
+
 test("untrusted imported content cannot broaden a reviewed permission scope", async () => {
   await withPermissionFixture(async ({ stateStore, connector }) => {
     const review = await beginSourcePermissionReview({

@@ -8,7 +8,10 @@
  * connector contract.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 
 export const PERMISSION_SOURCE_KINDS = Object.freeze({
   gmail: "communication",
@@ -58,6 +61,15 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+// Every lifecycle writer persists the same Setup Session root object. A
+// source/account-scoped lock cannot protect that shared document: an unrelated
+// source could otherwise save an older root and resurrect a revoked grant.
+// FileStateStore instances can also be reconstructed with equivalent lexical
+// paths, so derive one in-process lock identity from the canonical backing
+// file. The AsyncLocalStorage context makes this lock safely re-entrant.
+const stateStoreOperationTails = new Map();
+const inMemoryStateStoreOperationKeys = new WeakMap();
+const stateStoreLockContext = new AsyncLocalStorage();
 
 export class PermissionLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -76,6 +88,66 @@ function isoNow(clock) {
 function assertStateStore(stateStore) {
   if (!stateStore || typeof stateStore.load !== "function" || typeof stateStore.save !== "function") {
     throw new TypeError("A persistent stateStore with load() and save() is required.");
+  }
+}
+
+function canonicalStateStorePath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return typeof realpathSync.native === "function" ? realpathSync.native(resolved) : realpathSync(resolved);
+  } catch {
+    // The file itself is absent before bootstrap. Canonicalizing an existing
+    // parent still handles symlinked state directories; path.resolve handles
+    // lexical aliases such as ../ until that parent exists.
+    const parent = path.dirname(resolved);
+    try {
+      const canonicalParent = typeof realpathSync.native === "function"
+        ? realpathSync.native(parent)
+        : realpathSync(parent);
+      return path.join(canonicalParent, path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function stateStoreOperationKey(stateStore) {
+  if (typeof stateStore?.filePath === "string" && stateStore.filePath) {
+    return `file:${canonicalStateStorePath(stateStore.filePath)}`;
+  }
+  let key = inMemoryStateStoreOperationKeys.get(stateStore);
+  if (!key) {
+    key = {};
+    inMemoryStateStoreOperationKeys.set(stateStore, key);
+  }
+  return key;
+}
+
+/**
+ * Serializes full read-modify-write lifecycle operations for one persisted
+ * Setup Session, including distinct FileStateStore instances for the same
+ * file. This is intentionally wider than a source or account: stateStore.save
+ * writes the entire root document, so any concurrent lifecycle writer could
+ * otherwise restore stale entries for a different source.
+ */
+export async function withSourcePermissionStateLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  const inherited = stateStoreLockContext.getStore();
+  if (inherited?.keys?.has(key)) return operation();
+
+  const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
+  await previous.catch(() => undefined);
+  const keys = new Set(inherited?.keys ?? []);
+  keys.add(key);
+  try {
+    return await stateStoreLockContext.run({ keys }, operation);
+  } finally {
+    release();
   }
 }
 
@@ -212,7 +284,30 @@ function uniqueStrings(values) {
 }
 
 function normalizedAccessLevel(value) {
-  return ACCESS_LEVELS.has(value) ? value : "allowed";
+  // Missing or malformed policy metadata must never silently promote a person
+  // into an approved-content allowlist. Treat it as Restricted so it is shown
+  // and excluded by the normal deny-by-default scope.
+  return ACCESS_LEVELS.has(value) ? value : "restricted";
+}
+
+function normalizedSensitiveCategories(item) {
+  const declared = item?.sensitiveCategories == null
+    ? []
+    : Array.isArray(item.sensitiveCategories)
+      ? item.sensitiveCategories
+      : [item.sensitiveCategories];
+  const recognized = uniqueStrings(declared).filter((category) => SENSITIVE_CATEGORIES.includes(category));
+  const hasUnknownCategory = declared.some((category) => (
+    typeof category !== "string"
+    || !category.trim()
+    || !SENSITIVE_CATEGORIES.includes(category.trim())
+  ));
+  const hasMalformedUncertaintyMarker = item?.uncertainSensitivity !== undefined
+    && typeof item.uncertainSensitivity !== "boolean";
+  return uniqueStrings([
+    ...recognized,
+    ...(item?.uncertainSensitivity === true || hasUnknownCategory || hasMalformedUncertaintyMarker ? ["uncertain-sensitivity"] : [])
+  ]);
 }
 
 function normalizeMetadata(preflight, source) {
@@ -258,10 +353,7 @@ function normalizeMetadata(preflight, source) {
       conversation: typeof item.conversation === "string" ? item.conversation : null,
       category: typeof item.category === "string" ? item.category : "general",
       timestamp: normalizedMetadataTimestamp(item.timestamp),
-      sensitiveCategories: uniqueStrings([
-        ...item.sensitiveCategories ?? [],
-        ...(item.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])
-      ]).filter((category) => SENSITIVE_CATEGORIES.includes(category)),
+      sensitiveCategories: normalizedSensitiveCategories(item),
       isGroup: item.isGroup === true,
       participantIds: uniqueStrings(item.participantIds),
       label: redactUntrustedLabel(item.label ?? item.title),
@@ -652,7 +744,11 @@ async function loadRootState(stateStore) {
  * granular permission request. This is the only entry point that starts a
  * source review; connector discovery is never a body fetch.
  */
-export async function beginSourcePermissionReview({
+export async function beginSourcePermissionReview(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => beginSourcePermissionReviewLocked(input));
+}
+
+async function beginSourcePermissionReviewLocked({
   message,
   stateStore,
   connector,
@@ -705,7 +801,11 @@ export async function beginSourcePermissionReview({
  * review cannot be used after denial or revocation, and a second matching call
  * returns the existing grant rather than widening or duplicating access.
  */
-export async function grantSourcePermission({
+export async function grantSourcePermission(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => grantSourcePermissionLocked(input));
+}
+
+async function grantSourcePermissionLocked({
   message,
   stateStore,
   connector,
@@ -776,7 +876,11 @@ export async function grantSourcePermission({
 }
 
 /** Records an explicit denial without treating it as an error or allowing stale approval UI to revive it. */
-export async function denySourcePermission({ message, stateStore, source, accountId, reviewId, language, clock }) {
+export async function denySourcePermission(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => denySourcePermissionLocked(input));
+}
+
+async function denySourcePermissionLocked({ message, stateStore, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "deny");
   assertStateStore(stateStore);
   const state = await loadRootState(stateStore);
@@ -800,7 +904,11 @@ export async function denySourcePermission({ message, stateStore, source, accoun
 }
 
 /** Revokes local permission state only; it never writes to a connected source application. */
-export async function revokeSourcePermission({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+export async function revokeSourcePermission(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => revokeSourcePermissionLocked(input));
+}
+
+async function revokeSourcePermissionLocked({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "revoke");
   assertStateStore(stateStore);
   if (!connector || typeof connector.revokePermissionGrant !== "function") {
@@ -842,7 +950,11 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
  * only a durable active grant to the adapter and returns opaque source refs;
  * it never returns raw source bodies to the conversation, proof, or tests.
  */
-export async function fetchApprovedSourceContent({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+export async function fetchApprovedSourceContent(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => fetchApprovedSourceContentLocked(input));
+}
+
+async function fetchApprovedSourceContentLocked({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "fetch");
   assertStateStore(stateStore);
   assertConnector(connector);
@@ -894,7 +1006,11 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
 }
 
 /** Read-only public status boundary for reviews, grants, and revocations. */
-export async function getSourcePermissionStatus({ stateStore, source, accountId, language }) {
+export async function getSourcePermissionStatus(input) {
+  return withSourcePermissionStateLock(input?.stateStore, () => getSourcePermissionStatusLocked(input));
+}
+
+async function getSourcePermissionStatusLocked({ stateStore, source, accountId, language }) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   if (!state?.[STATE_KEY]) return null;
