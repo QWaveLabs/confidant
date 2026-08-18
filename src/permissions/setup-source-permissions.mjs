@@ -66,7 +66,10 @@ const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
 // source could otherwise save an older root and resurrect a revoked grant.
 // FileStateStore instances can also be reconstructed with equivalent lexical
 // paths, so derive one in-process lock identity from the canonical backing
-// file. The AsyncLocalStorage context makes this lock safely re-entrant.
+// file. AsyncLocalStorage identifies unsafe descendant calls: a public writer
+// must never re-enter from a state-store/connector callback while its ancestor
+// still holds a stale full-root snapshot. Legitimate composition must use an
+// explicit lock-held internal primitive instead of re-entering this boundary.
 const stateStoreOperationTails = new Map();
 const inMemoryStateStoreOperationKeys = new WeakMap();
 const stateStoreLockContext = new AsyncLocalStorage();
@@ -135,7 +138,12 @@ export async function withSourcePermissionStateLock(stateStore, operation) {
   if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
   const key = stateStoreOperationKey(stateStore);
   const inherited = stateStoreLockContext.getStore();
-  if (inherited?.keys?.has(key)) return operation();
+  if (inherited?.keys?.has(key)) {
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REENTRANT_OPERATION_BLOCKED",
+      "A nested state operation was blocked before it could overwrite a newer private permission state. Retry it after the current operation finishes."
+    );
+  }
 
   const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
   let release;
@@ -719,7 +727,7 @@ function publicReview(entry, language) {
   };
 }
 
-function assertPersistedGrantStillMatchesReview(grant, entry, clock) {
+export function assertPersistedSourcePermissionGrantStillMatchesReview(grant, entry, clock) {
   if (!grant?.disclosuresAcknowledged?.modelProcessing?.acknowledged || !grant?.disclosuresAcknowledged?.untrustedSourceMaterial?.acknowledged) {
     throw new PermissionLifecycleError(
       "PERSISTED_GRANT_INVALID",
@@ -983,7 +991,7 @@ async function fetchApprovedSourceContentLocked({ message, stateStore, connector
   if (!grant || entry.status !== "granted") {
     throw new PermissionLifecycleError("ACTIVE_GRANT_REQUIRED", "No source content was read because there is no active permission grant for this reviewed scope.");
   }
-  assertPersistedGrantStillMatchesReview(grant, entry, clock);
+  assertPersistedSourcePermissionGrantStillMatchesReview(grant, entry, clock);
 
   if (typeof connector.registerPermissionGrant !== "function") {
     throw new PermissionLifecycleError("PERMISSION_GRANT_RESTORE_FAILED", "I could not restore the saved read-only permission safely, so no source content was read.");

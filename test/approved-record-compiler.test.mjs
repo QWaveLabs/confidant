@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdtemp, mkdir, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,6 +28,54 @@ import {
 
 const startedAt = "2026-08-17T12:00:00.000Z";
 const laterToday = "2026-08-17T13:00:00.000Z";
+
+function generationTag(leaseId) {
+  return createHash("sha256").update(leaseId).digest("hex").slice(0, 24);
+}
+
+function stagingArtifacts(root, batchId, leaseId) {
+  const base = path.join(root, `batch-${batchId}.${generationTag(leaseId)}`);
+  return {
+    data: `${base}.json`,
+    lease: `${base}.lease.json`,
+    receipt: `${base}.receipt.json`,
+    tombstone: `${base}.tombstone.json`,
+    owner: `${base}.owner.json`
+  };
+}
+
+async function stagedDataNames(root) {
+  return (await readdir(root)).filter((name) => (
+    name.endsWith(".json")
+    && !name.endsWith(".lease.json")
+    && !name.endsWith(".receipt.json")
+    && !name.endsWith(".tombstone.json")
+    && !name.endsWith(".owner.json")
+  )).sort();
+}
+
+function simulatedIoError(message) {
+  const error = new Error(message);
+  error.code = "EIO";
+  return error;
+}
+
+function isStagingDataPath(target) {
+  const name = path.basename(String(target));
+  return name.startsWith("batch-")
+    && name.endsWith(".json")
+    && ![".lease.json", ".receipt.json", ".tombstone.json", ".owner.json"].some((suffix) => name.endsWith(suffix));
+}
+
+function proxyFileHandle(handle, overrides) {
+  return new Proxy(handle, {
+    get(target, property) {
+      if (Object.hasOwn(overrides, property)) return overrides[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
 
 function clockAt(value) {
   return { now: () => new Date(value) };
@@ -229,6 +279,62 @@ class FailOnceReadStaging {
   async delete(input) { return this.delegate.delete(input); }
 
   async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
+
+  async acknowledgeCleanupReceipt(input) { return this.delegate.acknowledgeCleanupReceipt(input); }
+}
+
+class ControlledFailureStaging {
+  constructor(delegate) {
+    this.delegate = delegate;
+    this.readFailures = 0;
+    this.deleteFailures = 0;
+    this.afterRead = null;
+  }
+
+  async stage(input) { return this.delegate.stage(input); }
+
+  async read(input) {
+    if (this.readFailures > 0) {
+      this.readFailures -= 1;
+      throw new Error("Simulated transient staging read interruption.");
+    }
+    const result = await this.delegate.read(input);
+    await this.afterRead?.(result);
+    return result;
+  }
+
+  async delete(input) {
+    if (this.deleteFailures > 0) {
+      this.deleteFailures -= 1;
+      throw new Error("Simulated transient staging deletion interruption.");
+    }
+    return this.delegate.delete(input);
+  }
+
+  async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
+
+  async acknowledgeCleanupReceipt(input) { return this.delegate.acknowledgeCleanupReceipt(input); }
+}
+
+class HookedStateStore {
+  constructor(delegate) {
+    this.delegate = delegate;
+    this.filePath = delegate.filePath;
+    this.hook = null;
+    this.hookResult = null;
+    this.hookError = null;
+    this.hookInvoked = false;
+  }
+
+  async load() { return this.delegate.load(); }
+
+  async save(state) {
+    if (this.hook && !this.hookInvoked) {
+      this.hookInvoked = true;
+      try { this.hookResult = await this.hook(); } catch (error) { this.hookError = error; }
+    }
+    return this.delegate.save(state);
+  }
 }
 
 class FailNextSaveStateStore {
@@ -314,17 +420,22 @@ class PauseBeforeCompiledResultSaveStateStore {
 }
 
 class FixtureRetentionService {
-  constructor() {
+  constructor({ onArm = null } = {}) {
     this.armed = [];
     this.disarmed = [];
+    this.onArm = onArm;
   }
 
-  async arm({ root, batchId, expiresAt }) {
-    this.armed.push({ root, batchId, expiresAt, filesBeforeWrite: await readdir(root) });
+  async arm({ root, batchId, expiresAt, leaseId }) {
+    const filesBeforeWrite = await readdir(root);
+    const leaseName = filesBeforeWrite.find((name) => name.endsWith(".lease.json"));
+    const manifestBeforeWrite = leaseName ? JSON.parse(await readFile(path.join(root, leaseName), "utf8")) : null;
+    await this.onArm?.({ root, batchId, expiresAt, leaseId, filesBeforeWrite, manifestBeforeWrite });
+    this.armed.push({ root, batchId, expiresAt, leaseId, filesBeforeWrite, manifestBeforeWrite });
   }
 
-  async disarm({ root, batchId }) {
-    this.disarmed.push({ root, batchId });
+  async disarm({ root, batchId, leaseId }) {
+    this.disarmed.push({ root, batchId, leaseId });
   }
 }
 
@@ -365,6 +476,26 @@ function runRetentionCreator({ root, batchId, expiresAt }) {
       else rejectChild(new Error(`Retention creator exited unexpectedly (${code ?? "null"}/${signal ?? "none"}).`));
     });
   });
+}
+
+function processCommands() {
+  return new Promise((resolveCommands, rejectCommands) => {
+    const child = spawn("/bin/ps", ["-axo", "pid=,command="], { stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.once("error", rejectCommands);
+    child.once("exit", (code) => {
+      if (code === 0) resolveCommands(output.split("\n").filter(Boolean));
+      else rejectCommands(new Error(`ps exited with ${code}`));
+    });
+  });
+}
+
+async function retentionWorkerCommands(batchId) {
+  return (await processCommands()).filter((line) => (
+    line.includes("private-staging-retention-worker.mjs") && line.includes(batchId)
+  ));
 }
 
 test("approved references compile into sourced canonical notes for every QWA-146 subject category without retaining staging", async () => {
@@ -586,20 +717,20 @@ test("temporary staging rejects repository roots and symlink escapes", async () 
     );
     const outside = path.join(directory, "outside.json");
     await writeFile(outside, "{}\n", "utf8");
-    await symlink(outside, path.join(safeRoot, "batch-symlink-batch.json"));
+    const symlinkReceipt = await safeStaging.stage({ batchId: "symlink-batch", records: [inertStagingRecord()], createdAt: startedAt });
+    const symlinkArtifacts = stagingArtifacts(safeRoot, "symlink-batch", symlinkReceipt.leaseId);
+    await unlink(symlinkArtifacts.data);
+    await symlink(outside, symlinkArtifacts.data);
     await assert.rejects(
-      () => safeStaging.read({ batchId: "symlink-batch" }),
+      () => safeStaging.read({ batchId: "symlink-batch", leaseId: symlinkReceipt.leaseId }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_SYMLINK_BLOCKED"
     );
 
-    await safeStaging.stage({ batchId: "tampered-expiry", records: [inertStagingRecord()], createdAt: startedAt });
-    await writeFile(path.join(safeRoot, "batch-tampered-expiry.json"), JSON.stringify({
-      version: 1,
-      batchId: "tampered-expiry",
-      createdAt: startedAt,
-      expiresAt: "2030-01-01T00:00:00.000Z",
-      records: [inertStagingRecord()]
-    }), "utf8");
+    const tamperedReceipt = await safeStaging.stage({ batchId: "tampered-expiry", records: [inertStagingRecord()], createdAt: startedAt });
+    const tamperedArtifacts = stagingArtifacts(safeRoot, "tampered-expiry", tamperedReceipt.leaseId);
+    const tamperedPayload = JSON.parse(await readFile(tamperedArtifacts.data, "utf8"));
+    tamperedPayload.expiresAt = "2030-01-01T00:00:00.000Z";
+    await writeFile(tamperedArtifacts.data, `${JSON.stringify(tamperedPayload)}\n`, "utf8");
     const tamperCleanup = await safeStaging.cleanupExpired({ now: laterToday });
     assert.deepEqual(tamperCleanup.removedBatchIds, ["symlink-batch", "tampered-expiry"]);
   } finally {
@@ -704,6 +835,160 @@ test("an approved record with a participant omitted from the selected allowlist 
   });
 });
 
+test("persisted Blocked-to-Allowed corruption is revalidated against immutable review metadata before compilation", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging }) => {
+    const accountId = "fixture-blocked-integrity-account";
+    const sourceRecordId = "fixture-blocked-integrity-group";
+    const connector = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: accountId, label: "Blocked integrity fixture" },
+      people: [
+        { id: "person-allowed", label: "Allowed", accessLevel: "allowed" },
+        { id: "person-blocked", label: "Blocked", accessLevel: "blocked" }
+      ],
+      items: [{
+        id: sourceRecordId,
+        kind: "conversation",
+        isGroup: true,
+        area: "inbox",
+        category: "planning",
+        timestamp: startedAt,
+        participantIds: ["person-allowed", "person-blocked"],
+        label: "Blocked group record"
+      }]
+    });
+    const reviewId = "blocked-integrity-review";
+    const grantId = "blocked-integrity-grant";
+    const review = await beginSourcePermissionReview({
+      message: "Review this bounded Gmail group",
+      stateStore,
+      connector,
+      source: "gmail",
+      clock: clockAt(startedAt),
+      reviewIdFactory: () => reviewId
+    });
+    const scope = scopeForApproval(review);
+    scope.blockedGroupConversationExceptions = [sourceRecordId];
+    await grantSourcePermission({
+      message: "Approve only this separately reviewed group",
+      stateStore,
+      connector,
+      source: "gmail",
+      accountId,
+      reviewId,
+      scope,
+      clock: clockAt(startedAt),
+      grantIdFactory: () => grantId
+    });
+
+    const state = await stateStore.load();
+    const entry = state.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(accountId)}`];
+    const grant = entry.grants.find((candidate) => candidate.status === "active");
+    for (const boundary of [entry.review.requestedScope, grant.scope]) {
+      boundary.people.allowed = [...new Set([...boundary.people.allowed, "person-blocked"])].sort();
+      boundary.people.blocked = boundary.people.blocked.filter((id) => id !== "person-blocked");
+      boundary.exclusions.people = boundary.exclusions.people.filter((id) => id !== "person-blocked");
+    }
+    await stateStore.save(state);
+
+    const permission = {
+      source: "gmail",
+      accountId,
+      sourceRecordId,
+      reviewId,
+      grantId,
+      sourceTimestamp: startedAt,
+      participantRefs: ["person-allowed", "person-blocked"],
+      sourceLabel: "Blocked group record",
+      stableLink: null
+    };
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Compile my approved notes",
+        stateStore,
+        staging,
+        batchId: "fixture-blocked-integrity",
+        approvedRecords: [approvedRecord(permission, [
+          assertion("knowledge", "knowledge-blocked-integrity", "Blocked integrity", "This forged promotion must never compile.")
+        ])],
+        clock: clockAt(laterToday)
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "PERSISTED_GRANT_INVALID"
+    );
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
+test("missing or unknown access, sensitivity, and participant metadata fail closed before staging", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const baseline = await stateStore.load();
+    const key = `gmail:${encodeURIComponent(gmail.accountId)}`;
+    const cases = [
+      ["missing-access", (entry) => { delete entry.review.metadata.people[0].accessLevel; }],
+      ["unknown-access", (entry) => { entry.review.metadata.people[0].accessLevel = "mystery"; }],
+      ["missing-sensitivity", (entry) => { delete entry.review.metadata.items[0].sensitiveCategories; }],
+      ["unknown-sensitivity", (entry) => { entry.review.metadata.items[0].sensitiveCategories = ["unknown-private-class"]; }],
+      ["malformed-participants", (entry) => { entry.review.metadata.items[0].participantIds = "person-fixture-alex"; }]
+    ];
+    for (const [label, mutate] of cases) {
+      const corrupted = structuredClone(baseline);
+      mutate(corrupted.sourcePermissionLifecycle.entries[key]);
+      await stateStore.save(corrupted);
+      await assert.rejects(
+        () => compileApprovedRecords({
+          message: "Compile my approved notes",
+          stateStore,
+          staging,
+          batchId: `fixture-${label}`,
+          approvedRecords: [approvedRecord(gmail, [
+            assertion("knowledge", `knowledge-${label}`, "Metadata integrity", "Malformed metadata must remain outside compilation.")
+          ])],
+          clock: clockAt(laterToday)
+        }),
+        (error) => error instanceof KnowledgeCompilationError
+          && ["PERSISTED_GRANT_INVALID", "RECORD_OUTSIDE_APPROVED_SCOPE", "SOURCE_PROVENANCE_INVALID"].includes(error.code)
+      );
+      assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+    }
+    await stateStore.save(baseline);
+  });
+});
+
+test("a descendant public revoke cannot re-enter the compiler lock and overwrite a stale full-root state", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const hookedStore = new HookedStateStore(stateStore);
+    hookedStore.hook = () => revokeSourcePermission({
+      message: "Revoke this source permission",
+      stateStore: hookedStore,
+      connector: gmail.connector,
+      source: gmail.source,
+      accountId: gmail.accountId,
+      reviewId: gmail.reviewId,
+      clock: clockAt("2026-08-17T13:00:30.000Z")
+    });
+    const result = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore: hookedStore,
+      staging,
+      batchId: "fixture-reentrant-revoke",
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-reentrant-revoke", "Re-entry guard", "A descendant callback cannot write through an ancestor transaction.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+
+    assert.equal(result.compilation.status, "compiled");
+    assert.equal(hookedStore.hookResult, null);
+    assert.equal(hookedStore.hookError?.code, "STATE_LOCK_REENTRANT_OPERATION_BLOCKED");
+    const durable = await stateStore.load();
+    const entry = durable.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(gmail.accountId)}`];
+    assert.equal(entry.status, "granted");
+    assert.equal(entry.grants.find((grant) => grant.id === gmail.grantId).status, "active");
+    assert.equal(durable.knowledgeCompilationLifecycle.batches["fixture-reentrant-revoke"].status, "compiled");
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
 test("a transient staging interruption resumes the same protected batch and deletes it after success", async () => {
   await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
     const interruptedStaging = new FailOnceReadStaging(staging);
@@ -720,7 +1005,7 @@ test("a transient staging interruption resumes the same protected batch and dele
     });
     assert.equal(interrupted.compilation.status, "staged");
     assert.equal(interrupted.interruption.retryable, true);
-    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-resume-batch.json"]);
+    assert.equal((await stagedDataNames(path.join(directory, ".qwave-second-brain-staging"))).length, 1);
 
     const resumed = await compileApprovedRecords({
       message: "Continue compiling my approved notes",
@@ -763,7 +1048,7 @@ test("a disk-staged batch reconciles after a private state-save interruption ins
       }),
       /Simulated private state save interruption/
     );
-    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-state-save-retry.json"]);
+    assert.equal((await stagedDataNames(path.join(directory, ".qwave-second-brain-staging"))).length, 1);
 
     // Recreate the adapter to model a restart: recovery comes from the
     // bounded on-disk batch, not from the prior instance's memory.
@@ -802,7 +1087,7 @@ test("a persistent final result-save failure retains the protected stage and res
     });
     assert.equal(first.compilation.status, "staged");
     assert.equal(first.interruption.code, "RESULT_STATE_SAVE_FAILED");
-    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), [`batch-${batchId}.json`]);
+    assert.equal((await stagedDataNames(path.join(directory, ".qwave-second-brain-staging"))).length, 1);
 
     interruptedStore.failCompiledResultSaves = false;
     const resumed = await compileApprovedRecords({
@@ -835,7 +1120,10 @@ test("a cleanup-receipt save failure keeps the durable compiled result and finis
     assert.equal(first.compilation.status, "compiled");
     assert.equal(first.compilation.staging.status, "result-persisted-pending-deletion");
     assert.equal(first.claims.length, 1);
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+    assert.deepEqual(
+      (await readdir(path.join(directory, ".qwave-second-brain-staging"))).sort().map((name) => name.split(".").at(-2)),
+      ["receipt", "tombstone"]
+    );
 
     const durableAfterFailure = await stateStore.load();
     const durableEntry = durableAfterFailure.knowledgeCompilationLifecycle.batches[batchId];
@@ -855,6 +1143,211 @@ test("a cleanup-receipt save failure keeps the durable compiled result and finis
     assert.deepEqual(resumed.claims, first.claims);
     const durableAfterResume = await stateStore.load();
     assert.equal(durableAfterResume.knowledgeCompilationLifecycle.batches[batchId].staging.status, "deleted-after-compilation");
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
+test("forged completion receipts cannot change lifecycle truth while the exact generation still exists", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const controlled = new ControlledFailureStaging(staging);
+    controlled.readFailures = 1;
+    const batchId = "fixture-forged-receipts";
+    const first = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-forged-receipts", "Receipt integrity", "Only an exact durable cleanup receipt may change lifecycle truth.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(first.compilation.status, "staged");
+
+    const durable = await stateStore.load();
+    const leaseId = durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const forgeries = [
+      { version: 999, batchId, leaseId, deletedAt: laterToday },
+      { version: 1, batchId, leaseId: "lease-forged-other", deletedAt: laterToday },
+      { version: 1, batchId, leaseId, deletedAt: "2026-08-17 13:00:00Z" }
+    ];
+    for (const forged of forgeries) {
+      await writeFile(artifacts.receipt, `${JSON.stringify(forged)}\n`, "utf8");
+      await cleanupExpiredKnowledgeStaging({
+        stateStore,
+        staging: controlled,
+        clock: clockAt("2026-08-17T13:01:00.000Z")
+      });
+      const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+      assert.equal(status.compilation.status, "staged");
+      assert.equal(status.compilation.retryable, true);
+      assert.equal((await lstat(artifacts.data)).isFile(), true);
+      assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    }
+    await staging.delete({ batchId, leaseId });
+    await staging.acknowledgeCleanupReceipt({ batchId, leaseId });
+  });
+});
+
+test("a receipt rename failure after verified deletion remains cleanup-pending and resumes from the durable tombstone", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    let failReceiptRename = true;
+    const staging = fixtureStaging(root, {
+      fileSystem: {
+        async rename(from, to) {
+          if (failReceiptRename && String(to).endsWith(".receipt.json")) {
+            failReceiptRename = false;
+            throw simulatedIoError("Simulated completion-receipt rename failure.");
+          }
+          return rename(from, to);
+        }
+      }
+    });
+    const batchId = "fixture-receipt-rename-retry";
+    const first = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-receipt-rename", "Receipt rename", "A content-free tombstone makes deletion bookkeeping resumable.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(first.compilation.status, "compiled");
+    assert.equal(first.compilation.staging.status, "result-persisted-pending-deletion");
+    assert.equal(first.compilation.retryable, true);
+    assert.match(first.compilation.message, /continue to retry cleanup only/i);
+    const durable = await stateStore.load();
+    const leaseId = durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    await assert.rejects(() => lstat(artifacts.data), (error) => error?.code === "ENOENT");
+    await assert.rejects(() => lstat(artifacts.lease), (error) => error?.code === "ENOENT");
+    assert.equal((await lstat(artifacts.tombstone)).isFile(), true);
+
+    const resumed = await compileApprovedRecords({
+      message: "Continue compiling my approved notes",
+      stateStore,
+      staging,
+      batchId,
+      clock: clockAt("2026-08-17T13:02:00.000Z")
+    });
+    assert.equal(resumed.compilation.staging.status, "deleted-after-compilation");
+    assert.equal(resumed.compilation.staging.deletedAt, "2026-08-17T13:02:00.000Z");
+    assert.equal(resumed.compilation.retryable, false);
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
+test("a durable tombstone parent-fsync failure keeps compiled cleanup pending and callable through normal-language resume", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    let failNextRootSync = false;
+    const base = fixtureStaging(root, {
+      fileSystem: {
+        async open(target, flags, mode) {
+          if (failNextRootSync && path.basename(String(target)) === ".qwave-second-brain-staging") {
+            failNextRootSync = false;
+            throw simulatedIoError("Simulated staging-directory fsync failure.");
+          }
+          return open(target, flags, mode);
+        }
+      }
+    });
+    const controlled = new ControlledFailureStaging(base);
+    controlled.afterRead = async () => { failNextRootSync = true; controlled.afterRead = null; };
+    const batchId = "fixture-tombstone-dir-sync-retry";
+    const first = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-tombstone-dir-sync", "Tombstone durability", "Directory durability failures remain explicit and retryable.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(first.compilation.status, "compiled");
+    assert.equal(first.compilation.staging.status, "result-persisted-pending-deletion");
+    assert.equal(first.compilation.retryable, true);
+
+    const durable = await stateStore.load();
+    const leaseId = durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.equal((await lstat(artifacts.tombstone)).isFile(), true);
+
+    const resumed = await compileApprovedRecords({
+      message: "Continue compiling my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      clock: clockAt("2026-08-17T13:03:00.000Z")
+    });
+    assert.equal(resumed.compilation.staging.status, "deleted-after-compilation");
+    assert.equal(resumed.compilation.retryable, false);
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
+test("discarded pending deletion stays retryable and normal-language resume performs cleanup only", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const controlled = new ControlledFailureStaging(staging);
+    controlled.readFailures = 1;
+    const batchId = "fixture-discard-cleanup-resume";
+    const interrupted = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-discard-cleanup", "Discard cleanup", "Revoked staging remains inert and cleanup-only.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(interrupted.compilation.status, "staged");
+    await revokeSourcePermission({
+      message: "Revoke this source permission",
+      stateStore,
+      connector: gmail.connector,
+      source: gmail.source,
+      accountId: gmail.accountId,
+      reviewId: gmail.reviewId,
+      clock: clockAt("2026-08-17T13:01:00.000Z")
+    });
+    controlled.deleteFailures = 1;
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Continue compiling my approved notes",
+        stateStore,
+        staging: controlled,
+        batchId,
+        clock: clockAt("2026-08-17T13:02:00.000Z")
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "ACTIVE_GRANT_REQUIRED"
+    );
+    const pending = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(pending.compilation.status, "discarded");
+    assert.equal(pending.compilation.staging.status, "discarded-pending-deletion");
+    assert.equal(pending.compilation.retryable, true);
+    assert.match(pending.compilation.message, /continue to retry cleanup only/i);
+
+    const resumed = await compileApprovedRecords({
+      message: "Continue cleanup of my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      clock: clockAt("2026-08-17T13:03:00.000Z")
+    });
+    assert.equal(resumed.compilation.status, "discarded");
+    assert.equal(resumed.compilation.staging.status, "discarded");
+    assert.equal(resumed.compilation.retryable, false);
+    assert.deepEqual(resumed.cleanup, { completed: true, retryable: false });
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
   });
 });
 
@@ -998,7 +1491,7 @@ test("the 24-hour cleanup deletes interrupted staging and makes resume fail clos
       ])],
       clock: clockAt(startedAt)
     });
-    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-expiry-batch.json"]);
+    assert.equal((await stagedDataNames(path.join(directory, ".qwave-second-brain-staging"))).length, 1);
 
     const cleanup = await cleanupExpiredKnowledgeStaging({
       stateStore,
@@ -1035,15 +1528,23 @@ test("a fresh staging adapter removes an expired durable batch on restart and le
       clock: clockAt(startedAt)
     });
 
-    const stagedPath = path.join(directory, ".qwave-second-brain-staging", `batch-${batchId}.json`);
-    const stale = JSON.parse(await readFile(stagedPath, "utf8"));
+    const durable = await stateStore.load();
+    const leaseId = durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const stale = JSON.parse(await readFile(artifacts.data, "utf8"));
     stale.createdAt = "2020-01-01T00:00:00.000Z";
     stale.expiresAt = "2020-01-02T00:00:00.000Z";
-    await writeFile(stagedPath, `${JSON.stringify(stale)}\n`, "utf8");
+    await writeFile(artifacts.data, `${JSON.stringify(stale)}\n`, "utf8");
+    const staleLease = JSON.parse(await readFile(artifacts.lease, "utf8"));
+    staleLease.createdAt = stale.createdAt;
+    staleLease.expiresAt = stale.expiresAt;
+    await writeFile(artifacts.lease, `${JSON.stringify(staleLease)}\n`, "utf8");
 
-    const restartedStaging = fixtureStaging(path.join(directory, ".qwave-second-brain-staging"));
+    const restartedStaging = fixtureStaging(root);
     await restartedStaging.initialize();
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+    assert.deepEqual(await stagedDataNames(root), []);
+    assert.equal((await readdir(root)).some((name) => name.endsWith(".tombstone.json")), true);
 
     const cleanup = await cleanupExpiredKnowledgeStaging({
       stateStore,
@@ -1054,6 +1555,7 @@ test("a fresh staging adapter removes an expired durable batch on restart and le
     const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
     assert.equal(status.compilation.status, "expired");
     assert.equal(status.compilation.staging.status, "expired-deleted");
+    assert.deepEqual(await readdir(root), []);
   });
 });
 
@@ -1061,11 +1563,51 @@ test("retention arming occurs before a temporary batch write and fails closed wh
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-retention-arm-"));
   try {
     const root = path.join(directory, ".qwave-second-brain-staging");
-    const retentionService = new FixtureRetentionService();
-    const staging = fixtureStaging(root, { retentionService });
-    await staging.stage({ batchId: "fixture-retention-arm", records: [inertStagingRecord()], createdAt: startedAt });
-    assert.deepEqual(retentionService.armed[0].filesBeforeWrite, []);
-    await staging.delete({ batchId: "fixture-retention-arm" });
+    const durabilityEvents = [];
+    const retentionService = new FixtureRetentionService({
+      onArm({ manifestBeforeWrite }) {
+        durabilityEvents.push("retention-armed");
+        assert.equal(manifestBeforeWrite.phase, "prepared");
+      }
+    });
+    const staging = fixtureStaging(root, {
+      retentionService,
+      fileSystem: {
+        async open(target, flags, mode) {
+          if (isStagingDataPath(target)) durabilityEvents.push("data-opened");
+          const handle = await open(target, flags, mode);
+          if (String(target).endsWith(".lease.json") && (flags & constants.O_WRONLY) === constants.O_WRONLY) {
+            return proxyFileHandle(handle, {
+              async sync() {
+                await handle.sync();
+                durabilityEvents.push("lease-file-synced");
+              }
+            });
+          }
+          if (path.basename(String(target)) === ".qwave-second-brain-staging") {
+            return proxyFileHandle(handle, {
+              async sync() {
+                await handle.sync();
+                durabilityEvents.push("lease-parent-synced");
+              }
+            });
+          }
+          return handle;
+        }
+      }
+    });
+    const receipt = await staging.stage({ batchId: "fixture-retention-arm", records: [inertStagingRecord()], createdAt: startedAt });
+    assert.equal(retentionService.armed[0].filesBeforeWrite.length, 1);
+    assert.equal(retentionService.armed[0].filesBeforeWrite[0].endsWith(".lease.json"), true);
+    assert.equal(retentionService.armed[0].filesBeforeWrite.some((name) => !name.endsWith(".lease.json") && name.endsWith(".json")), false);
+    assert.deepEqual(durabilityEvents.slice(0, 4), [
+      "lease-file-synced",
+      "lease-parent-synced",
+      "retention-armed",
+      "data-opened"
+    ]);
+    await staging.delete({ batchId: "fixture-retention-arm", leaseId: receipt.leaseId });
+    await staging.acknowledgeCleanupReceipt({ batchId: "fixture-retention-arm", leaseId: receipt.leaseId });
 
     const unavailable = fixtureStaging(root, {
       retentionService: {
@@ -1087,6 +1629,100 @@ test("retention arming occurs before a temporary batch write and fails closed wh
       }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "RETENTION_SERVICE_UNAVAILABLE"
     );
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("post-open write, fsync, and close failures never leave untracked staging data", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-post-open-"));
+  try {
+    for (const operation of ["writeFile", "sync", "close"]) {
+      const parent = path.join(directory, operation);
+      const root = path.join(parent, ".qwave-second-brain-staging");
+      await mkdir(parent);
+      let injected = false;
+      const staging = fixtureStaging(root, {
+        fileSystem: {
+          async open(target, flags, mode) {
+            const handle = await open(target, flags, mode);
+            if (!isStagingDataPath(target)) return handle;
+            return proxyFileHandle(handle, {
+              async writeFile(...args) {
+                if (!injected && operation === "writeFile") {
+                  injected = true;
+                  throw simulatedIoError("Simulated post-open staging write failure.");
+                }
+                return handle.writeFile(...args);
+              },
+              async sync() {
+                if (!injected && operation === "sync") {
+                  injected = true;
+                  throw simulatedIoError("Simulated post-open staging fsync failure.");
+                }
+                return handle.sync();
+              },
+              async close() {
+                if (!injected && operation === "close") {
+                  await handle.close();
+                  injected = true;
+                  throw simulatedIoError("Simulated post-open staging close failure.");
+                }
+                return handle.close();
+              }
+            });
+          }
+        }
+      });
+      await assert.rejects(
+        () => staging.stage({
+          batchId: `fixture-post-open-${operation}`,
+          records: [inertStagingRecord()],
+          createdAt: startedAt
+        }),
+        (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_WRITE_FAILED"
+      );
+      assert.equal(injected, true);
+      assert.deepEqual(await readdir(root), []);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a transient data-unlink failure keeps generation-bound cleanup retryable until verified absence", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-unlink-retry-"));
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    let failTarget = null;
+    let unlinkFailed = false;
+    const staging = fixtureStaging(root, {
+      fileSystem: {
+        async unlink(target) {
+          if (!unlinkFailed && failTarget && path.basename(String(target)) === path.basename(failTarget)) {
+            unlinkFailed = true;
+            throw simulatedIoError("Simulated transient staged-data unlink failure.");
+          }
+          return unlink(target);
+        }
+      }
+    });
+    const batchId = "fixture-transient-unlink";
+    const receipt = await staging.stage({ batchId, records: [inertStagingRecord()], createdAt: startedAt });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    failTarget = artifacts.data;
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_DELETE_FAILED"
+    );
+    assert.equal(unlinkFailed, true);
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.equal((await lstat(artifacts.tombstone)).isFile(), true);
+
+    assert.equal(await staging.delete({ batchId, leaseId: receipt.leaseId }), true);
+    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId });
     assert.deepEqual(await readdir(root), []);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -1141,17 +1777,222 @@ test("the detached private retention worker removes a pre-armed batch after its 
     await mkdir(rootPath, { mode: 0o700 });
     const root = await realpath(rootPath);
     const batchId = "fixture-creator-exit";
+    const leaseId = "lease-fixture-worker";
     const expiresAt = new Date(Date.now() + 1_000).toISOString();
     // The creator only arms the detached worker and exits. The test writes a
     // non-sensitive placeholder after that exit to prove the worker, not the
     // creator's in-memory timer, performs the scheduled cleanup.
     await runRetentionCreator({ root, batchId, expiresAt });
-    const stagedPath = path.join(root, `batch-${batchId}.json`);
-    await writeFile(path.join(root, `batch-${batchId}.lease`), "lease-fixture-worker\n", { encoding: "utf8", mode: 0o600 });
-    await writeFile(stagedPath, `${JSON.stringify({ batchId, expiresAt })}\n`, { encoding: "utf8", mode: 0o600 });
-    await waitFor(async () => !(await readdir(root)).includes(`batch-${batchId}.json`));
-    assert.ok((await readdir(root)).every((name) => name === `batch-${batchId}.receipt.json`));
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const manifest = JSON.parse(await readFile(artifacts.lease, "utf8"));
+    await writeFile(artifacts.data, `${JSON.stringify({ batchId, leaseId, expiresAt })}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(artifacts.lease, `${JSON.stringify({ ...manifest, phase: "ready" })}\n`, { encoding: "utf8", mode: 0o600 });
+    await waitFor(async () => {
+      const names = await readdir(root);
+      return !names.includes(path.basename(artifacts.data))
+        && !names.includes(path.basename(artifacts.owner))
+        && names.includes(path.basename(artifacts.receipt));
+    });
+    const remaining = (await readdir(root)).sort();
+    assert.deepEqual(remaining, [path.basename(artifacts.receipt), path.basename(artifacts.tombstone)].sort());
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a restarted staging adapter adopts one generation owner and early deletion leaves zero worker processes", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-adoption-"));
+  const batchId = "fixture-restart-adoption-owner";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const firstService = new DetachedLocalRetentionService();
+    const first = new LocalTemporaryStaging({ root, retentionService: firstService });
+    const receipt = await first.stage({ batchId, records: [inertStagingRecord()], createdAt: new Date().toISOString() });
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+
+    const restarted = new LocalTemporaryStaging({
+      root,
+      retentionService: new DetachedLocalRetentionService()
+    });
+    await restarted.initialize();
+    assert.equal((await readdir(root)).filter((name) => name.endsWith(".owner.json")).length, 1);
+    assert.equal((await retentionWorkerCommands(batchId)).length, 1);
+
+    await restarted.delete({ batchId, leaseId: receipt.leaseId });
+    await restarted.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId });
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart replaces a fresh-looking owner whose bound worker process has crashed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-crashed-owner-"));
+  const batchId = "fixture-crashed-owner-restart";
+  const leaseId = "lease-crashed-owner-restart";
+  try {
+    const rootPath = path.join(directory, ".qwave-second-brain-staging");
+    await mkdir(rootPath, { mode: 0o700 });
+    const root = await realpath(rootPath);
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.parse(createdAt) + (24 * 60 * 60 * 1000)).toISOString();
+    await writeFile(artifacts.lease, `${JSON.stringify({
+      version: 1,
+      batchId,
+      leaseId,
+      phase: "prepared",
+      createdAt,
+      expiresAt
+    })}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(artifacts.owner, `${JSON.stringify({
+      version: 1,
+      batchId,
+      leaseId,
+      expiresAt,
+      workerId: "worker-crashed-fixture",
+      pid: 2_147_483_647,
+      startedAt: createdAt,
+      heartbeatAt: createdAt
+    })}\n`, { encoding: "utf8", mode: 0o600 });
+
+    const service = new DetachedLocalRetentionService();
+    const armed = await service.arm({ root, batchId, leaseId, expiresAt });
+    assert.equal(armed.adopted, false);
+    const replacement = JSON.parse(await readFile(artifacts.owner, "utf8"));
+    assert.notEqual(replacement.workerId, "worker-crashed-fixture");
+    assert.notEqual(replacement.pid, 2_147_483_647);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+
+    await service.disarm({ root, batchId, leaseId });
+    await unlink(artifacts.lease);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an old generation worker cannot delete a later same-ID stage", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-generation-reuse-"));
+  const batchId = "fixture-generation-reuse";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const staging = new LocalTemporaryStaging({ root, retentionService: new DetachedLocalRetentionService() });
+    const oldReceipt = await staging.stage({ batchId, records: [inertStagingRecord()], createdAt: new Date().toISOString() });
+    const oldArtifacts = stagingArtifacts(root, batchId, oldReceipt.leaseId);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+
+    // Model the creator crashing after another recovery path removed the old
+    // generation but before it could cancel the detached worker.
+    await unlink(oldArtifacts.data);
+    await unlink(oldArtifacts.lease);
+    const newReceipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord({ sourceRecordId: "fixture-new-generation-record" })],
+      createdAt: new Date(Date.now() + 1_000).toISOString()
+    });
+    const newArtifacts = stagingArtifacts(root, batchId, newReceipt.leaseId);
+    assert.notEqual(newArtifacts.data, oldArtifacts.data);
+
+    await waitFor(async () => {
+      const names = await readdir(root);
+      return names.includes(path.basename(oldArtifacts.receipt))
+        && !names.includes(path.basename(oldArtifacts.owner));
+    });
+    const newStage = await staging.read({ batchId, leaseId: newReceipt.leaseId });
+    assert.equal(newStage.records[0].sourceRecordId, "fixture-new-generation-record");
+    assert.equal((await lstat(newArtifacts.data)).isFile(), true);
+    assert.equal((await lstat(newArtifacts.lease)).isFile(), true);
+
+    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: oldReceipt.leaseId });
+    await staging.delete({ batchId, leaseId: newReceipt.leaseId });
+    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: newReceipt.leaseId });
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the detached worker retries a transient directory-permission deletion failure and exits after cleanup", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-worker-retry-"));
+  const batchId = "fixture-worker-unlink-retry";
+  const leaseId = "lease-worker-unlink-retry";
+  try {
+    const rootPath = path.join(directory, ".qwave-second-brain-staging");
+    await mkdir(rootPath, { mode: 0o700 });
+    const root = await realpath(rootPath);
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const expiresAt = new Date(Date.now() + 500).toISOString();
+    const createdAt = new Date(Date.parse(expiresAt) - (24 * 60 * 60 * 1000)).toISOString();
+    await writeFile(artifacts.lease, `${JSON.stringify({
+      version: 1,
+      batchId,
+      leaseId,
+      phase: "ready",
+      createdAt,
+      expiresAt
+    })}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(artifacts.data, `${JSON.stringify({ batchId, leaseId, createdAt, expiresAt })}\n`, { encoding: "utf8", mode: 0o600 });
+    const service = new DetachedLocalRetentionService();
+    await service.arm({ root, batchId, leaseId, expiresAt });
+    await chmod(root, 0o500);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 900));
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await retentionWorkerCommands(batchId)).length, 1);
+
+    await chmod(root, 0o700);
+    await waitFor(async () => {
+      const names = await readdir(root);
+      return names.includes(path.basename(artifacts.receipt))
+        && !names.includes(path.basename(artifacts.owner));
+    });
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual(
+      (await readdir(root)).sort(),
+      [path.basename(artifacts.receipt), path.basename(artifacts.tombstone)].sort()
+    );
+  } finally {
+    try { await chmod(path.join(directory, ".qwave-second-brain-staging"), 0o700); } catch {}
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("detached cleanup workers inherit no caller sentinel or ambient environment", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-worker-env-"));
+  const previousSentinel = process.env.QWA146_RETENTION_SENTINEL;
+  try {
+    const rootPath = path.join(directory, ".qwave-second-brain-staging");
+    await mkdir(rootPath, { mode: 0o700 });
+    const root = await realpath(rootPath);
+    const batchId = "fixture-worker-minimal-env";
+    const leaseId = "lease-worker-minimal-env";
+    const workerPath = path.join(process.cwd(), "test-support", "qwa146-env-observer-worker.mjs");
+    const service = new DetachedLocalRetentionService({ workerPath });
+    process.env.QWA146_RETENTION_SENTINEL = "must-not-cross-worker-boundary";
+    await service.arm({
+      root,
+      batchId,
+      leaseId,
+      expiresAt: new Date(Date.now() + 5_000).toISOString()
+    });
+    const observationPath = path.join(root, `env-observation-${batchId}.json`);
+    await waitFor(async () => (await lstat(observationPath)).isFile());
+    const observation = JSON.parse(await readFile(observationPath, "utf8"));
+    assert.equal(observation.inheritedSentinel, false);
+    assert.deepEqual(
+      observation.environmentKeys.filter((key) => key !== "__CF_USER_TEXT_ENCODING"),
+      [],
+      "macOS may add its non-secret text-encoding marker; no caller environment is inherited"
+    );
+    await service.disarm({ root, batchId, leaseId });
+    await unlink(observationPath);
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    if (previousSentinel === undefined) delete process.env.QWA146_RETENTION_SENTINEL;
+    else process.env.QWA146_RETENTION_SENTINEL = previousSentinel;
     await rm(directory, { recursive: true, force: true });
   }
 });
