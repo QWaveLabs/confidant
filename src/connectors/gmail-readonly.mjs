@@ -124,7 +124,9 @@ function copy(language) {
       unsupported: "La conexión de Gmail no está disponible en este entorno. No se leyó ningún correo.",
       actualReadRequired: "No pude probar una lectura real y de solo lectura de Gmail, por lo que no la marcaré como conexión en vivo.",
       retrySavedStep: "Reintenta el paso guardado de Gmail en esta misma conversación.",
-      continueImport: "Continúa la importación guardada de Gmail en esta misma conversación."
+      continueImport: "Continúa la importación guardada de Gmail en esta misma conversación.",
+      uncertainRead: "Una lectura de página de Gmail pudo haber ocurrido, pero su punto de control externo no quedó guardado. No volveré a leer esa página. Revoca este permiso guardado de Gmail e inicia una revisión nueva de metadatos para continuar de forma segura.",
+      preReadCheckpointFailed: "No pude guardar el punto de control de seguridad previo a la lectura, así que no solicité ninguna página de Gmail. Puedes reintentar este paso guardado."
     };
   }
   return {
@@ -146,7 +148,9 @@ function copy(language) {
     unsupported: "Gmail connection is not available in this environment. No mail was read.",
     actualReadRequired: "I could not prove a real, read-only Gmail read, so I will not label it as live.",
     retrySavedStep: "Retry the saved Gmail step in this same conversation.",
-    continueImport: "Continue the saved Gmail import in this same conversation."
+    continueImport: "Continue the saved Gmail import in this same conversation.",
+    uncertainRead: "A Gmail page read may have occurred, but its outer checkpoint was not saved. I will not read that page again. Revoke this saved Gmail permission and start a fresh metadata review to continue safely.",
+    preReadCheckpointFailed: "I could not save the pre-read safety checkpoint, so no Gmail page was requested. You can retry this saved step."
   };
 }
 
@@ -290,6 +294,8 @@ function newEntry(now) {
     },
     import: {
       status: "not-started",
+      operationRevision: 0,
+      pendingPageRead: null,
       pagesCompleted: 0,
       recordsProcessed: 0,
       nextPageToken: null,
@@ -351,8 +357,120 @@ function setFailure(state, entry, { code, stage, clock, language = "en", externa
   rootLifecycle(state).audit.push({ type: revoked ? "gmail-access-revoked" : "gmail-safe-failure", at: now, code, stage, bodiesExposed: false });
 }
 
+function importOperationRevision(entry) {
+  return Number.isSafeInteger(entry?.import?.operationRevision) && entry.import.operationRevision >= 0
+    ? entry.import.operationRevision
+    : 0;
+}
+
+function pendingPageRead(entry) {
+  const pending = entry?.import?.pendingPageRead;
+  return pending && typeof pending === "object" && !Array.isArray(pending) ? pending : null;
+}
+
+function unresolvedPendingPageRead(entry) {
+  if (!pendingPageRead(entry)) return false;
+  return ![
+    GMAIL_CONNECTION_STATES.REVOKED,
+    GMAIL_CONNECTION_STATES.SKIPPED,
+    GMAIL_CONNECTION_STATES.UNSUPPORTED
+  ].includes(entry.status);
+}
+
+function pendingReadRecoveryAction(language) {
+  return {
+    kind: "revoke-and-start-fresh-gmail-review",
+    message: copy(language).uncertainRead
+  };
+}
+
+function pendingReadError(entry) {
+  const pending = pendingPageRead(entry);
+  return {
+    code: "GMAIL_PAGE_READ_CHECKPOINT_UNCERTAIN",
+    stage: "approved-read-checkpoint",
+    at: pending?.startedAt ?? null,
+    readMayHaveOccurred: true
+  };
+}
+
+const PUBLIC_GMAIL_AUDIT_FIELDS = new Set([
+  "type",
+  "at",
+  "code",
+  "bodiesExposed",
+  "simulated",
+  "actualRead",
+  "page",
+  "recordCount",
+  "nextCheckpoint",
+  "estimatedItemCount",
+  "readMayHaveOccurred",
+  "sourceReadAttempted",
+  "permissionRevocationConfirmed"
+]);
+
+function publicAudit(events) {
+  return events.map((event) => Object.fromEntries(
+    Object.entries(event)
+      .filter(([key]) => PUBLIC_GMAIL_AUDIT_FIELDS.has(key))
+      .map(([key, value]) => [key, clone(value)])
+  ));
+}
+
+function pendingGenerationMatches(entry, expected) {
+  const current = pendingPageRead(entry);
+  return Boolean(current
+    && expected
+    && importOperationRevision(entry) === expected.operationRevision
+    && current.operationId === expected.operationId
+    && current.operationRevision === expected.operationRevision
+    && current.reviewId === expected.reviewId
+    && current.grantId === expected.grantId
+    && current.checkpoint === expected.checkpoint
+    && current.startedAt === expected.startedAt);
+}
+
+function setPendingPageReadFailure(state, entry, { error, code, stage, clock, language }) {
+  const pending = pendingPageRead(entry);
+  const now = isoNow(clock);
+  const failureCode = code ?? safeErrorCode(error, "GMAIL_PAGE_READ_CHECKPOINT_UNCERTAIN");
+  entry.status = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
+  entry.connection.state = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
+  entry.connection.live = false;
+  entry.import.status = "read-may-have-occurred";
+  entry.pendingAction = pendingReadRecoveryAction(language);
+  entry.lastSafeError = {
+    code: failureCode,
+    ...(failureCode === "GMAIL_PAGE_READ_CHECKPOINT_UNCERTAIN" && error ? { causeCode: safeErrorCode(error, "GMAIL_PAGE_CHECKPOINT_SAVE_FAILED") } : {}),
+    stage,
+    at: now,
+    readMayHaveOccurred: true
+  };
+  if (!entry.audit.some((event) => event.type === "gmail-page-read-checkpoint-uncertain" && event.operationId === pending?.operationId)) {
+    entry.audit.push({
+      type: "gmail-page-read-checkpoint-uncertain",
+      at: now,
+      operationId: pending?.operationId ?? null,
+      operationRevision: pending?.operationRevision ?? null,
+      code: failureCode,
+      readMayHaveOccurred: true,
+      bodiesExposed: false
+    });
+    rootLifecycle(state).audit.push({
+      type: "gmail-page-read-checkpoint-uncertain",
+      at: now,
+      operationRevision: pending?.operationRevision ?? null,
+      code: failureCode,
+      readMayHaveOccurred: true,
+      bodiesExposed: false
+    });
+  }
+}
+
 function statusMessage(entry, language) {
   const wording = copy(language);
+  if (unresolvedPendingPageRead(entry)) return wording.uncertainRead;
   if (entry.status === GMAIL_CONNECTION_STATES.REVOKED) return wording.revoked;
   if (entry.status === GMAIL_CONNECTION_STATES.SKIPPED) return wording.skipped;
   if (entry.status === GMAIL_CONNECTION_STATES.UNSUPPORTED) return wording.unsupported;
@@ -373,7 +491,10 @@ function publicView(entry, language, permissionReview = null) {
   // Persisted or injected fields must therefore never turn its Gmail view into
   // a live verification claim. A future host-owned integration must expose its
   // evidence through a separately reviewed, non-public boundary.
-  const status = entry.status === GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED
+  const readMayHaveOccurred = unresolvedPendingPageRead(entry);
+  const status = readMayHaveOccurred
+    ? GMAIL_CONNECTION_STATES.NEEDS_ATTENTION
+    : entry.status === GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED
     ? GMAIL_CONNECTION_STATES.NEEDS_ATTENTION
     : entry.status;
   return {
@@ -403,18 +524,22 @@ function publicView(entry, language, permissionReview = null) {
     },
     account: entry.accountId ? { context: `gmail:${entry.accountId}` } : null,
     import: {
-      status: entry.import.status,
+      status: readMayHaveOccurred ? "read-may-have-occurred" : entry.import.status,
       pagesCompleted: entry.import.pagesCompleted,
       recordsProcessed: entry.import.recordsProcessed,
       estimatedItemCount: entry.import.estimatedItemCount,
       checkpointPending: typeof entry.import.nextPageToken === "string",
+      readMayHaveOccurred,
+      recoveryRequiresFreshReview: readMayHaveOccurred,
       complete: entry.import.complete,
       empty: entry.import.empty
     },
-    nextAction: entry.pendingAction ? clone(entry.pendingAction) : null,
-    lastSafeError: entry.lastSafeError ? clone(entry.lastSafeError) : null,
+    nextAction: readMayHaveOccurred ? pendingReadRecoveryAction(language) : entry.pendingAction ? clone(entry.pendingAction) : null,
+    lastSafeError: readMayHaveOccurred ? clone(entry.lastSafeError ?? pendingReadError(entry)) : entry.lastSafeError ? clone(entry.lastSafeError) : null,
     permissionReview: permissionReview ? clone(permissionReview) : null,
-    audit: clone(entry.audit)
+    // Review ids, grant ids, pending operation ids/revisions, and raw page
+    // checkpoints remain private lifecycle state rather than status output.
+    audit: publicAudit(entry.audit)
   };
 }
 
@@ -1106,6 +1231,60 @@ async function synchronizeExternalRevocation({ stateStore, plugin, entry, langua
   return { ...cleanup, grantId };
 }
 
+async function persistPendingPageReadFailure({
+  stateStore,
+  expectedPending,
+  error,
+  code,
+  stage,
+  language,
+  clock
+}) {
+  const state = await loadState(stateStore);
+  const entry = requireEntry(state);
+  if (!pendingGenerationMatches(entry, expectedPending)) {
+    code = "GMAIL_PAGE_READ_GENERATION_MISMATCH";
+    stage = "approved-read-generation";
+  }
+  setPendingPageReadFailure(state, entry, { error, code, stage, clock, language });
+  let persisted = false;
+  try {
+    // Do not clear or rewrite pendingPageRead. This save only makes the
+    // customer-facing needs-attention state explicit. If it also fails, the
+    // already durable pending generation still projects the same safe truth.
+    await stateStore.save(state);
+    persisted = true;
+  } catch {
+    // The immutable pre-read generation is itself the durable recovery marker.
+  }
+  return { state, entry, persisted };
+}
+
+async function gmailPermissionReview({ stateStore, entry, language }) {
+  if (!entry.accountId) return null;
+  try {
+    return await getSourcePermissionStatus({
+      stateStore,
+      source: SOURCE,
+      accountId: entry.accountId,
+      language
+    });
+  } catch {
+    return null;
+  }
+}
+
+function pendingReadResult({ entry, language, permissionReview, approvedReferences = [] }) {
+  return {
+    gmail: publicView(entry, language, permissionReview?.permissionReview),
+    approvedReferences,
+    complete: false,
+    checkpointRequired: false,
+    recoverable: true,
+    recoveryRequired: true
+  };
+}
+
 /**
  * Fetches bounded opaque references only after QWA-139 has persisted a grant.
  * Each page is committed as a checkpoint, so a later interruption resumes from
@@ -1120,6 +1299,19 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
   if (!entry.accountId || !entry.reviewId || entry.status === GMAIL_CONNECTION_STATES.REVOKED) {
     throw new GmailReadOnlyError("GMAIL_ACTIVE_GRANT_REQUIRED", "No Gmail content was read because the saved granular review is not ready.");
   }
+  if (unresolvedPendingPageRead(entry)) {
+    const pending = clone(pendingPageRead(entry));
+    const failed = await persistPendingPageReadFailure({
+      stateStore,
+      expectedPending: pending,
+      code: "GMAIL_PAGE_READ_CHECKPOINT_UNCERTAIN",
+      stage: "approved-read-recovery",
+      language: locale,
+      clock
+    });
+    const permission = await gmailPermissionReview({ stateStore, entry: failed.entry, language: locale });
+    return pendingReadResult({ entry: failed.entry, language: locale, permissionReview: permission });
+  }
   if (entry.import.complete) {
     const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
     return { gmail: publicView(entry, locale, permission?.permissionReview), approvedReferences: [], complete: true, checkpointRequired: false };
@@ -1128,12 +1320,106 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
   const newlyProcessed = [];
   for (let pageIndex = 0; pageIndex < budget; pageIndex += 1) {
     const currentCheckpoint = entry.import.nextPageToken ?? "initial";
+    if (pageCheckpointHistory(entry).includes(currentCheckpoint)) {
+      setFailure(state, entry, {
+        code: "GMAIL_CHECKPOINT_LOOP",
+        stage: "approved-read",
+        clock,
+        language: locale
+      });
+      await stateStore.save(state);
+      const permission = await gmailPermissionReview({ stateStore, entry, language: locale });
+      return {
+        gmail: publicView(entry, locale, permission?.permissionReview),
+        approvedReferences: newlyProcessed,
+        complete: false,
+        checkpointRequired: false,
+        recoverable: true
+      };
+    }
+
+    const permissionBeforeRead = await gmailPermissionReview({ stateStore, entry, language: locale });
+    const activeGrantId = permissionBeforeRead?.permissionReview?.activeGrant?.grantId ?? null;
+    const activation = grantActivation(entry, clock);
+    if (!activeGrantId || activation.status !== "active" || activation.grantId !== activeGrantId) {
+      setFailure(state, entry, {
+        code: "GMAIL_GRANT_GENERATION_MISMATCH",
+        stage: "approved-read-grant",
+        clock,
+        language: locale
+      });
+      await stateStore.save(state);
+      return {
+        gmail: publicView(entry, locale, permissionBeforeRead?.permissionReview),
+        approvedReferences: newlyProcessed,
+        complete: false,
+        checkpointRequired: false,
+        recoverable: true
+      };
+    }
+
+    const operationRevision = importOperationRevision(entry) + 1;
+    const pending = Object.freeze({
+      operationId: `gmail-page-read-${randomUUID()}`,
+      operationRevision,
+      reviewId: opaqueIdentifier(entry.reviewId, "review"),
+      grantId: opaqueIdentifier(activeGrantId, "permission grant"),
+      checkpoint: opaqueIdentifier(currentCheckpoint, "page checkpoint"),
+      startedAt: isoNow(clock)
+    });
+    entry.import.operationRevision = operationRevision;
+    entry.import.pendingPageRead = clone(pending);
+    entry.import.status = "page-read-pending";
+    entry.pendingAction = null;
+    entry.lastSafeError = null;
+    entry.audit.push({
+      type: "gmail-page-read-checkpoint-saved",
+      at: pending.startedAt,
+      operationId: pending.operationId,
+      operationRevision,
+      reviewId: pending.reviewId,
+      grantId: pending.grantId,
+      checkpoint: pending.checkpoint,
+      readMayHaveOccurred: false,
+      bodiesExposed: false
+    });
+    try {
+      // No adapter page call is allowed until this exact generation is durable.
+      await stateStore.save(state);
+    } catch (error) {
+      entry.import.pendingPageRead = null;
+      if (entry.audit.at(-1)?.type === "gmail-page-read-checkpoint-saved"
+        && entry.audit.at(-1)?.operationId === pending.operationId) {
+        entry.audit.pop();
+      }
+      setFailure(state, entry, {
+        code: safeErrorCode(error, "GMAIL_PRE_READ_CHECKPOINT_SAVE_FAILED"),
+        stage: "pre-read-checkpoint",
+        clock,
+        language: locale
+      });
+      entry.import.status = "paused-before-read";
+      entry.pendingAction = { kind: "retry-saved-gmail-step", message: copy(locale).preReadCheckpointFailed };
+      entry.lastSafeError.sourceReadAttempted = false;
+      entry.audit.push({
+        type: "gmail-pre-read-checkpoint-save-failed",
+        at: isoNow(clock),
+        operationRevision,
+        sourceReadAttempted: false,
+        bodiesExposed: false
+      });
+      return {
+        gmail: publicView(entry, locale, permissionBeforeRead?.permissionReview),
+        approvedReferences: newlyProcessed,
+        complete: false,
+        checkpointRequired: false,
+        recoverable: true
+      };
+    }
+
     const connector = new GmailReadOnlyConnector({ plugin, pageToken: entry.import.nextPageToken });
     let fetched;
     try {
-      if (pageCheckpointHistory(entry).includes(currentCheckpoint)) {
-        throw new GmailReadOnlyError("GMAIL_CHECKPOINT_LOOP", "Gmail repeated a saved page checkpoint, so I stopped instead of looping through the same source page.");
-      }
       fetched = await fetchApprovedSourceContent({
         message,
         stateStore,
@@ -1154,44 +1440,90 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
       if (code === "GMAIL_ACCESS_REVOKED") {
         externalCleanup = await synchronizeExternalRevocation({ stateStore, plugin, entry, language: locale, clock });
       }
-      const refreshed = await loadState(stateStore);
-      const updated = requireEntry(refreshed);
-      if (code === "GMAIL_ACCESS_REVOKED") {
+      if (code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed === true) {
+        const refreshed = await loadState(stateStore);
+        const updated = requireEntry(refreshed);
         updated.grantActivation = {
-          status: externalCleanup?.confirmed ? "revoked" : "revocation-unconfirmed",
-          grantId: externalCleanup?.grantId ?? grantActivation(updated, clock).grantId,
+          status: "revoked",
+          grantId: externalCleanup.grantId ?? grantActivation(updated, clock).grantId,
           reviewId: updated.reviewId,
-          revocationConfirmed: externalCleanup?.confirmed === true,
+          revocationConfirmed: true,
           updatedAt: isoNow(clock)
         };
+        setFailure(refreshed, updated, {
+          code,
+          stage: "approved-read",
+          clock,
+          language: locale,
+          externalRevocation: true
+        });
+        try { await stateStore.save(refreshed); } catch { /* the durable pending generation remains fail-closed */ }
+        const permission = await gmailPermissionReview({ stateStore, entry: updated, language: locale });
+        return {
+          gmail: publicView(updated, locale, permission?.permissionReview),
+          approvedReferences: newlyProcessed,
+          complete: false,
+          checkpointRequired: false,
+          recoverable: false
+        };
       }
-      setFailure(refreshed, updated, {
-        code: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed !== true
+
+      const failed = await persistPendingPageReadFailure({
+        stateStore,
+        expectedPending: pending,
+        error,
+        code: code === "GMAIL_ACCESS_REVOKED"
           ? "GMAIL_EXTERNAL_REVOCATION_RECONCILIATION_FAILED"
           : code,
-        stage: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed !== true
+        stage: code === "GMAIL_ACCESS_REVOKED"
           ? "external-revocation-cleanup"
           : "approved-read",
-        clock,
         language: locale,
-        externalRevocation: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed === true
+        clock
       });
-      await stateStore.save(refreshed);
-      const permission = updated.accountId ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: updated.accountId, language: locale }) : null;
+      if (code === "GMAIL_ACCESS_REVOKED") {
+        failed.entry.grantActivation = {
+          status: "revocation-unconfirmed",
+          grantId: externalCleanup?.grantId ?? grantActivation(failed.entry, clock).grantId,
+          reviewId: failed.entry.reviewId,
+          revocationConfirmed: false,
+          updatedAt: isoNow(clock)
+        };
+        try { await stateStore.save(failed.state); } catch { /* pending generation remains durable */ }
+      }
+      const permission = await gmailPermissionReview({ stateStore, entry: failed.entry, language: locale });
       return {
-        gmail: publicView(updated, locale, permission?.permissionReview),
+        gmail: publicView(failed.entry, locale, permission?.permissionReview),
         approvedReferences: newlyProcessed,
         complete: false,
         checkpointRequired: false,
-        recoverable: updated.status !== GMAIL_CONNECTION_STATES.REVOKED
+        recoverable: true,
+        recoveryRequired: true
       };
     }
 
     state = await loadState(stateStore);
     entry = requireEntry(state);
+    if (!pendingGenerationMatches(entry, pending)) {
+      const failed = await persistPendingPageReadFailure({
+        stateStore,
+        expectedPending: pending,
+        code: "GMAIL_PAGE_READ_GENERATION_MISMATCH",
+        stage: "approved-read-generation",
+        language: locale,
+        clock
+      });
+      const permission = await gmailPermissionReview({ stateStore, entry: failed.entry, language: locale });
+      return pendingReadResult({
+        entry: failed.entry,
+        language: locale,
+        permissionReview: permission,
+        approvedReferences: newlyProcessed
+      });
+    }
     const page = connector.lastPage;
     pageCheckpointHistory(entry).push(currentCheckpoint);
-    newlyProcessed.push(...appendUniqueReferences(entry, page.references));
+    const pageReferences = appendUniqueReferences(entry, page.references);
     entry.import.pagesCompleted += 1;
     entry.import.nextPageToken = page.nextPageToken;
     entry.import.empty = entry.import.recordsProcessed === 0 && page.nextPageToken == null;
@@ -1199,6 +1531,7 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
     entry.import.status = entry.import.complete ? "complete" : "checkpoint-required";
     entry.pendingAction = entry.import.complete ? null : { kind: "continue-gmail-import", message: copy(locale).continueImport };
     entry.lastSafeError = null;
+    entry.import.pendingPageRead = null;
     entry.connection.simulationOnly = page.simulated;
     if (page.simulated) {
       entry.connection.live = false;
@@ -1215,7 +1548,29 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
       actualRead: page.actualRead,
       bodiesExposed: false
     });
-    await stateStore.save(state);
+    try {
+      // The page checkpoint and removal of pendingPageRead are one durable root
+      // save. Until it succeeds, a retry must never request this page again.
+      await stateStore.save(state);
+    } catch (error) {
+      const failed = await persistPendingPageReadFailure({
+        stateStore,
+        expectedPending: pending,
+        error,
+        code: "GMAIL_PAGE_READ_CHECKPOINT_UNCERTAIN",
+        stage: "approved-read-checkpoint",
+        language: locale,
+        clock
+      });
+      const permission = await gmailPermissionReview({ stateStore, entry: failed.entry, language: locale });
+      return pendingReadResult({
+        entry: failed.entry,
+        language: locale,
+        permissionReview: permission,
+        approvedReferences: newlyProcessed
+      });
+    }
+    newlyProcessed.push(...pageReferences);
     if (entry.import.complete) break;
   }
 

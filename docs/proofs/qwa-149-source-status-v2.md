@@ -29,6 +29,12 @@ The included `SimulatedGenericExportAdapter` has no source SDK, no body-read ope
 3. One-time, snapshot-labelled import that returns only opaque references.
 4. Immediate close/revocation of the simulated one-time permission.
 
+The returned snapshot must contain each normalized approved `sourceRecordId`
+exactly once and must be set-equal to the granular selection. Matching only the
+record count is insufficient: an `A + A` adapter result for an approved `A + B`
+selection fails closed, exposes zero references, and closes the adapter grant
+before another review can start.
+
 If registration or import fails after the adapter may have seen a grant, the
 local record becomes `needs-attention` with a durable revocation generation.
 It cannot be skipped, restarted, or granted again until revocation is
@@ -55,6 +61,18 @@ mismatched interrupted generation closes both possible plugin identifiers
 before local permission state is cleared. The same fail-closed rule applies
 when a provider reports external revocation but local/plugin cleanup cannot be
 confirmed.
+
+Before each approved Gmail page call, the outer lifecycle now durably saves an
+immutable pending read generation bound to the current review id, grant id,
+opaque page checkpoint, and monotonically increasing operation revision. The
+generic approved-fetch audit carries that marker in the same root. Only a
+successful outer page-checkpoint save clears it. If the adapter page may have
+run but the outer save does not commit, Gmail says `read-may-have-occurred`,
+returns no uncommitted references, and a normal retry makes zero additional
+page calls. The explicit recovery is to revoke that saved permission and start
+a fresh metadata review; this proof does not claim exact resume through an
+uncommitted post-read checkpoint. A failed pre-read marker save invokes no page
+call and remains safely retryable.
 
 All full-root lifecycle writers in this candidate for Gmail, Google Drive, and
 iMessage use the same canonical, per-state-root re-entrant lock as the generic
@@ -84,9 +102,10 @@ QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **25/25** focused checks passed.
-- `npm run test:qwa-145` — **11/11** Gmail compatibility checks passed.
-- `npm test` — **83/83** repository checks passed in this isolated candidate.
+- `npm run test:qwa-149` — **26/26** focused checks passed.
+- `npm run test:qwa-145` — **14/14** Gmail compatibility checks passed.
+- `npm run test:qwa-139` — **10/10** shared permission checks passed.
+- `npm test` — **87/87** repository checks passed in this isolated candidate.
 - `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
 
 ## Boundaries and limitations
@@ -97,6 +116,6 @@ QWA-145's outstanding real Gmail verification.
 - Final handoff and the Gmail, Drive, and iMessage status lookups use saved local lifecycle state only. A provider denial or cancellation remains unfinished with its exact authorization outcome; it is never silently presented as a customer skip.
 - Skipping Gmail first revokes every durably tracked connector/plugin generation and the linked generic permission. If plugin cleanup is unavailable or interrupted, skip fails closed as `needs-attention` instead of hiding an active grant.
 - Google Calendar status projection is covered against the current-primary persisted lifecycle shape, but this older candidate branch does not contain the newer primary Calendar adapter. Additive integration must import `withSourcePermissionStateLock`, wrap `beginGoogleCalendarReview`, `grantGoogleCalendarContent`, `fetchApprovedGoogleCalendarContent`, and `revokeGoogleCalendarContent` under that canonical re-entrant root lock, add `getPersistedAdapterSourceStatus(...)` to `getGoogleCalendarStatus`, preserve the primary Calendar implementation and index exports, and rerun the integrated suite.
-- Primary integration must preserve QWA-148's stronger shared permission module and its exports. QWA-149's source-status and Gmail changes are additive dependencies; the older candidate permission file must not replace the QWA-148 primary version.
+- Primary integration must preserve QWA-148's stronger shared permission module and its exports. This repair does not modify `setup-source-permissions.mjs`; QWA-149's source-status and Gmail changes only consume its existing `withSourcePermissionStateLock` export. No permission-module delta from this repair needs to be applied atop QWA-148, and the older candidate permission file must not replace the QWA-148 primary version.
 - The canonical state lock coordinates aliases and nested calls only within one Node.js process. Separate processes can still race on the same JSON state root and require a later cross-process atomicity mechanism.
 - This is a status and simulated-export vertical slice, not a live connector release.

@@ -565,13 +565,19 @@ function normalizeSnapshotResult(result, entry) {
   if (!result || typeof result !== "object" || result.simulated !== true || result.sourceBodiesRead !== false || result.rawBodiesReturned !== false || result.snapshotLabel !== "simulated-export-snapshot" || !Array.isArray(result.records)) {
     throw new SourceStatusError("SNAPSHOT_BOUNDARY_INVALID", "The simulated export did not preserve the snapshot-only body boundary, so I stopped before saving or showing any import.");
   }
-  const selected = new Set(entry.permission.selectedItemIds);
+  const selectedItemIds = entry.permission.selectedItemIds.map((sourceRecordId) => opaqueId(sourceRecordId, "Approved simulated snapshot record id"));
+  const selected = new Set(selectedItemIds);
+  if (selected.size !== selectedItemIds.length) {
+    throw new SourceStatusError("SNAPSHOT_SCOPE_VIOLATION", "The saved granular permission contained ambiguous item identifiers, so I stopped before saving an import.");
+  }
+  const returnedSourceRecordIds = [];
   const records = result.records.map((record) => {
     if (!record || typeof record !== "object") {
       throw new SourceStatusError("SNAPSHOT_BOUNDARY_INVALID", "The simulated snapshot returned an invalid record, so I stopped safely.");
     }
     const sourceRecordId = opaqueId(record.sourceRecordId, "Simulated snapshot record id");
     const snapshotRecordId = opaqueId(record.snapshotRecordId, "Simulated snapshot reference");
+    returnedSourceRecordIds.push(sourceRecordId);
     if (!selected.has(sourceRecordId) || record.source !== entry.sourceId || record.processingDisposition !== "untrusted-inert-snapshot-reference") {
       throw new SourceStatusError("SNAPSHOT_SCOPE_VIOLATION", "The simulated snapshot included an item outside the granular permission, so I stopped before saving it.");
     }
@@ -581,7 +587,12 @@ function normalizeSnapshotResult(result, entry) {
       processingDisposition: "untrusted-inert-snapshot-reference"
     };
   });
-  if (new Set(records.map((record) => record.snapshotRecordId)).size !== records.length || records.length !== entry.permission.selectedItemIds.length) {
+  const returned = new Set(returnedSourceRecordIds);
+  const sourceRecordIdsExactlyMatch = returned.size === returnedSourceRecordIds.length
+    && returned.size === selected.size
+    && selectedItemIds.every((sourceRecordId) => returned.has(sourceRecordId));
+  if (!sourceRecordIdsExactlyMatch
+    || new Set(records.map((record) => record.snapshotRecordId)).size !== records.length) {
     throw new SourceStatusError("SNAPSHOT_SCOPE_VIOLATION", "The simulated snapshot did not exactly match the granular permission, so I stopped before saving it.");
   }
   return { snapshotLabel: "simulated-export-snapshot", records };

@@ -314,6 +314,70 @@ test("approved generic export becomes a labelled simulated snapshot and immediat
   });
 });
 
+test("a duplicate returned source id cannot stand in for another approved snapshot item", async () => {
+  await withFixture(async ({ stateStore, adapter }) => {
+    const preview = await beginSimulatedExportPreview({
+      message: "Preview a simulated export for my second brain",
+      stateStore,
+      adapter,
+      clock,
+      reviewIdFactory: () => "exact-set-review"
+    });
+    await grantSimulatedExportPermission({
+      message: "I approve exactly both simulated export items",
+      stateStore,
+      adapter,
+      reviewId: "exact-set-review",
+      scope: approvedScope(preview.sourceStatus, ["export-item-001", "export-item-002"]),
+      clock,
+      grantIdFactory: () => "exact-set-grant"
+    });
+    adapter.importApprovedSnapshot = async () => {
+      adapter.snapshotImportCalls += 1;
+      return {
+        simulated: true,
+        snapshotLabel: "simulated-export-snapshot",
+        sourceBodiesRead: false,
+        rawBodiesReturned: false,
+        records: [
+          {
+            source: sourceId,
+            sourceRecordId: "export-item-001",
+            snapshotRecordId: "snapshot:duplicate-a",
+            processingDisposition: "untrusted-inert-snapshot-reference"
+          },
+          {
+            source: sourceId,
+            sourceRecordId: "export-item-001",
+            snapshotRecordId: "snapshot:duplicate-b",
+            processingDisposition: "untrusted-inert-snapshot-reference"
+          }
+        ]
+      };
+    };
+
+    const failed = await importSimulatedExportSnapshot({
+      message: "Import the approved simulated snapshot",
+      stateStore,
+      adapter,
+      reviewId: "exact-set-review",
+      clock
+    });
+
+    assert.equal(failed.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(failed.sourceStatus.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
+    assert.equal(failed.sourceStatus.snapshotImport.recordCount, 0);
+    assert.deepEqual(failed.snapshotRecords, []);
+    assert.equal(failed.sourceStatus.lastSafeError.code, "SNAPSHOT_SCOPE_VIOLATION");
+    assert.equal(failed.sourceStatus.granularPermission.status, "revoked-after-failure");
+    assert.equal(failed.sourceStatus.granularPermission.revocationConfirmed, true);
+    assert.equal(adapter.activeGrantIds.has("exact-set-grant"), false);
+    assert.equal(adapter.permissionRevocationCalls, 1);
+    assert.equal(adapter.bodyReads, 0);
+    assert.equal(adapter.writeCalls, 0);
+  });
+});
+
 test("optional sources can be skipped and resumed without granting or restoring access", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     const skipped = await skipOptionalSource({
@@ -951,6 +1015,15 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
     gmail.import.status = "complete";
     gmail.import.complete = true;
     gmail.import.pagesCompleted = 1;
+    gmail.import.operationRevision = 99;
+    gmail.import.pendingPageRead = {
+      operationId: "pending-generation-must-not-leak",
+      operationRevision: 99,
+      reviewId: "gmail-review",
+      grantId: "gmail-grant",
+      checkpoint: "raw-page-token-must-not-leak",
+      startedAt: "2026-08-17T12:00:00.000Z"
+    };
     gmail.audit.push({
       type: "gmail-approved-page-processed",
       at: "2026-08-17T12:00:00.000Z",
@@ -973,6 +1046,7 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
     };
     await stateStore.save(state);
 
+    const directStatus = await getGmailReadOnlyStatus({ stateStore });
     const handoff = await getSourceStatusHandoff({ stateStore });
     const gmailStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "gmail:gmail-work");
     const calendarStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "calendar:calendar-work");
@@ -981,6 +1055,15 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
     assert.equal(gmailStatus.connection.independentlyVerified, false);
     assert.equal(gmailStatus.connection.readOnly, null);
     assert.equal(gmailStatus.adapterReportedState?.value, "live-and-verified");
+    assert.equal(directStatus.gmail.status, "needs-attention");
+    assert.equal(directStatus.gmail.connection.live, false);
+    assert.equal(directStatus.sourceStatus.connection.live, false);
+    assert.equal(directStatus.sourceStatus.connection.independentlyVerified, false);
+    assert.equal(directStatus.gmail.import.readMayHaveOccurred, true);
+    for (const publicSurface of [directStatus, handoff]) {
+      const rendered = JSON.stringify(publicSurface);
+      assert.doesNotMatch(rendered, /pending-generation-must-not-leak|raw-page-token-must-not-leak|operationRevision|pendingPageRead/);
+    }
     assert.equal(calendarStatus.state, SOURCE_STATUS_STATES.IMPORTED);
     assert.equal(calendarStatus.source.adapter, "google-calendar");
     assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
