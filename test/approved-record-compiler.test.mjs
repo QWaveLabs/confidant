@@ -2040,6 +2040,159 @@ test("valid-generation unexplained absence survives restart as exact public need
   });
 });
 
+test("tracked missing-lease restart cleanup binds the filename generation to the persisted lifecycle", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-tracked-missing-lease";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-tracked-missing-lease", "Tracked missing lease", "A missing lease is reconciled only through the exact persisted generation tag.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedState = await stateStore.load();
+    const leaseId = stagedState.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    await unlink(artifacts.lease);
+
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: fixtureStaging(root),
+      clock: clockAt(laterToday)
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+    for (const target of [artifacts.data, artifacts.lease]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "discarded");
+    assert.equal(status.compilation.staging.status, "discarded-orphaned-generation");
+    assert.equal(status.compilation.staging.cause, "orphaned-generation");
+    assert.equal(status.compilation.staging.needsAttention, false);
+    assert.equal(status.compilation.retryable, false);
+    assert.equal(typeof status.compilation.staging.deletedAt, "string");
+    assert.doesNotMatch(status.compilation.message, /expired|available/i);
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
+test("tracked malformed-lease restart cleanup binds the filename generation to the persisted lifecycle", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-tracked-malformed-lease";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-tracked-malformed-lease", "Tracked malformed lease", "A malformed lease is reconciled only through the exact persisted generation tag.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedState = await stateStore.load();
+    const leaseId = stagedState.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    await writeFile(artifacts.lease, "{not-valid-json\n", "utf8");
+
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: fixtureStaging(root),
+      clock: clockAt(laterToday)
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+    for (const target of [artifacts.data, artifacts.lease]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "discarded");
+    assert.equal(status.compilation.staging.status, "discarded-invalid-generation");
+    assert.equal(status.compilation.staging.cause, "invalid-generation");
+    assert.equal(status.compilation.staging.needsAttention, false);
+    assert.equal(status.compilation.retryable, false);
+    assert.equal(typeof status.compilation.staging.deletedAt, "string");
+    assert.doesNotMatch(status.compilation.message, /expired|available/i);
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
+test("tracked hardlink with a missing lease survives restart as exact public needs-attention", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-tracked-hardlink-missing-lease";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-tracked-hardlink-missing-lease", "Tracked hard link without lease", "Hard-linked bytes with a missing lease remain needs-attention for the exact persisted generation.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedState = await stateStore.load();
+    const leaseId = stagedState.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const survivor = path.join(directory, "tracked-hardlink-missing-lease-survivor.json");
+    await link(artifacts.data, survivor);
+    await unlink(artifacts.lease);
+
+    const restarted = fixtureStaging(root);
+    const blockedCleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: restarted,
+      clock: clockAt(laterToday)
+    });
+    assert.deepEqual(blockedCleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(blockedCleanup.cleanup.needsAttentionBatchIds, [batchId]);
+
+    const blockedStatus = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(blockedStatus.compilation.status, "staged");
+    assert.equal(blockedStatus.compilation.staging.status, "cleanup-needs-attention");
+    assert.equal(blockedStatus.compilation.staging.needsAttention, true);
+    assert.equal(blockedStatus.compilation.needsAttention, true);
+    assert.equal(blockedStatus.compilation.retryable, true);
+    assert.match(blockedStatus.compilation.message, /filesystem link/i);
+    assert.doesNotMatch(blockedStatus.compilation.message, /24 hours/i);
+
+    const blockedState = await stateStore.load();
+    const blockedEntry = blockedState.knowledgeCompilationLifecycle.batches[batchId];
+    assert.equal(blockedEntry.staging.leaseId, leaseId);
+    assert.equal(blockedEntry.staging.cleanupNeedsAttention, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
+    assert.equal((await lstat(artifacts.data)).nlink, 2);
+    assert.equal((await lstat(survivor)).nlink, 2);
+    await assert.rejects(() => lstat(artifacts.lease), (error) => error?.code === "ENOENT");
+
+    await unlink(survivor);
+    const recoveredCleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: restarted,
+      clock: clockAt("2026-08-17T13:05:00.000Z")
+    });
+    assert.deepEqual(recoveredCleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(recoveredCleanup.cleanup.needsAttentionBatchIds, []);
+    const recoveredStatus = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(recoveredStatus.compilation.status, "discarded");
+    assert.equal(recoveredStatus.compilation.staging.status, "discarded-orphaned-generation");
+    assert.equal(recoveredStatus.compilation.staging.cause, "orphaned-generation");
+    assert.equal(recoveredStatus.compilation.staging.needsAttention, false);
+    assert.equal(recoveredStatus.compilation.needsAttention, false);
+    assert.equal(recoveredStatus.compilation.retryable, false);
+    assert.deepEqual(await readdir(root), []);
+  });
+});
+
 test("restart keeps a hard-linked orphan generation as needs-attention without expired truth", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-orphan-hardlink-"));
   try {
@@ -2106,6 +2259,7 @@ test("restart keeps a hard-linked malformed generation and its lease as needs-at
     assert.deepEqual(cleanup.cleanupNeedsAttentionBatchIds, [batchId]);
     assert.deepEqual(cleanup.cleanupNeedsAttentionBatches, [{
       batchId,
+      generationTag: tag,
       leaseId: null,
       reason: "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"
     }]);

@@ -94,15 +94,19 @@ become a competing authority.
   tombstone and no completion receipt. A stale worker that finds both old
   generation paths already absent exits ownership without fabricating evidence
   and cannot affect a later same-ID generation.
-- A valid lifecycle generation whose startup cleanup encounters a hard link,
-  unexplained absence, identity uncertainty, tombstone/lease mismatch, or other
-  unverified deletion outcome now persists needs-attention only on the exact
-  matching `{batchId, leaseId}` generation, together with the exact bounded
-  reason code. Public cleanup and status project that state without reporting
-  the generation expired, removed, or available for up to 24 hours. A later
-  cleanup clears it only after deletion or absence is verified for that same
-  generation. Focused restart regressions cover both hard-link residue and a
-  newly absent data path, including exact-generation recovery clearing.
+- Every startup removal and needs-attention result retains the generation tag
+  parsed from its private staging filename. A result can alter a persisted
+  lifecycle only when that tag exactly equals the tag derived from the
+  lifecycle's persisted lease; when the result still has a readable lease, the
+  lease must also match exactly. This lets missing or malformed lease files be
+  reconciled without allowing a stale same-ID generation to affect the current
+  lifecycle. A valid lifecycle generation whose startup cleanup encounters a
+  hard link, unexplained absence, identity uncertainty, tombstone/lease
+  mismatch, or other unverified deletion outcome persists needs-attention with
+  the exact bounded reason code. Public cleanup and status project that state
+  without reporting the generation expired, removed, or available for up to 24
+  hours. A later cleanup clears it only after deletion or absence is verified
+  for that same generation.
 - Startup orphan and malformed-generation cleanup uses the same link-aware
   `lstat`/no-follow `open`/`fstat` identity checks and requires both verified
   zero-link data and path absence before reporting a removal. A hardlinked
@@ -112,11 +116,13 @@ become a competing authority.
   verified removed orphan, malformed lease, tracked invalid generation, or
   other non-expiry cleanup persists a bounded discarded status and cause; it
   is absent from `expiredBatchIds` and is never projected as expired or
-  available. Only the exact tracked `{batchId, leaseId}` generation whose
-  durable cleanup reason is exactly `expired` can enter expired lifecycle and
-  public status. Public restart regressions cover single-link orphan,
-  malformed-lease, and tracked-invalid cleanup, while retaining a legitimate
-  exact-generation expiry control.
+  available. Only the exact tracked generation whose filename tag equals the
+  tag derived from its persisted lease, and whose durable cleanup reason is
+  exactly `expired`, can enter expired lifecycle and public status. Public
+  restart regressions cover tracked missing-lease cleanup, tracked
+  malformed-lease cleanup, and hardlink-with-missing-lease needs-attention and
+  recovery, alongside the single-link orphan, tracked-invalid, and legitimate
+  exact-generation expiry controls.
 - Successful compilation deletes the protected batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
   `lstat`, then opened without following links and checked with `fstat`; exact
@@ -187,9 +193,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **48/48 passed**.
+- QWA-146 focused suite: **51/51 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **96/96 passed**.
+- Full repository suite: **99/99 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
