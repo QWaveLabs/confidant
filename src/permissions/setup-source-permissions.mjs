@@ -1027,17 +1027,29 @@ export async function fetchApprovedSourceContentWithinStateLock(args) {
   return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal(args));
 }
 
-/** Read-only public status boundary for reviews, grants, and revocations. */
-async function getSourcePermissionStatusInternal({ stateStore, source, accountId, language }) {
-  assertStateStore(stateStore);
-  const state = await stateStore.load();
+function getSourcePermissionStatusFromStateInternal({ state, source, accountId, language }) {
   if (!state?.[STATE_KEY]) return null;
   const entry = state[STATE_KEY].entries[sourceKey(source, accountId)];
   return entry ? { permissionReview: publicReview(entry, languageFor(state, language)) } : null;
 }
 
+/** Read-only public status boundary for reviews, grants, and revocations. */
+async function getSourcePermissionStatusInternal({ stateStore, source, accountId, language }) {
+  assertStateStore(stateStore);
+  const state = await stateStore.load();
+  return getSourcePermissionStatusFromStateInternal({ state, source, accountId, language });
+}
+
 export async function getSourcePermissionStatus(args) {
   return withSourcePermissionStateReadLock(args?.stateStore, () => getSourcePermissionStatusInternal(args));
+}
+
+// Connector status views that already loaded the full Setup Session use this
+// pure projection so the specialized lifecycle, permission review, and shared
+// source status all come from one exact root snapshot. It is intentionally not
+// re-exported from src/index.mjs.
+export function getSourcePermissionStatusFromState(args) {
+  return getSourcePermissionStatusFromStateInternal(args);
 }
 
 export async function getSourcePermissionStatusWithinStateLock(args) {

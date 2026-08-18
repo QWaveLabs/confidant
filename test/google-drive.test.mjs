@@ -15,6 +15,7 @@ import {
   beginGoogleDriveConnection,
   fetchApprovedGoogleDriveContent,
   getGoogleDriveConnectionStatus,
+  getSourceStatusHandoff,
   grantGoogleDriveFolderContent,
   revokeGoogleDriveConnection,
   startSetupSession
@@ -79,17 +80,24 @@ function driveItems() {
   ];
 }
 
-async function withDriveFixture(run, { authorization, revocation, items = driveItems() } = {}) {
+async function withDriveFixture(run, {
+  authorization,
+  revocation,
+  items = driveItems(),
+  rawAccountId = accountId,
+  folders = ["business", "private", "archive"],
+  people = [
+    { id: "alex", label: "Alex", accessLevel: "allowed" },
+    { id: "restricted", label: "Restricted person", accessLevel: "restricted" },
+    { id: "blocked", label: "Blocked person", accessLevel: "blocked" }
+  ]
+} = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa142-"));
   const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
   const connector = new SimulatedGoogleDriveConnector({
-    account: { id: accountId, label: "Simulated Drive" },
-    folders: ["business", "private", "archive"],
-    people: [
-      { id: "alex", label: "Alex", accessLevel: "allowed" },
-      { id: "restricted", label: "Restricted person", accessLevel: "restricted" },
-      { id: "blocked", label: "Blocked person", accessLevel: "blocked" }
-    ],
+    account: { id: rawAccountId, label: "Simulated Drive" },
+    folders,
+    people,
     items
   });
   const plugin = new SimulatedGoogleDrivePlugin({ authorization, revocation });
@@ -107,7 +115,7 @@ async function withDriveFixture(run, { authorization, revocation, items = driveI
       stateStore,
       adapters
     });
-    await run({ directory, stateStore, connector, plugin });
+    await run({ directory, stateStore, connector, plugin, rawAccountId });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -120,10 +128,11 @@ function approvedScope(permissionReview) {
   return scope;
 }
 
-async function connectAndReview({ stateStore, connector, plugin, language, reviewId = "drive-review" }) {
-  await beginGoogleDriveConnection({
+async function connectAndReview({ stateStore, connector, plugin, language, reviewId = "drive-review", rawAccountId = accountId }) {
+  const offered = await beginGoogleDriveConnection({
     message: language === "es" ? "Quiero conectar Google Drive a mi segundo cerebro" : "I want to connect Google Drive to my second brain",
     stateStore,
+    accountId: rawAccountId,
     language
   });
   return authorizeGoogleDriveReadOnly({
@@ -131,6 +140,7 @@ async function connectAndReview({ stateStore, connector, plugin, language, revie
     stateStore,
     connector,
     plugin,
+    accountId: offered.drive.account.context,
     authorizationApproved: true,
     language,
     reviewIdFactory: () => reviewId
@@ -186,8 +196,9 @@ test("Drive remains separate and metadata-only until the customer explicitly app
     assert.equal(review.drive.connection.verifiedReadOnly, true);
     assert.equal(review.drive.connection.metadataOnlyAuthorization, true);
     assert.equal(review.drive.permissionReview.metadataPreflight.contentBodiesRead, false);
-    assert.deepEqual(review.drive.permissionReview.permissionRequest.requestedScope.folders, ["business", "private"]);
-    assert.equal(review.drive.permissionReview.permissionRequest.requestedScope.folders.includes("archive"), false);
+    assert.equal(review.drive.permissionReview.permissionRequest.requestedScope.folders.length, 2);
+    assert.equal(review.drive.permissionReview.permissionRequest.requestedScope.folders.every((id) => /^local-drive-reference-/.test(id)), true);
+    assert.equal(JSON.stringify(review).includes("archive"), false);
   }, {
     authorization: {
       status: "authorized",
@@ -202,21 +213,23 @@ test("Drive remains separate and metadata-only until the customer explicitly app
 test("folder exclusions retain selected evergreen files and return safe normalized Drive references only after a granular grant", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const review = await connectAndReview({ stateStore, connector, plugin });
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
-    scope.folders = ["business"];
-    scope.exclusions.folders = ["private"];
+    const [businessFolderAlias, privateFolderAlias] = scope.folders;
+    scope.folders = [businessFolderAlias];
+    scope.exclusions.folders = [privateFolderAlias];
 
     const expandedScope = structuredClone(scope);
-    expandedScope.folders.push("archive");
+    expandedScope.folders.push("local-drive-reference-not-reviewed");
     await assert.rejects(
       () => grantGoogleDriveFolderContent({
         message: "I approve the selected Drive folders",
         stateStore,
         connector,
-        reviewId: "drive-review",
+        reviewId,
         scope: expandedScope
       }),
-      /not part of the metadata review/i
+      /local source reference is not current/i
     );
     assert.equal(connector.bodyFetchCalls, 0);
     assert.equal(connector.bodyAccesses, 0);
@@ -225,24 +238,22 @@ test("folder exclusions retain selected evergreen files and return safe normaliz
       message: "I approve the selected Drive folders",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
     assert.equal(granted.drive.status, "ready-to-fetch");
-    assert.deepEqual(granted.drive.permissionReview.activeGrant.scope.folders, ["business"]);
+    assert.deepEqual(granted.drive.permissionReview.activeGrant.scope.folders, [businessFolderAlias]);
     assert.equal(connector.bodyFetchCalls, 0);
 
     const fetched = await fetchApprovedGoogleDriveContent({
       message: "Process only my approved Drive references",
       stateStore,
       connector,
-      reviewId: "drive-review"
+      reviewId
     });
-    assert.deepEqual(
-      fetched.approvedRecords.map((record) => record.sourceRecordId).sort(),
-      ["business-current", "evergreen-brief", "mismatched-link-record"]
-    );
+    assert.equal(fetched.approvedRecords.length, 3);
+    assert.equal(fetched.approvedRecords.every((record) => /^local-drive-reference-/.test(record.sourceRecordId)), true);
     assert.equal("body" in fetched.approvedRecords[0], false);
     assert.equal(connector.bodyFetchCalls, 1);
     assert.equal(connector.bodyAccesses, 1);
@@ -253,17 +264,17 @@ test("folder exclusions retain selected evergreen files and return safe normaliz
     assert.equal(fetched.drive.connection.canShareFiles, false);
     assert.equal(fetched.drive.connection.canDeleteFiles, false);
 
-    const evergreen = fetched.normalizedSourceRecords.find((record) => record.sourceRecordId === "evergreen-brief");
-    const current = fetched.normalizedSourceRecords.find((record) => record.sourceRecordId === "business-current");
-    const mismatched = fetched.normalizedSourceRecords.find((record) => record.sourceRecordId === "mismatched-link-record");
-    assert.equal(evergreen.accountId, accountId);
-    assert.equal(evergreen.stableDriveId, "evergreen-brief");
-    assert.equal(evergreen.stableLink, "https://drive.google.com/file/d/evergreen-brief/view");
+    const evergreen = fetched.normalizedSourceRecords.find((record) => record.modifiedAt === "2026-08-01T12:00:00.000Z");
+    const current = fetched.normalizedSourceRecords.find((record) => record.fileName === "[untrusted text removed]");
+    const mismatched = fetched.normalizedSourceRecords.find((record) => record.fileName === "Reference with a mismatched metadata link");
+    assert.match(evergreen.accountId, /^local-drive-account-/);
+    assert.match(evergreen.stableDriveId, /^local-drive-reference-/);
+    assert.equal(evergreen.stableLink, null, "public records never embed a raw Drive identifier in a URL");
     assert.equal(evergreen.modifiedAt, "2026-08-01T12:00:00.000Z");
     assert.equal(current.stableLink, null, "credential-bearing metadata links are rejected");
     assert.equal(mismatched.stableLink, null, "metadata links must point to the same opaque Drive item");
     assert.equal(current.fileName, "[untrusted text removed]");
-    assert.equal(fetched.normalizedSourceRecords.some((record) => record.sourceRecordId === "unselected-archive-item"), false);
+    assert.equal(JSON.stringify(fetched).includes("unselected-archive-item"), false);
   }, {
     authorization: {
       status: "authorized",
@@ -275,17 +286,184 @@ test("folder exclusions retain selected evergreen files and return safe normaliz
   });
 });
 
+test("Drive public lifecycle aliases survive restart and status composes one exact root snapshot", async () => {
+  const rawAccountId = "drv-private-account-77";
+  const rawReviewId = "drv-private-review-77";
+  const rawGrantId = "drv-private-grant-77";
+  const rawFolderA = "drv-private-folder-a-77";
+  const rawFolderB = "drv-private-folder-b-77";
+  const rawPersonA = "drv-private-person-a-77";
+  const rawPersonB = "drv-private-person-b-77";
+  const rawRecordA = "drv-private-record-a-77";
+  const rawRecordB = "drv-private-record-b-77";
+  const items = [
+    {
+      id: rawRecordA,
+      area: "My Drive",
+      folder: rawFolderA,
+      category: "planning",
+      participantIds: [rawPersonA],
+      timestamp: "2026-08-16T00:00:00.000Z",
+      modifiedAt: "2026-08-16T12:00:00.000Z",
+      label: "Document one",
+      webUrl: `https://drive.google.com/file/d/${rawRecordA}/view`
+    },
+    {
+      id: rawRecordB,
+      area: "My Drive",
+      folder: rawFolderB,
+      category: "planning",
+      participantIds: [rawPersonB],
+      timestamp: "2026-08-16T00:00:00.000Z",
+      label: "Document two"
+    }
+  ];
+  await withDriveFixture(async ({ directory, stateStore, connector, plugin }) => {
+    const offered = await beginGoogleDriveConnection({
+      message: "Connect my selected Drive folders",
+      stateStore,
+      accountId: rawAccountId
+    });
+    const accountAlias = offered.drive.account.context;
+    const reviewed = await authorizeGoogleDriveReadOnly({
+      message: "Authorize the selected Drive folders",
+      stateStore,
+      connector,
+      plugin,
+      accountId: accountAlias,
+      authorizationApproved: true,
+      reviewIdFactory: () => rawReviewId
+    });
+    const reviewAlias = reviewed.drive.permissionReview.permissionRequest.reviewId;
+    const granted = await grantGoogleDriveFolderContent({
+      message: "Approve the reviewed Drive scope",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewId: reviewAlias,
+      scope: approvedScope(reviewed.drive.permissionReview),
+      grantIdFactory: () => rawGrantId
+    });
+    const grantAlias = granted.drive.permissionReview.activeGrant.grantId;
+    const fetched = await fetchApprovedGoogleDriveContent({
+      message: "Process approved Drive references",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewId: reviewAlias
+    });
+
+    let loadCalls = 0;
+    let nestedRevokes = 0;
+    const hookedStore = {
+      filePath: stateStore.filePath,
+      async load() {
+        loadCalls += 1;
+        if (loadCalls === 2) {
+          nestedRevokes += 1;
+          await revokeGoogleDriveConnection({
+            message: "Revoke Drive from a hostile second status load",
+            stateStore: hookedStore,
+            connector,
+            plugin,
+            accountId: accountAlias,
+            reviewId: reviewAlias
+          });
+        }
+        return stateStore.load();
+      },
+      save: (value) => stateStore.save(value)
+    };
+    const exactStatus = await getGoogleDriveConnectionStatus({ stateStore: hookedStore, accountId: accountAlias });
+    assert.equal(loadCalls, 1, "specialized Drive status must compose from one loaded root");
+    assert.equal(nestedRevokes, 0, "there is no second load window for a nested revoke");
+    assert.equal(exactStatus.drive.status, "imported");
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    const revoked = await revokeGoogleDriveConnection({
+      message: "Revoke the Drive connection",
+      stateStore,
+      connector,
+      plugin,
+      accountId: accountAlias,
+      reviewId: reviewAlias
+    });
+    const restartedStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+    const restartedStatus = await getGoogleDriveConnectionStatus({ stateStore: restartedStore, accountId: accountAlias });
+    const restartedHandoff = await getSourceStatusHandoff({ stateStore: restartedStore });
+    const publicText = JSON.stringify({
+      offered,
+      reviewed,
+      granted,
+      fetched,
+      exactStatus,
+      handoff,
+      revoked,
+      restartedStatus,
+      restartedHandoff
+    });
+    for (const secret of [
+      rawAccountId,
+      rawReviewId,
+      rawGrantId,
+      rawFolderA,
+      rawFolderB,
+      rawPersonA,
+      rawPersonB,
+      rawRecordA,
+      rawRecordB
+    ]) {
+      assert.equal(publicText.includes(secret), false, `Drive public surfaces must not expose ${secret}`);
+    }
+    assert.match(accountAlias, /^local-drive-account-/);
+    assert.match(reviewAlias, /^local-drive-review-/);
+    assert.match(grantAlias, /^local-drive-grant-/);
+    assert.equal(publicText.includes(accountAlias), true);
+    assert.equal(publicText.includes(reviewAlias), true);
+    assert.equal(publicText.includes(grantAlias), true);
+
+    const corrupted = await stateStore.load();
+    const corruptedEntry = corrupted.googleDriveLifecycle.entries[`drive:${rawAccountId}`];
+    corruptedEntry.publicIdentifierAliases.mappings
+      .find((mapping) => mapping.kind === "account").alias = rawAccountId;
+    await stateStore.save(corrupted);
+    await assert.rejects(
+      () => getGoogleDriveConnectionStatus({ stateStore, accountId: accountAlias }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    const corruptedHandoff = await getSourceStatusHandoff({ stateStore });
+    assert.equal(JSON.stringify(corruptedHandoff).includes(rawAccountId), false);
+  }, {
+    rawAccountId,
+    folders: [rawFolderA, rawFolderB],
+    people: [
+      { id: rawPersonA, label: "Person one", accessLevel: "allowed" },
+      { id: rawPersonB, label: "Person two", accessLevel: "restricted" }
+    ],
+    items,
+    authorization: {
+      status: "authorized",
+      accountId: rawAccountId,
+      readOnly: true,
+      metadataOnly: true,
+      approvedFolderIds: [rawFolderA, rawFolderB]
+    },
+    revocation: { status: "revoked" }
+  });
+});
+
 test("an adapter cannot surface a preflight record outside the final grant or an unreviewed record", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const review = await connectAndReview({ stateStore, connector, plugin });
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
-    scope.folders = ["business"];
-    scope.exclusions.folders = ["private"];
+    const [businessFolderAlias, privateFolderAlias] = scope.folders;
+    scope.folders = [businessFolderAlias];
+    scope.exclusions.folders = [privateFolderAlias];
     await grantGoogleDriveFolderContent({
       message: "I approve the selected Drive folders",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
@@ -299,7 +477,7 @@ test("an adapter cannot surface a preflight record outside the final grant or an
         message: "Process my approved Drive references",
         stateStore,
         connector,
-        reviewId: "drive-review"
+        reviewId
       }),
       /outside the final granted folders/i
     );
@@ -312,7 +490,7 @@ test("an adapter cannot surface a preflight record outside the final grant or an
         message: "Process my approved Drive references",
         stateStore,
         connector,
-        reviewId: "drive-review"
+        reviewId
       }),
       /outside the final granted folders/i
     );
@@ -334,12 +512,13 @@ test("partial authorization and revocation have truthful, non-writing states", a
     const review = await connectAndReview({ stateStore, connector, plugin });
     assert.equal(review.drive.connection.partial, true);
     assert.match(review.drive.message, /partial read-only access/i);
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
     await grantGoogleDriveFolderContent({
       message: "I approve the selected Drive folder",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
@@ -348,7 +527,7 @@ test("partial authorization and revocation have truthful, non-writing states", a
       stateStore,
       connector,
       plugin,
-      reviewId: "drive-review"
+      reviewId
     });
     assert.equal(revoked.drive.status, "revoked");
     assert.equal(revoked.drive.connection.remoteRevocationVerified, true);
@@ -360,7 +539,7 @@ test("partial authorization and revocation have truthful, non-writing states", a
         message: "Process my approved Drive references",
         stateStore,
         connector,
-        reviewId: "drive-review"
+        reviewId
       }),
       /saved selected-folder grant is not ready/i
     );
@@ -380,12 +559,13 @@ test("partial authorization and revocation have truthful, non-writing states", a
 test("an unconfirmed plugin revocation remains honest and blocks further processing", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const review = await connectAndReview({ stateStore, connector, plugin });
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
     await grantGoogleDriveFolderContent({
       message: "I approve the selected Drive folder",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
@@ -394,7 +574,7 @@ test("an unconfirmed plugin revocation remains honest and blocks further process
       stateStore,
       connector,
       plugin,
-      reviewId: "drive-review"
+      reviewId
     });
     assert.equal(revoked.drive.status, "revocation-unconfirmed");
     assert.equal(revoked.drive.connection.remoteRevocationVerified, false);
@@ -468,7 +648,8 @@ test("metadata-only authorization is required and an interrupted review resumes 
     });
     assert.equal(resumed.drive.status, "awaiting-folder-review");
     assert.match(resumed.drive.message, /metadatos/i);
-    assert.equal(resumed.drive.permissionReview.permissionRequest.reviewId, "spanish-resume-review");
+    assert.match(resumed.drive.permissionReview.permissionRequest.reviewId, /^local-drive-review-/);
+    assert.equal(JSON.stringify(resumed).includes("spanish-resume-review"), false);
     assert.equal(connector.bodyFetchCalls, 0);
     assert.equal(connector.bodyAccesses, 0);
   }, {
@@ -485,14 +666,16 @@ test("metadata-only authorization is required and an interrupted review resumes 
 test("a revoked external authorization invalidates the local grant and requires a fresh folder review", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const review = await connectAndReview({ stateStore, connector, plugin });
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
-    scope.folders = ["business"];
-    scope.exclusions.folders = ["private"];
+    const [businessFolderAlias, privateFolderAlias] = scope.folders;
+    scope.folders = [businessFolderAlias];
+    scope.exclusions.folders = [privateFolderAlias];
     await grantGoogleDriveFolderContent({
       message: "I approve the selected Drive folder",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
@@ -507,7 +690,7 @@ test("a revoked external authorization invalidates the local grant and requires 
       message: "Process only my approved Drive references",
       stateStore,
       connector,
-      reviewId: "drive-review"
+      reviewId
     });
     assert.equal(interrupted.importUnavailable, true);
     assert.equal(interrupted.recoveryRequired, true);
@@ -530,7 +713,8 @@ test("a revoked external authorization invalidates the local grant and requires 
       reviewIdFactory: () => "drive-review-resumed"
     });
     assert.equal(resumed.drive.status, "awaiting-folder-review");
-    assert.equal(resumed.drive.permissionReview.permissionRequest.reviewId, "drive-review-resumed");
+    assert.match(resumed.drive.permissionReview.permissionRequest.reviewId, /^local-drive-review-/);
+    assert.notEqual(resumed.drive.permissionReview.permissionRequest.reviewId, reviewId);
   }, {
     authorization: {
       status: "authorized",
@@ -545,14 +729,16 @@ test("a revoked external authorization invalidates the local grant and requires 
 test("an unclassified connector interruption becomes needs-attention instead of retaining a ready status", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const review = await connectAndReview({ stateStore, connector, plugin });
+    const reviewId = review.drive.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(review.drive.permissionReview);
-    scope.folders = ["business"];
-    scope.exclusions.folders = ["private"];
+    const [businessFolderAlias, privateFolderAlias] = scope.folders;
+    scope.folders = [businessFolderAlias];
+    scope.exclusions.folders = [privateFolderAlias];
     await grantGoogleDriveFolderContent({
       message: "I approve the selected Drive folder",
       stateStore,
       connector,
-      reviewId: "drive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "drive-grant"
     });
@@ -564,7 +750,7 @@ test("an unclassified connector interruption becomes needs-attention instead of 
       message: "Process only my approved Drive references",
       stateStore,
       connector,
-      reviewId: "drive-review"
+      reviewId
     });
     assert.equal(interrupted.importUnavailable, true);
     assert.equal(interrupted.drive.status, "needs-attention");

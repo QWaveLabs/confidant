@@ -26,7 +26,7 @@ Run locally:
 npm run test:qwa-145
 ```
 
-Result on this branch: **17 passing tests, 0 failures**. The black-box scenarios cover metadata-first ordering, 90-day scope, granular grant registration, stable public aliases and secret-string sweeps, empty sources, cancelled/unavailable plugin flow, metadata retry, nested/case-variant metadata body rejection, normal oversized pagination checkpoints, pre-read save failure with zero page calls, post-fetch outer save failure, persistent save failure across restart, zero-reread recovery, out-of-scope page rejection, repeated-checkpoint rejection, permission cancellation, exact-grant versus ambiguous revocation, local/external revocation, body-boundary rejection, opaque reference normalization, English/Spanish customer wording, and the no-live-simulation rule.
+Result on this branch: **17 passing tests, 0 failures**. The black-box scenarios cover metadata-first ordering, 90-day scope, granular grant registration, stable public aliases and secret-string sweeps, one-root status/permission/source projection, empty sources, cancelled/unavailable plugin flow, metadata retry, nested/case-variant metadata body rejection, normal oversized pagination checkpoints, pre-read save failure with zero page calls, post-fetch outer save failure, persistent save failure across restart, zero-reread recovery, out-of-scope page rejection, repeated-checkpoint rejection, permission cancellation, exact-grant versus ambiguous revocation, local/external revocation, body-boundary rejection, opaque reference normalization, English/Spanish customer wording, and the no-live-simulation rule.
 
 ## Remaining limitation
 

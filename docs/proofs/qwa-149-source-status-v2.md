@@ -71,6 +71,13 @@ generation identifiers remain private state. Customer-visible connection,
 permission, reference, status, and final-handoff views use persisted local
 aliases; one serialized regression sweeps all of those surfaces for the raw
 adapter account, review, grant, page-generation, and page-token strings.
+Google Drive and iMessage apply the same persisted-alias boundary to adapter
+account, review, grant, reference, audit, and any generation identifiers.
+Their direct status, permission review, approved references, final handoff,
+and restart views are swept as serialized strings for raw test identifiers.
+Guided lifecycle writers translate a current local alias back to the private
+adapter identifier only after entering the shared state lock; an unknown or
+stale alias fails closed.
 Metadata preflight recursively normalizes field names and rejects body-shaped
 keys before a grant, including singular `Attachment` and nested/case-variant
 message/email body fields.
@@ -96,6 +103,17 @@ queue in read mode so they cannot observe a half-committed root. Hooked
 state-store and connector regressions prove a rejected callback cannot be
 followed by the outer stale-root save. The lock is deliberately described as
 **in-process only**; it is not a cross-process file lock or compare-and-swap.
+Each Gmail, Drive, and iMessage specialized status view loads one root exactly
+once, then derives the connector view, shared permission review, and persisted
+source-status projection from that same in-memory snapshot. Hooked Drive and
+iMessage regressions would attempt a nested revoke on a second load and prove
+one load, zero nested revokes, and a consistent public result.
+
+The generic-export boundary normalizes case and removes separators before
+classifying every nested key. Preview and import both reject singular/plural
+message body, email body, attachment, payload, and header variants before an
+untrusted value can be displayed or persisted; the regression matrix records
+zero source-body consumption and exposes zero rejected records.
 
 Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, and the release-gate result.
 
@@ -118,12 +136,12 @@ QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **26/26** focused checks passed.
+- `npm run test:qwa-149` — **27/27** focused checks passed.
 - `npm run test:qwa-145` — **17/17** Gmail compatibility checks passed.
 - `npm run test:qwa-139` — **12/12** shared permission checks passed.
-- `npm run test:qwa-142` — **8/8** Google Drive compatibility checks passed.
-- `npm run test:qwa-150` — **6/6** iMessage compatibility checks passed.
-- `npm test` — **92/92** repository checks passed in this isolated candidate.
+- `npm run test:qwa-142` — **9/9** Google Drive compatibility checks passed.
+- `npm run test:qwa-150` — **7/7** iMessage compatibility checks passed.
+- `npm test` — **95/95** repository checks passed in this isolated candidate.
 - `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
 
 ## Boundaries and limitations

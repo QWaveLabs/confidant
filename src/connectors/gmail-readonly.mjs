@@ -14,6 +14,7 @@ import {
   beginSourcePermissionReviewWithinStateLock,
   denySourcePermissionWithinStateLock,
   fetchApprovedSourceContentWithinStateLock,
+  getSourcePermissionStatusFromState,
   getSourcePermissionStatusWithinStateLock,
   grantSourcePermissionWithinStateLock,
   revokeSourcePermissionWithinStateLock,
@@ -1898,7 +1899,9 @@ async function getGmailReadOnlyStatusInternal({ stateStore, language } = {}) {
   const entry = getEntry(state);
   if (!entry) return null;
   const locale = languageFor(state, language);
-  const permission = entry.accountId ? await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
+  const permission = entry.accountId
+    ? getSourcePermissionStatusFromState({ state, source: SOURCE, accountId: entry.accountId, language: locale })
+    : null;
   return {
     gmail: publicView(entry, locale, permission?.permissionReview),
     sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GMAIL, accountId: gmailPublicAliases(entry).account, language: locale })

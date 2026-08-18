@@ -13,24 +13,30 @@ import {
   withSourcePermissionStateLock,
   withSourcePermissionStateReadLock
 } from "./permissions/setup-source-permissions.mjs";
+import { isStableLocalAlias } from "./connectors/stable-local-aliases.mjs";
 
 const STATE_KEY = "sourceStatusV2";
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SOURCE_ID = /^simulated-export(?::[a-z0-9][a-z0-9-]{0,63})?$/;
 const BODY_FIELD_NAMES = new Set([
   "body",
+  "bodies",
   "html",
   "text",
   "content",
   "snippet",
   "raw",
   "payload",
+  "payloads",
+  "header",
   "headers",
   "mime",
   "attachment",
   "attachments",
   "messagebody",
-  "emailbody"
+  "messagebodies",
+  "emailbody",
+  "emailbodies"
 ]);
 const MAX_PREVIEW_ITEMS = 250;
 const REMOTE_REVOCATION_REQUIRED_PERMISSION_STATUSES = new Set([
@@ -244,7 +250,8 @@ function assertNoSourceBody(value, location = "adapter response", seen = new Set
     return;
   }
   for (const [key, child] of Object.entries(value)) {
-    if (BODY_FIELD_NAMES.has(key.toLowerCase())) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (BODY_FIELD_NAMES.has(normalizedKey)) {
       throw new SourceStatusError(
         "SOURCE_BODY_BOUNDARY_INVALID",
         `The ${location} included a source-body field, so I stopped before saving or showing it.`
@@ -1707,6 +1714,25 @@ function persistedGmailAccountAlias(entry) {
   return "local-gmail-account";
 }
 
+function persistedLocalConnectorAccountAlias(entry, namespace) {
+  const rawAccountId = typeof entry?.accountId === "string" ? entry.accountId : null;
+  const mappings = Array.isArray(entry?.publicIdentifierAliases?.mappings)
+    && entry.publicIdentifierAliases.namespace === namespace
+    ? entry.publicIdentifierAliases.mappings
+    : [];
+  const persisted = mappings.find((mapping) => (
+    mapping?.kind === "account"
+    && mapping.raw === rawAccountId
+    && isStableLocalAlias(namespace, "account", mapping.alias)
+    && mapping.alias !== rawAccountId
+  ))?.alias;
+  if (persisted) return persisted;
+  return [
+    `local-${namespace}-account-unavailable`,
+    "local-source-account-unavailable"
+  ].find((candidate) => candidate !== rawAccountId);
+}
+
 function authorizationOutcomeFor(adapter, reported) {
   if (["authorization-denied", "authorization-cancelled"].includes(reported)) return reported;
   if (adapter === SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE && reported === "authorization-unavailable") return reported;
@@ -1815,7 +1841,10 @@ function persistedAdapterStatuses(state, language) {
   for (const entry of Object.values(state?.googleDriveLifecycle?.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
     statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, entry.accountId),
+      sourceId: persistedSourceInstanceId(
+        SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
+        persistedLocalConnectorAccountAlias(entry, "drive")
+      ),
       adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
       adapterStatus: entry.status,
       language
@@ -1825,7 +1854,10 @@ function persistedAdapterStatuses(state, language) {
   for (const entry of Object.values(state?.imessageBetaLifecycle?.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
     statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.IMESSAGE, entry.accountId),
+      sourceId: persistedSourceInstanceId(
+        SOURCE_ADAPTER_NAMES.IMESSAGE,
+        persistedLocalConnectorAccountAlias(entry, "imessage")
+      ),
       adapter: SOURCE_ADAPTER_NAMES.IMESSAGE,
       adapterStatus: entry.status,
       language

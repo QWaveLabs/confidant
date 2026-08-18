@@ -17,16 +17,18 @@ import {
   beginIMessageSnapshotImport,
   fetchApprovedIMessageContent,
   getIMessageBetaStatus,
+  getSourceStatusHandoff,
   getSetupSessionStatus,
   grantIMessageContent,
+  revokeIMessageContent,
   startSetupSession
 } from "../src/index.mjs";
 
 const accountId = "local-imessage";
 
-function messageFixture() {
+function messageFixture(rawAccountId = accountId) {
   return {
-    account: { id: accountId, label: "Local iMessage" },
+    account: { id: rawAccountId, label: "Local iMessage" },
     people: [
       { id: "allowed", label: "Avery", accessLevel: "allowed" },
       { id: "restricted", label: "Riley", accessLevel: "restricted" },
@@ -91,10 +93,11 @@ function messageFixture() {
   };
 }
 
-async function withIMessageFixture(run, { localAccess = "denied", language = "en", items } = {}) {
+async function withIMessageFixture(run, { localAccess = "denied", language = "en", items, fixture } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa150-"));
   const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
-  const connector = new SimulatedIMessageSnapshotConnector({ ...messageFixture(), items: items ?? messageFixture().items });
+  const sourceFixture = fixture ?? messageFixture();
+  const connector = new SimulatedIMessageSnapshotConnector({ ...sourceFixture, items: items ?? sourceFixture.items });
   const localAdapter = new SimulatedIMessageLocalAdapter({ accessResult: localAccess });
   const adapters = {
     environment: new SimulatedEnvironmentAdapter(),
@@ -237,7 +240,8 @@ test("a failed metadata review becomes a resumable snapshot fallback without rea
       reviewIdFactory: () => "recovered-snapshot-review"
     });
     assert.equal(resumed.iMessageBeta.status, "awaiting-content-grant");
-    assert.equal(resumed.iMessageBeta.permissionReview.permissionRequest.reviewId, "recovered-snapshot-review");
+    assert.match(resumed.iMessageBeta.permissionReview.permissionRequest.reviewId, /^local-imessage-review-/);
+    assert.equal(JSON.stringify(resumed).includes("recovered-snapshot-review"), false);
     assert.equal(connector.bodyFetchCalls, 0);
     assert.equal(connector.bodyAccesses, 0);
   }, { localAccess: "granted" });
@@ -256,7 +260,9 @@ test("contact and group privacy apply before snapshot message processing and sou
     const reviewStatus = await getIMessageBetaStatus({ stateStore });
     const review = reviewStatus.iMessageBeta.permissionReview;
     assert.equal(review.metadataPreflight.contentBodiesRead, false);
-    assert.deepEqual(review.metadataPreflight.blockedGroupConversations.map((entry) => entry.id), ["blocked-group"]);
+    assert.equal(review.metadataPreflight.blockedGroupConversations.length, 1);
+    assert.match(review.metadataPreflight.blockedGroupConversations[0].id, /^local-imessage-reference-/);
+    assert.equal(JSON.stringify(review).includes("blocked-group"), false);
     assert.equal(connector.bodyAccesses, 0);
 
     const granted = await grantIMessageContent({
@@ -265,7 +271,7 @@ test("contact and group privacy apply before snapshot message processing and sou
       connector,
       reviewId: "permission-review-should-be-overridden"
     }).catch((error) => error);
-    assert.equal(granted.code, "IMESSAGE_REVIEW_NOT_READY", "a guessed review ID cannot approve a source");
+    assert.equal(granted.code, "LOCAL_ALIAS_NOT_FOUND", "a guessed review ID cannot approve a source");
     const actualReviewId = review.permissionRequest.reviewId;
     const permission = await grantIMessageContent({
       message: "I approve the reviewed iMessage scope",
@@ -282,17 +288,166 @@ test("contact and group privacy apply before snapshot message processing and sou
       connector,
       reviewId: actualReviewId
     });
-    assert.deepEqual(fetched.approvedRecords, [{
-      sourceRecordId: "allowed-message",
-      processingDisposition: "untrusted-inert-reference",
-      source: "imessage"
-    }]);
+    assert.equal(fetched.approvedRecords.length, 1);
+    assert.match(fetched.approvedRecords[0].sourceRecordId, /^local-imessage-reference-/);
+    assert.equal(fetched.approvedRecords[0].processingDisposition, "untrusted-inert-reference");
+    assert.equal(fetched.approvedRecords[0].source, "imessage");
+    assert.equal(JSON.stringify(fetched).includes("allowed-message"), false);
     assert.equal("body" in fetched.approvedRecords[0], false);
     assert.equal(connector.writeCalls, 0);
     assert.equal(localAdapter.writeCalls, 0);
     assert.equal(fetched.iMessageBeta.connection.canSendMessages, false);
     assert.equal(fetched.iMessageBeta.connection.canAlterMessages, false);
   }, { localAccess: "granted" });
+});
+
+test("iMessage public lifecycle aliases survive restart and status composes one exact root snapshot", async () => {
+  const rawAccountId = "ims-private-account-77";
+  const rawReviewId = "ims-private-review-77";
+  const rawGrantId = "ims-private-grant-77";
+  const rawAllowedPerson = "ims-private-person-a-77";
+  const rawBlockedPerson = "ims-private-person-b-77";
+  const rawAllowedMessage = "ims-private-message-a-77";
+  const rawBlockedMessage = "ims-private-message-b-77";
+  const fixture = {
+    account: { id: rawAccountId, label: "Private local message source" },
+    people: [
+      { id: rawAllowedPerson, label: "Person one", accessLevel: "allowed" },
+      { id: rawBlockedPerson, label: "Person two", accessLevel: "blocked" }
+    ],
+    items: [
+      {
+        id: rawAllowedMessage,
+        kind: "conversation",
+        area: "messages",
+        conversation: rawAllowedMessage,
+        category: "personal",
+        timestamp: "2026-08-10T12:00:00.000Z",
+        participantIds: [rawAllowedPerson],
+        label: "Conversation one",
+        body: "Private connector body"
+      },
+      {
+        id: rawBlockedMessage,
+        kind: "conversation",
+        area: "messages",
+        conversation: rawBlockedMessage,
+        category: "personal",
+        timestamp: "2026-08-10T12:00:00.000Z",
+        participantIds: [rawBlockedPerson],
+        label: "Conversation two"
+      }
+    ]
+  };
+  await withIMessageFixture(async ({ directory, stateStore, connector }) => {
+    const offered = await beginIMessageBeta({
+      message: "Offer the iMessage snapshot beta",
+      stateStore,
+      accountId: rawAccountId
+    });
+    const accountAlias = offered.iMessageBeta.account.context;
+    const reviewed = await beginIMessageSnapshotImport({
+      message: "Review the saved iMessage snapshot",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewIdFactory: () => rawReviewId
+    });
+    const reviewAlias = reviewed.iMessageBeta.permissionReview.permissionRequest.reviewId;
+    const granted = await grantIMessageContent({
+      message: "Approve the reviewed iMessage scope",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewId: reviewAlias,
+      scope: approvedScope(reviewed.iMessageBeta.permissionReview),
+      grantIdFactory: () => rawGrantId
+    });
+    const grantAlias = granted.iMessageBeta.permissionReview.activeGrant.grantId;
+    const fetched = await fetchApprovedIMessageContent({
+      message: "Process the approved iMessage references",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewId: reviewAlias
+    });
+
+    let loadCalls = 0;
+    let nestedRevokes = 0;
+    const hookedStore = {
+      filePath: stateStore.filePath,
+      async load() {
+        loadCalls += 1;
+        if (loadCalls === 2) {
+          nestedRevokes += 1;
+          await revokeIMessageContent({
+            message: "Revoke iMessage from a hostile second status load",
+            stateStore: hookedStore,
+            connector,
+            accountId: accountAlias,
+            reviewId: reviewAlias
+          });
+        }
+        return stateStore.load();
+      },
+      save: (value) => stateStore.save(value)
+    };
+    const exactStatus = await getIMessageBetaStatus({ stateStore: hookedStore, accountId: accountAlias });
+    assert.equal(loadCalls, 1, "specialized iMessage status must compose from one loaded root");
+    assert.equal(nestedRevokes, 0, "there is no second load window for a nested revoke");
+    assert.equal(exactStatus.iMessageBeta.status, "processed");
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    const revoked = await revokeIMessageContent({
+      message: "Revoke the iMessage snapshot permission",
+      stateStore,
+      connector,
+      accountId: accountAlias,
+      reviewId: reviewAlias
+    });
+    const restartedStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+    const restartedStatus = await getIMessageBetaStatus({ stateStore: restartedStore, accountId: accountAlias });
+    const restartedHandoff = await getSourceStatusHandoff({ stateStore: restartedStore });
+    const publicText = JSON.stringify({
+      offered,
+      reviewed,
+      granted,
+      fetched,
+      exactStatus,
+      handoff,
+      revoked,
+      restartedStatus,
+      restartedHandoff
+    });
+    for (const secret of [
+      rawAccountId,
+      rawReviewId,
+      rawGrantId,
+      rawAllowedPerson,
+      rawBlockedPerson,
+      rawAllowedMessage,
+      rawBlockedMessage
+    ]) {
+      assert.equal(publicText.includes(secret), false, `iMessage public surfaces must not expose ${secret}`);
+    }
+    assert.match(accountAlias, /^local-imessage-account-/);
+    assert.match(reviewAlias, /^local-imessage-review-/);
+    assert.match(grantAlias, /^local-imessage-grant-/);
+    assert.equal(publicText.includes(accountAlias), true);
+    assert.equal(publicText.includes(reviewAlias), true);
+    assert.equal(publicText.includes(grantAlias), true);
+
+    const corrupted = await stateStore.load();
+    const corruptedEntry = corrupted.imessageBetaLifecycle.entries[`imessage:${rawAccountId}`];
+    corruptedEntry.publicIdentifierAliases.mappings
+      .find((mapping) => mapping.kind === "account").alias = rawAccountId;
+    await stateStore.save(corrupted);
+    await assert.rejects(
+      () => getIMessageBetaStatus({ stateStore, accountId: accountAlias }),
+      (error) => error?.code === "IMESSAGE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    const corruptedHandoff = await getSourceStatusHandoff({ stateStore });
+    assert.equal(JSON.stringify(corruptedHandoff).includes(rawAccountId), false);
+  }, { fixture });
 });
 
 test("attachments and high-risk identifiers require separate approval before they can enter the bounded fetch", async () => {
@@ -305,6 +460,7 @@ test("attachments and high-risk identifiers require separate approval before the
       reviewIdFactory: () => "sensitive-review"
     });
     const review = snapshot.iMessageBeta.permissionReview;
+    const reviewId = review.permissionRequest.reviewId;
     const scope = approvedScope(review);
     scope.sensitiveGroups.included = ["financial-identifiers"];
     scope.sensitiveGroups.excluded = scope.sensitiveGroups.excluded.filter((value) => value !== "financial-identifiers");
@@ -314,7 +470,7 @@ test("attachments and high-risk identifiers require separate approval before the
         message: "I approve the snapshot including the reviewed sensitive category",
         stateStore,
         connector,
-        reviewId: "sensitive-review",
+        reviewId,
         scope
       }),
       /High-risk identifiers remain excluded/i
@@ -324,7 +480,7 @@ test("attachments and high-risk identifiers require separate approval before the
     const separatelyApproved = await approveIMessageSensitiveContent({
       message: "I separately approve attachments and high-risk identifiers for this reviewed snapshot",
       stateStore,
-      reviewId: "sensitive-review",
+      reviewId,
       attachments: true,
       highRiskIdentifiers: true
     });
@@ -334,7 +490,7 @@ test("attachments and high-risk identifiers require separate approval before the
       message: "I approve the reviewed iMessage snapshot scope",
       stateStore,
       connector,
-      reviewId: "sensitive-review",
+      reviewId,
       scope,
       grantIdFactory: () => "sensitive-grant"
     });
@@ -342,12 +498,13 @@ test("attachments and high-risk identifiers require separate approval before the
       message: "Process the separately approved iMessage snapshot references",
       stateStore,
       connector,
-      reviewId: "sensitive-review"
+      reviewId
     });
-    assert.deepEqual(
-      fetched.approvedRecords.map((record) => record.sourceRecordId).sort(),
-      ["allowed-message", "attachment-message", "financial-message"]
-    );
+    assert.equal(fetched.approvedRecords.length, 3);
+    assert.equal(fetched.approvedRecords.every((record) => /^local-imessage-reference-/.test(record.sourceRecordId)), true);
+    assert.equal(JSON.stringify(fetched).includes("allowed-message"), false);
+    assert.equal(JSON.stringify(fetched).includes("attachment-message"), false);
+    assert.equal(JSON.stringify(fetched).includes("financial-message"), false);
     assert.equal(connector.policyCalls, 1);
   });
 });
@@ -373,6 +530,7 @@ test("untrusted metadata cannot activate attachments or widen the snapshot scope
     assert.match(snapshot.iMessageBeta.message, /instantánea única y beta/i);
     assert.equal(snapshot.iMessageBeta.privacy.attachments.status, "excluded-unless-separately-approved");
     assert.equal(connector.bodyFetchCalls, 0);
+    const reviewId = snapshot.iMessageBeta.permissionReview.permissionRequest.reviewId;
     const scope = approvedScope(snapshot.iMessageBeta.permissionReview);
     scope.includeAttachments = true;
     await assert.rejects(
@@ -380,7 +538,7 @@ test("untrusted metadata cannot activate attachments or widen the snapshot scope
         message: "Apruebo el alcance de iMessage",
         stateStore,
         connector,
-        reviewId: "hostile-review",
+        reviewId,
         scope
       }),
       /untrusted request to change the permission shape/i

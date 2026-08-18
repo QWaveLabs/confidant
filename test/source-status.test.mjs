@@ -1218,6 +1218,88 @@ test("hostile adapter fields cannot leak into a metadata preview or snapshot imp
   });
 });
 
+test("generic export rejects separator-normalized nested body fields in preview and import", async () => {
+  for (const key of ["message_body", "Email-Body", "ATTACHMENT", "pay_load", "Headers"]) {
+    await withFixture(async ({ stateStore, adapter }) => {
+      const secret = `PREVIEW-SECRET-${key}`;
+      adapter.previewMetadata = async () => {
+        adapter.metadataPreviewCalls += 1;
+        return {
+          sourceId,
+          simulated: true,
+          metadataOnly: true,
+          contentBodiesRead: false,
+          items: [{ id: "export-item-001", label: "safe", nested: { [key]: secret } }]
+        };
+      };
+      const rejected = await beginSimulatedExportPreview({
+        message: "Preview the separator-safe simulated export",
+        stateStore,
+        adapter,
+        clock
+      });
+      const persisted = await stateStore.load();
+      assert.equal(rejected.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+      assert.equal(rejected.sourceStatus.metadataPreview, null);
+      assert.equal(adapter.snapshotImportCalls, 0);
+      assert.equal(adapter.bodyReads, 0);
+      assert.equal(JSON.stringify({ rejected, persisted }).includes(secret), false);
+    });
+  }
+
+  for (const key of ["message_bodies", "email-bodies", "Attachments", "Payload", "HEADER"]) {
+    await withFixture(async ({ stateStore, adapter }) => {
+      const preview = await beginSimulatedExportPreview({
+        message: "Preview the safe simulated export before import",
+        stateStore,
+        adapter,
+        clock,
+        reviewIdFactory: () => `normalized-import-review-${key}`
+      });
+      const reviewId = preview.sourceStatus.granularPermission.reviewId;
+      await grantSimulatedExportPermission({
+        message: "Approve the exact safe simulated export item",
+        stateStore,
+        adapter,
+        reviewId,
+        scope: approvedScope(preview.sourceStatus),
+        clock,
+        grantIdFactory: () => `normalized-import-grant-${key}`
+      });
+      const secret = `IMPORT-SECRET-${key}`;
+      adapter.importApprovedSnapshot = async () => {
+        adapter.snapshotImportCalls += 1;
+        return {
+          simulated: true,
+          snapshotLabel: "simulated-export-snapshot",
+          sourceBodiesRead: false,
+          rawBodiesReturned: false,
+          records: [{
+            source: sourceId,
+            sourceRecordId: "export-item-001",
+            snapshotRecordId: "snapshot:export-item-001",
+            processingDisposition: "untrusted-inert-snapshot-reference",
+            nested: { [key]: secret }
+          }]
+        };
+      };
+      const rejected = await importSimulatedExportSnapshot({
+        message: "Import the separator-safe simulated snapshot",
+        stateStore,
+        adapter,
+        reviewId,
+        clock
+      });
+      const persisted = await stateStore.load();
+      assert.equal(rejected.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+      assert.deepEqual(rejected.snapshotRecords, []);
+      assert.equal(adapter.snapshotImportCalls, 1);
+      assert.equal(adapter.bodyReads, 0);
+      assert.equal(JSON.stringify({ rejected, persisted }).includes(secret), false);
+    });
+  }
+});
+
 test("slash commands, real-source identifiers, and non-simulated adapters are rejected before preview", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     await assert.rejects(
@@ -1300,6 +1382,15 @@ test("final handoff and connector status lookups derive adapter truth only from 
         "drive:drive-demo": {
           source: "drive",
           accountId: "drive-demo",
+          publicIdentifierAliases: {
+            version: 1,
+            namespace: "drive",
+            mappings: [{
+              kind: "account",
+              raw: "drive-demo",
+              alias: "local-drive-account-00000000-0000-4000-8000-000000000001"
+            }]
+          },
           status: "authorization-denied",
           authorization: { status: "denied", readOnly: false, metadataOnly: false },
           audit: []
@@ -1312,6 +1403,15 @@ test("final handoff and connector status lookups derive adapter truth only from 
         "imessage:local-demo": {
           source: "imessage",
           accountId: "local-demo",
+          publicIdentifierAliases: {
+            version: 1,
+            namespace: "imessage",
+            mappings: [{
+              kind: "account",
+              raw: "local-demo",
+              alias: "local-imessage-account-00000000-0000-4000-8000-000000000002"
+            }]
+          },
           status: "processed",
           mode: "snapshot",
           localAccess: { status: "unavailable" },
@@ -1327,19 +1427,25 @@ test("final handoff and connector status lookups derive adapter truth only from 
       stateStore,
       adapterStatuses: [{ sourceId: "forged-status", adapter: "gmail", adapterStatus: { status: "imported" } }]
     });
-    const drive = handoff.sourceStatusHandoff.sources.find((source) => source.source.id === "drive:drive-demo");
+    const drive = handoff.sourceStatusHandoff.sources.find((source) => source.source.id === "drive:local-drive-account-00000000-0000-4000-8000-000000000001");
     assert.equal(drive.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(drive.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
     assert.equal(drive.adapterReportedState.value, "authorization-denied");
     assert.equal(drive.authorizationOutcome, "authorization-denied");
-    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "drive:drive-demo"), false);
+    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "drive:local-drive-account-00000000-0000-4000-8000-000000000001"), false);
     assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.adapter === "gmail-readonly"), true);
-    assert.equal(handoff.sourceStatusHandoff.sections.imported.some((source) => source.source.id === "imessage:local-demo"), true);
+    assert.equal(handoff.sourceStatusHandoff.sections.imported.some((source) => source.source.id === "imessage:local-imessage-account-00000000-0000-4000-8000-000000000002"), true);
     assert.equal(handoff.sourceStatusHandoff.sources.some((source) => source.source.id === "forged-status"), false);
 
-    const driveLookup = await getGoogleDriveConnectionStatus({ stateStore, accountId: "drive-demo" });
+    const driveLookup = await getGoogleDriveConnectionStatus({
+      stateStore,
+      accountId: "local-drive-account-00000000-0000-4000-8000-000000000001"
+    });
     const gmailLookup = await getGmailReadOnlyStatus({ stateStore });
-    const imessageLookup = await getIMessageBetaStatus({ stateStore, accountId: "local-demo" });
+    const imessageLookup = await getIMessageBetaStatus({
+      stateStore,
+      accountId: "local-imessage-account-00000000-0000-4000-8000-000000000002"
+    });
     assert.equal(driveLookup.sourceStatus.authorizationOutcome, "authorization-denied");
     assert.equal(gmailLookup.sourceStatus.state, SOURCE_STATUS_STATES.SKIPPED);
     assert.equal(imessageLookup.sourceStatus.state, SOURCE_STATUS_STATES.IMPORTED);
@@ -1347,7 +1453,9 @@ test("final handoff and connector status lookups derive adapter truth only from 
     state.googleDriveLifecycle.entries["drive:drive-demo"].status = "authorization-cancelled";
     await stateStore.save(state);
     const cancelled = await getSourceStatusHandoff({ stateStore });
-    const cancelledDrive = cancelled.sourceStatusHandoff.sources.find((source) => source.source.id === "drive:drive-demo");
+    const cancelledDrive = cancelled.sourceStatusHandoff.sources.find((source) => (
+      source.source.id === "drive:local-drive-account-00000000-0000-4000-8000-000000000001"
+    ));
     assert.equal(cancelledDrive.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(cancelledDrive.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
     assert.equal(cancelledDrive.authorizationOutcome, "authorization-cancelled");

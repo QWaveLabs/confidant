@@ -216,7 +216,28 @@ test("Gmail public, status, reference, and handoff views expose only stable loca
       maxPages: 1
     });
     assert.equal(fetched.approvedReferences[0].accountContext, accountAlias);
-    const status = await getGmailReadOnlyStatus({ stateStore });
+    let loadCalls = 0;
+    let nestedRevokes = 0;
+    const hookedStore = {
+      filePath: stateStore.filePath,
+      async load() {
+        loadCalls += 1;
+        if (loadCalls === 2) {
+          nestedRevokes += 1;
+          await revokeGmailReadOnlyConnection({
+            message: "Revoke Gmail from a hostile second status load",
+            stateStore: hookedStore,
+            plugin,
+            clock
+          });
+        }
+        return stateStore.load();
+      },
+      save: (value) => stateStore.save(value)
+    };
+    const status = await getGmailReadOnlyStatus({ stateStore: hookedStore });
+    assert.equal(loadCalls, 1, "specialized Gmail status must compose from one loaded root");
+    assert.equal(nestedRevokes, 0, "there is no second load window for a nested revoke");
     const handoff = await getSourceStatusHandoff({ stateStore });
     const persisted = await stateStore.load();
     const internalPageGenerationId = persisted.gmailReadOnlyLifecycle.entry.audit
