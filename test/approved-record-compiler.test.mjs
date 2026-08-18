@@ -2083,6 +2083,125 @@ test("tracked missing-lease restart cleanup binds the filename generation to the
   });
 });
 
+test("stale startup cleanup cannot discard an exact generation restored before lifecycle reconciliation", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-restored-after-startup-cleanup";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-restored-after-startup-cleanup", "Restored generation", "A fresh exact generation scan supersedes stale startup cleanup evidence.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedState = await stateStore.load();
+    const leaseId = stagedState.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const originalData = await readFile(artifacts.data, "utf8");
+    const originalLease = await readFile(artifacts.lease, "utf8");
+    await unlink(artifacts.lease);
+
+    const retentionService = new FixtureRetentionService();
+    const restarted = fixtureStaging(root, { retentionService });
+    await restarted.initialize();
+    for (const target of [artifacts.data, artifacts.lease]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+
+    let currentStaging = restarted;
+    const restoringStaging = {
+      stage: (input) => currentStaging.stage(input),
+      read: (input) => currentStaging.read(input),
+      delete: (input) => currentStaging.delete(input),
+      async cleanupExpired(input) {
+        const staleCleanup = await restarted.cleanupExpired(input);
+        await writeFile(artifacts.data, originalData, { encoding: "utf8", mode: 0o600 });
+        await writeFile(artifacts.lease, originalLease, { encoding: "utf8", mode: 0o600 });
+        currentStaging = fixtureStaging(root, { retentionService });
+        await currentStaging.initialize();
+        return staleCleanup;
+      }
+    };
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: restoringStaging,
+      clock: clockAt(laterToday)
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "staged");
+    assert.equal(status.compilation.staging.status, "available");
+    assert.equal(status.compilation.staging.deletedAt, null);
+    assert.equal(status.compilation.retryable, true);
+    assert.match(status.compilation.message, /resume|reanudar/i);
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.equal(retentionService.armed.some((entry) => (
+      entry.batchId === batchId && entry.leaseId === leaseId
+    )), true);
+
+    const durable = await stateStore.load();
+    assert.equal(durable.knowledgeCompilationLifecycle.batches[batchId].status, "staged");
+    assert.equal(durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId, leaseId);
+  });
+});
+
+test("an exact legacy cleanup result without a generation tag still reconciles its persisted lease", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-legacy-exact-lease-cleanup";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-legacy-exact-lease-cleanup", "Legacy exact cleanup", "The original exact-lease adapter result remains compatible.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const stagedState = await stateStore.load();
+    const leaseId = stagedState.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const legacyCleanupAdapter = {
+      stage: (input) => staging.stage(input),
+      read: (input) => staging.read(input),
+      delete: (input) => staging.delete(input),
+      async cleanupExpired() {
+        await staging.delete({ batchId, leaseId, reason: "expired" });
+        return {
+          removedBatches: [{ batchId, leaseId, reason: "expired" }],
+          cleanupNeedsAttentionBatches: [],
+          completionReceipts: []
+        };
+      }
+    };
+
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: legacyCleanupAdapter,
+      clock: clockAt("2026-08-18T12:00:00.000Z")
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, [batchId]);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+    for (const target of [artifacts.data, artifacts.lease]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "expired");
+    assert.equal(status.compilation.staging.status, "expired-deleted");
+    assert.equal(status.compilation.retryable, false);
+  });
+});
+
 test("tracked malformed-lease restart cleanup binds the filename generation to the persisted lifecycle", async () => {
   await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
     const root = path.join(directory, ".qwave-second-brain-staging");

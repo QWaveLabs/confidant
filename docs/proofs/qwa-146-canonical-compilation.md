@@ -100,7 +100,17 @@ become a competing authority.
   lifecycle's persisted lease; when the result still has a readable lease, the
   lease must also match exactly. This lets missing or malformed lease files be
   reconciled without allowing a stale same-ID generation to affect the current
-  lifecycle. A valid lifecycle generation whose startup cleanup encounters a
+  lifecycle. Before queued startup evidence is consumed, a fresh scan records
+  every generation it observes. Queued removal or needs-attention evidence for
+  an exact generation that has reappeared is superseded by that fresh scan, so
+  a restored valid stage is re-armed and stays resumable while a newly removed
+  or uncertain stage uses only the fresh result. Because a generation can be
+  restored after that scan but before the lifecycle save, every removal,
+  completion receipt, and needs-attention result also performs an exact-lease
+  read immediately before it changes lifecycle truth. If that generation is
+  readable, the stale cleanup evidence is ignored and the batch stays staged
+  and resumable. A valid lifecycle generation
+  whose startup cleanup encounters a
   hard link, unexplained absence, identity uncertainty, tombstone/lease
   mismatch, or other unverified deletion outcome persists needs-attention with
   the exact bounded reason code. Public cleanup and status project that state
@@ -123,6 +133,11 @@ become a competing authority.
   malformed-lease cleanup, and hardlink-with-missing-lease needs-attention and
   recovery, alongside the single-link orphan, tracked-invalid, and legitimate
   exact-generation expiry controls.
+- The public staging-adapter boundary remains compatible with its original
+  exact-lease cleanup result: an exact persisted lease ID can reconcile without
+  a generation tag. If an adapter supplies a tag, it must match the lease-derived
+  tag; a missing lease can reconcile only through that exact generation tag.
+  Batch ID alone never changes lifecycle truth.
 - Successful compilation deletes the protected batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
   `lstat`, then opened without following links and checked with `fstat`; exact
@@ -193,9 +208,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **51/51 passed**.
+- QWA-146 focused suite: **53/53 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **99/99 passed**.
+- Full repository suite: **101/101 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full

@@ -1770,6 +1770,12 @@ export class LocalTemporaryStaging {
     return {
       removedBatches,
       cleanupNeedsAttentionBatches,
+      // Startup cleanup evidence is queued until the lifecycle lock can
+      // consume it. Remember every generation observed by this fresh scan so
+      // evidence from an earlier scan cannot override a generation that has
+      // since reappeared and was revalidated, removed again, or placed into a
+      // current needs-attention state.
+      observedGenerationKeys: [...descriptors.keys()],
       completionReceipts: await this.#discoverCompletionArtifacts(root)
     };
   }
@@ -1777,9 +1783,16 @@ export class LocalTemporaryStaging {
   async cleanupExpired({ now }) {
     const root = await this.#trustedRoot();
     const cleaned = await this.#cleanupExpiredInRoot(root, now);
-    const removedBatches = [...this.startupRemovedBatches, ...cleaned.removedBatches];
+    const observedGenerationKeys = new Set(cleaned.observedGenerationKeys ?? []);
+    const startupEvidenceIsStillCurrent = (entry) => !observedGenerationKeys.has(
+      `${entry.batchId}\u0000${entry.generationTag ?? ""}`
+    );
+    const removedBatches = [
+      ...this.startupRemovedBatches.filter(startupEvidenceIsStillCurrent),
+      ...cleaned.removedBatches
+    ];
     const cleanupNeedsAttentionBatches = [...new Map([
-      ...this.startupCleanupNeedsAttentionBatches,
+      ...this.startupCleanupNeedsAttentionBatches.filter(startupEvidenceIsStillCurrent),
       ...cleaned.cleanupNeedsAttentionBatches
     ].map((entry) => [
       `${entry.batchId}\u0000${entry.generationTag ?? ""}\u0000${entry.leaseId ?? ""}\u0000${entry.reason}`,
@@ -2674,9 +2687,36 @@ function cleanupResultKey(result) {
 function cleanupResultMatchesPersistedGeneration(entry, result) {
   const persistedLeaseId = entry?.staging?.leaseId;
   if (typeof persistedLeaseId !== "string" || !OPAQUE_ID.test(persistedLeaseId)) return false;
-  if (typeof result?.generationTag !== "string" || !GENERATION_TAG.test(result.generationTag)) return false;
-  if (result.generationTag !== generationTagForLease(persistedLeaseId)) return false;
-  return result.leaseId === null || result.leaseId === persistedLeaseId;
+  const expectedGenerationTag = generationTagForLease(persistedLeaseId);
+  if (result?.leaseId === persistedLeaseId) {
+    // The original public adapter boundary returned the exact durable lease
+    // without a generation tag. Preserve that compatible, exact binding. If
+    // a newer adapter also supplies a tag, require both identities to agree.
+    return result.generationTag === undefined
+      || (
+        typeof result.generationTag === "string"
+        && GENERATION_TAG.test(result.generationTag)
+        && result.generationTag === expectedGenerationTag
+      );
+  }
+  // Missing or malformed lease cleanup can bind to lifecycle state only via
+  // the newer filename-derived generation tag. A public batch ID alone is
+  // never sufficient.
+  return result?.leaseId === null
+    && typeof result.generationTag === "string"
+    && GENERATION_TAG.test(result.generationTag)
+    && result.generationTag === expectedGenerationTag;
+}
+
+async function persistedGenerationIsReadableNow({ staging, entry, batchId }) {
+  const leaseId = entry?.staging?.leaseId;
+  if (typeof leaseId !== "string" || !OPAQUE_ID.test(leaseId)) return false;
+  try {
+    const current = await staging.read({ batchId, leaseId });
+    return current?.leaseId === leaseId;
+  } catch {
+    return false;
+  }
 }
 
 async function markExpiredBatches({ lifecycle, staging, now }) {
@@ -2699,6 +2739,11 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     // they can never alter or clear a persisted lifecycle generation sharing
     // the same public batch ID.
     if (entry && !cleanupResultMatchesPersistedGeneration(entry, removal)) continue;
+    // Cleanup scans and durable lifecycle reconciliation are separate I/O
+    // boundaries. An exact generation can be restored after a scan produced
+    // removal evidence but before this locked lifecycle mutation. Re-read the
+    // persisted lease now so stale evidence cannot create ghost deletion truth.
+    if (entry && await persistedGenerationIsReadableNow({ staging, entry, batchId })) continue;
     const matchedLeaseId = entry?.staging?.leaseId ?? null;
     if (entry) verifiedCleanupKeys.add(`${batchId}\u0000${matchedLeaseId}`);
     if (entry?.status === "staged" && cleanupReason === "expired") {
@@ -2765,6 +2810,7 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     // generation. A stale or forged generation can remain inert for owner
     // inspection, but it cannot change public deletion truth.
     if (entry?.staging?.leaseId !== leaseId) continue;
+    if (await persistedGenerationIsReadableNow({ staging, entry, batchId })) continue;
     verifiedCleanupKeys.add(`${batchId}\u0000${leaseId}`);
     const by = completion.source === "receipt" ? "retention-worker" : "durable-retention-tombstone";
     // A tombstone records when deletion began, not when absence became known.
@@ -2811,6 +2857,7 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     const { batchId, reason } = attention;
     const entry = lifecycle.batches[batchId];
     if (!cleanupResultMatchesPersistedGeneration(entry, attention)) continue;
+    if (await persistedGenerationIsReadableNow({ staging, entry, batchId })) continue;
     const leaseId = entry.staging.leaseId;
     if (verifiedCleanupKeys.has(`${batchId}\u0000${leaseId}`)) continue;
     const desiredStatus = entry.status === "staged" ? "cleanup-needs-attention" : entry.staging.status;
