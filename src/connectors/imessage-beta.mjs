@@ -14,8 +14,7 @@ import {
   getSourcePermissionStatusFromState,
   grantSourcePermissionWithinStateLock,
   revokeSourcePermissionWithinStateLock,
-  withSourcePermissionStateLock,
-  withSourcePermissionStateReadLock
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 import {
@@ -24,6 +23,7 @@ import {
   projectApprovedReferencesWithStableAliases,
   projectAuditWithStableAliases,
   projectPermissionReviewWithStableAliases,
+  migrateStableLocalAliases,
   registerApprovedReferenceAliases,
   registerPermissionReviewAliases,
   registerStableAccountAlias,
@@ -34,6 +34,10 @@ const STATE_KEY = "imessageBetaLifecycle";
 const SOURCE = "imessage";
 const ALIAS_NAMESPACE = "imessage";
 const LOCAL_STATUSES = new Set(["granted", "denied", "unavailable"]);
+const IMESSAGE_FAILURE_REASONS = Object.freeze({
+  METADATA_REVIEW: "IMESSAGE_METADATA_REVIEW_FAILED"
+});
+const ALLOWED_IMESSAGE_FAILURE_REASONS = new Set(Object.values(IMESSAGE_FAILURE_REASONS));
 
 export class IMessageBetaError extends Error {
   constructor(code, customerMessage) {
@@ -185,9 +189,63 @@ function resolveGuidedIMessageArguments(state, args, { review = false, scope = f
 async function runGuidedIMessageWriter(args, operation, options) {
   return withSourcePermissionStateLock(args?.stateStore, async () => {
     const state = await loadState(args?.stateStore);
+    await migrateIMessageAliases(state, args?.stateStore);
     const resolved = resolveGuidedIMessageArguments(state, args, options);
     return operation(resolved.args);
   });
+}
+
+function iMessageFailureReason(reason) {
+  if (!ALLOWED_IMESSAGE_FAILURE_REASONS.has(reason)) {
+    throw new TypeError("A fixed iMessage failure reason is required.");
+  }
+  return reason;
+}
+
+function sanitizePersistedIMessageFailureReasons(state, entry) {
+  let changed = false;
+  for (const event of Array.isArray(entry?.audit) ? entry.audit : []) {
+    if (event?.type === "imessage-metadata-review-unavailable"
+      && event.reason !== IMESSAGE_FAILURE_REASONS.METADATA_REVIEW) {
+      event.reason = iMessageFailureReason(IMESSAGE_FAILURE_REASONS.METADATA_REVIEW);
+      changed = true;
+    }
+  }
+  for (const event of Array.isArray(state?.[STATE_KEY]?.audit) ? state[STATE_KEY].audit : []) {
+    if (event?.type !== "imessage-snapshot-fallback-available") continue;
+    if (event.reason === "denied" || event.reason === "unavailable") continue;
+    if (event.reason !== IMESSAGE_FAILURE_REASONS.METADATA_REVIEW) {
+      event.reason = iMessageFailureReason(IMESSAGE_FAILURE_REASONS.METADATA_REVIEW);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function migrateIMessageAliasesInState(state) {
+  let changed = false;
+  for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
+    if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
+    try {
+      const permission = getSourcePermissionStatusFromState({
+        state,
+        source: SOURCE,
+        accountId: entry.accountId
+      });
+      changed = sanitizePersistedIMessageFailureReasons(state, entry) || changed;
+      changed = migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
+        permissionReview: permission?.permissionReview
+      }) || changed;
+    } catch {
+      // Resolution below translates a corrupt alias map to the connector's
+      // fail-closed local-reference error without exposing the raw account.
+    }
+  }
+  return changed;
+}
+
+async function migrateIMessageAliases(state, stateStore) {
+  if (migrateIMessageAliasesInState(state)) await stateStore.save(state);
 }
 
 function isHighRiskIncluded(scope) {
@@ -300,14 +358,14 @@ async function beginContentPrivacyReview({
       type: "imessage-metadata-review-unavailable",
       at: now,
       mode,
-      reason: error?.code ?? "metadata-review-failed",
+      reason: iMessageFailureReason(IMESSAGE_FAILURE_REASONS.METADATA_REVIEW),
       contentBodiesRead: false
     });
     lifecycle(fallbackState).audit.push({
       type: "imessage-snapshot-fallback-available",
       at: now,
       accountId,
-      reason: error?.code ?? "metadata-review-failed"
+      reason: iMessageFailureReason(IMESSAGE_FAILURE_REASONS.METADATA_REVIEW)
     });
     await stateStore.save(fallbackState);
     return {
@@ -335,6 +393,7 @@ async function beginContentPrivacyReview({
 async function beginIMessageBetaInternal({ message, stateStore, accountId = "local-imessage", language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
+  await migrateIMessageAliases(state, stateStore);
   const records = lifecycle(state);
   const now = isoNow(clock);
   const key = entryKey(accountId);
@@ -625,9 +684,13 @@ export async function revokeIMessageContent(args = {}) {
   return runGuidedIMessageWriter(args, revokeIMessageContentInternal, { review: true });
 }
 
-/** Read-only status lookup; it never invokes a local adapter or connector. */
+/**
+ * Source-read-only status lookup; it never invokes a local adapter or connector.
+ * It may durably add missing private local aliases under the shared root lock.
+ */
 async function getIMessageBetaStatusInternal({ stateStore, accountId, language }) {
   const state = await loadState(stateStore);
+  await migrateIMessageAliases(state, stateStore);
   if (Object.keys(state?.[STATE_KEY]?.entries ?? {}).length === 0) return null;
   const entry = resolveEntryFromPublicAccount(state, accountId);
   const permission = getSourcePermissionStatusFromState({ state, source: SOURCE, accountId: entry.accountId, language });
@@ -645,5 +708,5 @@ async function getIMessageBetaStatusInternal({ stateStore, accountId, language }
 }
 
 export async function getIMessageBetaStatus(args = {}) {
-  return withSourcePermissionStateReadLock(args?.stateStore, () => getIMessageBetaStatusInternal(args));
+  return withSourcePermissionStateLock(args?.stateStore, () => getIMessageBetaStatusInternal(args));
 }

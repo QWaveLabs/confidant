@@ -15,8 +15,7 @@ import {
   grantSourcePermissionWithinStateLock,
   PermissionLifecycleError,
   revokeSourcePermissionWithinStateLock,
-  withSourcePermissionStateLock,
-  withSourcePermissionStateReadLock
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 import {
@@ -25,6 +24,7 @@ import {
   projectApprovedReferencesWithStableAliases,
   projectAuditWithStableAliases,
   projectPermissionReviewWithStableAliases,
+  migrateStableLocalAliases,
   registerApprovedReferenceAliases,
   registerPermissionReviewAliases,
   registerStableAccountAlias,
@@ -52,6 +52,12 @@ const REVOKED_AUTHORIZATION_CODES = new Set([
   "UNAUTHENTICATED",
   "UNAUTHORIZED"
 ]);
+const DRIVE_FAILURE_REASONS = Object.freeze({
+  METADATA_REVIEW: "DRIVE_METADATA_REVIEW_FAILED",
+  APPROVED_FETCH: "DRIVE_APPROVED_FETCH_FAILED",
+  APPROVED_FETCH_AUTHORIZATION_REVOKED: "DRIVE_APPROVED_FETCH_AUTHORIZATION_REVOKED"
+});
+const ALLOWED_DRIVE_FAILURE_REASONS = new Set(Object.values(DRIVE_FAILURE_REASONS));
 
 export class GoogleDriveLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -202,6 +208,7 @@ function resolveGuidedDriveArguments(state, args, { review = false, scope = fals
 async function runGuidedDriveWriter(args, operation, options) {
   return withSourcePermissionStateLock(args?.stateStore, async () => {
     const state = await loadState(args?.stateStore);
+    await migrateDriveAliases(state, args?.stateStore);
     const resolved = resolveGuidedDriveArguments(state, args, options);
     return operation(resolved.args);
   });
@@ -268,14 +275,84 @@ function uniqueOpaqueGoogleIds(values) {
   return uniqueStrings(values).filter(isOpaqueGoogleId);
 }
 
-function safeFailureCode(error) {
-  return typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code)
-    ? error.code
-    : "CONNECTOR_FETCH_FAILED";
+function driveFailureReason(reason) {
+  if (!ALLOWED_DRIVE_FAILURE_REASONS.has(reason)) {
+    throw new TypeError("A fixed Drive failure reason is required.");
+  }
+  return reason;
+}
+
+function isRevokedAuthorizationFailure(error) {
+  try {
+    return REVOKED_AUTHORIZATION_CODES.has(error?.code);
+  } catch {
+    return false;
+  }
 }
 
 function fetchFailureStatus(error) {
-  return REVOKED_AUTHORIZATION_CODES.has(safeFailureCode(error)) ? "revoked" : "needs-attention";
+  return isRevokedAuthorizationFailure(error) ? "revoked" : "needs-attention";
+}
+
+function approvedFetchFailureReason(error) {
+  return driveFailureReason(isRevokedAuthorizationFailure(error)
+    ? DRIVE_FAILURE_REASONS.APPROVED_FETCH_AUTHORIZATION_REVOKED
+    : DRIVE_FAILURE_REASONS.APPROVED_FETCH);
+}
+
+function driveAliasRecords(entry) {
+  return [
+    ...(Array.isArray(entry?.authorizedFolderIds)
+      ? entry.authorizedFolderIds.map((folderId) => ({ folderId }))
+      : []),
+    ...Object.values(entry?.normalizedMetadataById ?? {})
+  ];
+}
+
+function sanitizePersistedDriveFailureReasons(entry) {
+  let changed = false;
+  for (const event of Array.isArray(entry?.audit) ? entry.audit : []) {
+    if (event?.type === "drive-metadata-review-unavailable"
+      && event.reason !== DRIVE_FAILURE_REASONS.METADATA_REVIEW) {
+      event.reason = driveFailureReason(DRIVE_FAILURE_REASONS.METADATA_REVIEW);
+      changed = true;
+    }
+    if (event?.type === "drive-approved-reference-fetch-interrupted"
+      && !ALLOWED_DRIVE_FAILURE_REASONS.has(event.reason)) {
+      event.reason = driveFailureReason(entry.status === "revoked"
+        ? DRIVE_FAILURE_REASONS.APPROVED_FETCH_AUTHORIZATION_REVOKED
+        : DRIVE_FAILURE_REASONS.APPROVED_FETCH);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function migrateDriveAliasesInState(state) {
+  let changed = false;
+  for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
+    if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
+    try {
+      const permission = getSourcePermissionStatusFromState({
+        state,
+        source: SOURCE,
+        accountId: entry.accountId
+      });
+      changed = sanitizePersistedDriveFailureReasons(entry) || changed;
+      changed = migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
+        permissionReview: permission?.permissionReview,
+        approvedRecords: driveAliasRecords(entry)
+      }) || changed;
+    } catch {
+      // Resolution below translates a corrupt alias map to the connector's
+      // fail-closed local-reference error without exposing the raw account.
+    }
+  }
+  return changed;
+}
+
+async function migrateDriveAliases(state, stateStore) {
+  if (migrateDriveAliasesInState(state)) await stateStore.save(state);
 }
 
 function isRecoverableConnectorFailure(error) {
@@ -507,7 +584,12 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
     failedEntry.authorizedFolderIds = [];
     failedEntry.reviewId = null;
     failedEntry.normalizedMetadataById = {};
-    failedEntry.audit.push({ type: "drive-metadata-review-unavailable", at: isoNow(clock), reason: error?.code ?? "metadata-review-failed", contentBodiesRead: false });
+    failedEntry.audit.push({
+      type: "drive-metadata-review-unavailable",
+      at: isoNow(clock),
+      reason: driveFailureReason(DRIVE_FAILURE_REASONS.METADATA_REVIEW),
+      contentBodiesRead: false
+    });
     await stateStore.save(failedState);
     return { drive: publicView(failedEntry, languageFor(failedState, language)), metadataReviewUnavailable: true };
   }
@@ -531,6 +613,7 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
 async function beginGoogleDriveConnectionInternal({ message, stateStore, accountId = "google-drive", language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
+  await migrateDriveAliases(state, stateStore);
   const records = lifecycle(state);
   const key = entryKey(accountId);
   if (!records.entries[key]) {
@@ -695,7 +778,7 @@ async function fetchApprovedGoogleDriveContentInternal({ message, stateStore, co
     failedEntry.audit.push({
       type: "drive-approved-reference-fetch-interrupted",
       at: isoNow(clock),
-      reason: safeFailureCode(error),
+      reason: approvedFetchFailureReason(error),
       localGrantInvalidated: localRevocation !== null,
       bodyAccessState: "unconfirmed-after-connector-failure"
     });
@@ -771,9 +854,13 @@ export async function revokeGoogleDriveConnection(args = {}) {
   return runGuidedDriveWriter(args, revokeGoogleDriveConnectionInternal, { review: true });
 }
 
-/** Read-only status lookup; never invokes a Drive plugin or connector. */
+/**
+ * Source-read-only status lookup; never invokes a Drive plugin or connector.
+ * It may durably add missing private local aliases under the shared root lock.
+ */
 async function getGoogleDriveConnectionStatusInternal({ stateStore, accountId, language }) {
   const state = await loadState(stateStore);
+  await migrateDriveAliases(state, stateStore);
   if (Object.keys(state?.[STATE_KEY]?.entries ?? {}).length === 0) return null;
   const entry = resolveEntryFromPublicAccount(state, accountId);
   const permission = getSourcePermissionStatusFromState({ state, source: SOURCE, accountId: entry.accountId, language });
@@ -791,5 +878,5 @@ async function getGoogleDriveConnectionStatusInternal({ stateStore, accountId, l
 }
 
 export async function getGoogleDriveConnectionStatus(args = {}) {
-  return withSourcePermissionStateReadLock(args?.stateStore, () => getGoogleDriveConnectionStatusInternal(args));
+  return withSourcePermissionStateLock(args?.stateStore, () => getGoogleDriveConnectionStatusInternal(args));
 }

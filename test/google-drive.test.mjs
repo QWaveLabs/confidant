@@ -619,7 +619,9 @@ test("metadata-only authorization is required and an interrupted review resumes 
     connector.discoverMetadata = async (request) => {
       if (failures > 0) {
         failures -= 1;
-        throw new Error("Simulated metadata interruption.");
+        const error = new Error("Simulated metadata interruption.");
+        error.code = "RAW_DRIVE_METADATA_SECRET_CODE";
+        throw error;
       }
       return originalDiscoverMetadata(request);
     };
@@ -635,6 +637,9 @@ test("metadata-only authorization is required and an interrupted review resumes 
     assert.equal(interrupted.drive.status, "authorization-unavailable");
     assert.equal(interrupted.drive.connection.verifiedReadOnly, false);
     assert.equal(interrupted.drive.connection.metadataOnlyAuthorization, false);
+    assert.equal(interrupted.drive.audit.at(-1).reason, "DRIVE_METADATA_REVIEW_FAILED");
+    assert.equal(JSON.stringify(interrupted).includes("RAW_DRIVE_METADATA_SECRET_CODE"), false);
+    assert.equal(JSON.stringify(await stateStore.load()).includes("RAW_DRIVE_METADATA_SECRET_CODE"), false);
     assert.equal(connector.bodyFetchCalls, 0);
 
     const resumed = await authorizeGoogleDriveReadOnly({
@@ -682,7 +687,7 @@ test("a revoked external authorization invalidates the local grant and requires 
     const originalFetch = connector.fetchApprovedContent.bind(connector);
     connector.fetchApprovedContent = async () => {
       const error = new Error("Simulated Drive authorization was revoked.");
-      error.code = "AUTHORIZATION_REVOKED";
+      error.code = "UNAUTHENTICATED";
       throw error;
     };
 
@@ -698,6 +703,9 @@ test("a revoked external authorization invalidates the local grant and requires 
     assert.equal(interrupted.drive.connection.verifiedReadOnly, false);
     assert.equal(interrupted.drive.connection.metadataOnlyAuthorization, false);
     assert.equal(interrupted.drive.permissionReview.status, "revoked");
+    assert.equal(interrupted.drive.audit.at(-1).reason, "DRIVE_APPROVED_FETCH_AUTHORIZATION_REVOKED");
+    assert.equal(JSON.stringify(interrupted).includes("UNAUTHENTICATED"), false);
+    assert.equal(JSON.stringify(await stateStore.load()).includes("UNAUTHENTICATED"), false);
     assert.equal(connector.writeCalls, 0);
     assert.equal(plugin.writeCalls, 0);
 
@@ -743,7 +751,9 @@ test("an unclassified connector interruption becomes needs-attention instead of 
       grantIdFactory: () => "drive-grant"
     });
     connector.fetchApprovedContent = async () => {
-      throw new Error("Simulated transient connector interruption.");
+      const error = new Error("Simulated transient connector interruption.");
+      error.code = "RAW_DRIVE_FETCH_SECRET_CODE";
+      throw error;
     };
 
     const interrupted = await fetchApprovedGoogleDriveContent({
@@ -757,8 +767,10 @@ test("an unclassified connector interruption becomes needs-attention instead of 
     assert.equal(interrupted.drive.connection.verifiedReadOnly, false);
     assert.equal(interrupted.drive.connection.metadataOnlyAuthorization, false);
     assert.equal(interrupted.drive.permissionReview.status, "revoked");
-    assert.equal(interrupted.drive.audit.at(-1).reason, "CONNECTOR_FETCH_FAILED");
+    assert.equal(interrupted.drive.audit.at(-1).reason, "DRIVE_APPROVED_FETCH_FAILED");
     assert.equal(interrupted.drive.audit.at(-1).bodyAccessState, "unconfirmed-after-connector-failure");
+    assert.equal(JSON.stringify(interrupted).includes("RAW_DRIVE_FETCH_SECRET_CODE"), false);
+    assert.equal(JSON.stringify(await stateStore.load()).includes("RAW_DRIVE_FETCH_SECRET_CODE"), false);
   }, {
     authorization: {
       status: "authorized",

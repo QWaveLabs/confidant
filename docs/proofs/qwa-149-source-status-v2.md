@@ -78,6 +78,22 @@ and restart views are swept as serialized strings for raw test identifiers.
 Guided lifecycle writers translate a current local alias back to the private
 adapter identifier only after entering the shared state lock; an unknown or
 stale alias fails closed.
+Valid Drive and iMessage lifecycle entries created before aliases existed are
+upgraded under that same root write lock before status projection or guided
+resume. The migration prepares account, review, grant, reference, and
+generation mappings transactionally, saves them in the canonical root, and
+then projects from that same loaded root. A two-account restart regression for
+each connector proves the records retain distinct stable ids and do not
+collapse into a shared fallback. Calendar handoff/status projection uses the
+same persisted local-account alias format; this candidate exports the pure
+loaded-root migration helper needed for additive integration with the newer
+primary Calendar connector.
+
+Drive and iMessage adapter exceptions are classified into fixed internal
+failure reasons before any audit save or public projection. Arbitrary adapter
+`error.code` strings are neither stored nor returned. Adversarial metadata and
+approved-fetch regressions inject recognizable raw codes and sweep both the
+public result and persisted root to prove those strings are absent.
 Metadata preflight recursively normalizes field names and rejects body-shaped
 keys before a grant, including singular `Attachment` and nested/case-variant
 message/email body fields.
@@ -98,11 +114,13 @@ All full-root lifecycle writers in this candidate for Gmail, Google Drive, and
 iMessage use the same canonical per-state-root lock as the generic source-status
 flow. Public writers are deliberately non-re-entrant and fail with typed
 `STATE_LOCK_REENTRANT_OPERATION_BLOCKED`; trusted outer connector lifecycles use
-explicit lock-held permission primitives. Read-only status views use the same
-queue in read mode so they cannot observe a half-committed root. Hooked
-state-store and connector regressions prove a rejected callback cannot be
-followed by the outer stale-root save. The lock is deliberately described as
-**in-process only**; it is not a cross-process file lock or compare-and-swap.
+explicit lock-held permission primitives. Ordinary non-migrating status reads
+use the same queue in read mode. Drive/iMessage specialized status and final
+handoff use write mode because they may durably add missing private aliases
+before projecting the same loaded root. Hooked state-store and connector
+regressions prove a rejected callback cannot be followed by the outer
+stale-root save. The lock is deliberately described as **in-process only**; it
+is not a cross-process file lock or compare-and-swap.
 Each Gmail, Drive, and iMessage specialized status view loads one root exactly
 once, then derives the connector view, shared permission review, and persisted
 source-status projection from that same in-memory snapshot. Hooked Drive and
@@ -136,12 +154,12 @@ QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **27/27** focused checks passed.
+- `npm run test:qwa-149` — **28/28** focused checks passed.
 - `npm run test:qwa-145` — **17/17** Gmail compatibility checks passed.
 - `npm run test:qwa-139` — **12/12** shared permission checks passed.
 - `npm run test:qwa-142` — **9/9** Google Drive compatibility checks passed.
 - `npm run test:qwa-150` — **7/7** iMessage compatibility checks passed.
-- `npm test` — **95/95** repository checks passed in this isolated candidate.
+- `npm test` — **96/96** repository checks passed in this isolated candidate.
 - `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
 
 ## Boundaries and limitations
@@ -151,7 +169,7 @@ QWA-145's outstanding real Gmail verification.
 - Unsupported sources receive a safe explanation instead of a made-up connection, link, or live status.
 - Final handoff and the Gmail, Drive, and iMessage status lookups use saved local lifecycle state only. A provider denial or cancellation remains unfinished with its exact authorization outcome; it is never silently presented as a customer skip.
 - Skipping Gmail first revokes every durably tracked connector/plugin generation and the linked generic permission. If plugin cleanup is unavailable or interrupted, skip fails closed as `needs-attention` instead of hiding an active grant.
-- Google Calendar status projection is covered against the current-primary persisted lifecycle shape, but this older candidate branch does not contain the newer primary Calendar adapter. Additive integration must retain the primary Calendar lifecycle, its existing canonical write-lock wrappers, read-locked status projection, `getPersistedAdapterSourceStatus(...)` call, and all index exports; then rerun the integrated Calendar and full suites.
+- Google Calendar status projection is covered against the current-primary persisted lifecycle shape, but this older candidate branch does not contain the newer primary Calendar adapter. Additive integration must retain the primary Calendar lifecycle, its existing canonical write-lock wrappers, and all index exports. Before the first public Calendar status projection, call the exported `migratePersistedAdapterAliasesInState(...)` while holding that canonical root write lock, save the same root if it changed, and pass the resulting account alias (or raw private account id resolved from that same root) to `getPersistedAdapterSourceStatus(...)`; alias-stable later reads can remain read-locked. Then rerun the integrated Calendar and full suites.
 - Primary integration must preserve QWA-148's stronger shared permission module and Slack-specialized exports; never replace it with this candidate file. QWA-148 already contains the typed non-reentrant lock, read lock, and explicit `begin/grant/deny/revoke/fetch*WithinStateLock` primitives. Apply QWA-149's Gmail, Drive, and iMessage callers to those existing primitives. For status composition, retain QWA-148's stronger `getSourcePermissionStatusFromState(...)` pattern using the exact root snapshot already loaded under the connector lock (or add an equivalent read-held helper); do not reintroduce a second public status read. Add QWA-149's read-lock wrappers for generic source status/handoff, while preserving every Slack boundary and primary index export.
 - The canonical state lock coordinates aliases and nested calls only within one Node.js process. Separate processes can still race on the same JSON state root and require a later cross-process atomicity mechanism.
 - This is a status and simulated-export vertical slice, not a live connector release.

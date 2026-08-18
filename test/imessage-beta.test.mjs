@@ -214,7 +214,9 @@ test("a failed metadata review becomes a resumable snapshot fallback without rea
     connector.discoverMetadata = async (request) => {
       if (metadataFailures > 0) {
         metadataFailures -= 1;
-        throw new Error("Simulated metadata review interruption.");
+        const error = new Error("Simulated metadata review interruption.");
+        error.code = "RAW_IMESSAGE_METADATA_SECRET_CODE";
+        throw error;
       }
       return originalDiscoverMetadata(request);
     };
@@ -229,6 +231,9 @@ test("a failed metadata review becomes a resumable snapshot fallback without rea
     });
     assert.equal(fallback.metadataReviewUnavailable, true);
     assert.equal(fallback.iMessageBeta.status, "snapshot-available");
+    assert.equal(fallback.iMessageBeta.audit.at(-1).reason, "IMESSAGE_METADATA_REVIEW_FAILED");
+    assert.equal(JSON.stringify(fallback).includes("RAW_IMESSAGE_METADATA_SECRET_CODE"), false);
+    assert.equal(JSON.stringify(await stateStore.load()).includes("RAW_IMESSAGE_METADATA_SECRET_CODE"), false);
     assert.equal(connector.bodyFetchCalls, 0);
     assert.equal(connector.bodyAccesses, 0);
 

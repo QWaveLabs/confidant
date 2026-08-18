@@ -266,6 +266,34 @@ export function registerApprovedReferenceAliases(entry, namespace, records) {
   }
 }
 
+/**
+ * Durably upgrades a valid connector entry created before local public aliases
+ * existed. The migration is prepared on a clone so a malformed legacy value
+ * cannot leave a partially populated alias map that a later save might expose.
+ * Callers still own the shared root lock and the single root-state save.
+ */
+export function migrateStableLocalAliases(entry, namespace, {
+  permissionReview = null,
+  approvedRecords = []
+} = {}) {
+  if (!entry || typeof entry !== "object") throw new TypeError("A persisted connector entry is required.");
+  const before = JSON.stringify(entry.publicIdentifierAliases ?? null);
+  const migrated = clone(entry);
+  if (typeof migrated.accountId === "string" && migrated.accountId) {
+    registerStableAccountAlias(migrated, namespace, migrated.accountId);
+  }
+  if (typeof migrated.reviewId === "string" && migrated.reviewId) {
+    registerStableLocalAlias(migrated, namespace, "review", migrated.reviewId);
+  }
+  registerAuditAliases(migrated, namespace, migrated);
+  registerPermissionReviewAliases(migrated, namespace, permissionReview);
+  registerApprovedReferenceAliases(migrated, namespace, approvedRecords);
+  const after = JSON.stringify(migrated.publicIdentifierAliases ?? null);
+  if (before === after) return false;
+  entry.publicIdentifierAliases = migrated.publicIdentifierAliases;
+  return true;
+}
+
 function projectReferenceArray(entry, namespace, values) {
   return (Array.isArray(values) ? values : [])
     .map((value) => getStableLocalAlias(entry, namespace, "reference", value));

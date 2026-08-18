@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import * as PublicApi from "../src/index.mjs";
+import { getPersistedAdapterSourceStatus } from "../src/source-status.mjs";
 
 import {
   FileStateStore,
@@ -15,6 +16,8 @@ import {
   SimulatedGenericExportAdapter,
   SimulatedGmailPlugin,
   SimulatedObsidianAdapter,
+  attemptIMessageLocalAccess,
+  authorizeGoogleDriveReadOnly,
   beginGmailConnection,
   beginGmailPrivacyReview,
   beginSimulatedExportPreview,
@@ -1000,7 +1003,7 @@ test("legacy and mismatched Gmail grant generations are migrated without duplica
   });
 });
 
-test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Calendar state is projected additively", async () => {
+test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Calendar state uses a stable local alias", async () => {
   await withFixture(async ({ stateStore }) => {
     const plugin = gmailPluginFixture();
     await connectReviewAndGrantGmail({ stateStore, plugin });
@@ -1051,7 +1054,7 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
     const directStatus = await getGmailReadOnlyStatus({ stateStore });
     const handoff = await getSourceStatusHandoff({ stateStore });
     const gmailStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.adapter === "gmail-readonly");
-    const calendarStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "calendar:calendar-work");
+    const calendarStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.adapter === "google-calendar");
     assert.equal(gmailStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(gmailStatus.connection.live, false);
     assert.equal(gmailStatus.connection.independentlyVerified, false);
@@ -1069,6 +1072,23 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
     }
     assert.equal(calendarStatus.state, SOURCE_STATUS_STATES.IMPORTED);
     assert.equal(calendarStatus.source.adapter, "google-calendar");
+    assert.match(calendarStatus.source.id, /^calendar:local-calendar-account-[0-9a-f-]{36}$/);
+    assert.equal(JSON.stringify(handoff).includes("calendar-work"), false);
+    const migrated = await stateStore.load();
+    const calendarAccountAlias = migrated.googleCalendarLifecycle.entries["calendar:calendar-work"]
+      .publicIdentifierAliases.mappings.find((mapping) => mapping.kind === "account" && mapping.raw === "calendar-work")?.alias;
+    assert.equal(calendarStatus.source.id, `calendar:${calendarAccountAlias}`);
+    const specializedCalendarProjection = getPersistedAdapterSourceStatus({
+      state: migrated,
+      adapter: "google-calendar",
+      accountId: "calendar-work"
+    });
+    assert.equal(specializedCalendarProjection.source.id, calendarStatus.source.id);
+    assert.equal(JSON.stringify(specializedCalendarProjection).includes("calendar-work"), false);
+    const restarted = await getSourceStatusHandoff({ stateStore: new FileStateStore(stateStore.filePath) });
+    const restartedCalendarStatus = restarted.sourceStatusHandoff.sources.find((item) => item.source.adapter === "google-calendar");
+    assert.equal(restartedCalendarStatus.source.id, calendarStatus.source.id);
+    assert.equal(JSON.stringify(restarted).includes("calendar-work"), false);
     assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
     assert.deepEqual(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors, []);
   });
@@ -1459,6 +1479,160 @@ test("final handoff and connector status lookups derive adapter truth only from 
     assert.equal(cancelledDrive.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(cancelledDrive.handoffCategory, SOURCE_HANDOFF_CATEGORIES.UNFINISHED);
     assert.equal(cancelledDrive.authorizationOutcome, "authorization-cancelled");
+  });
+});
+
+test("valid pre-alias Drive and iMessage accounts migrate durably before handoff and guided resume", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const state = await stateStore.load();
+    const rawAccounts = {
+      drive: ["legacy-drive-one", "legacy-drive-two"],
+      imessage: ["legacy-imessage-one", "legacy-imessage-two"]
+    };
+    const rawIdentifiers = [];
+    state.googleDriveLifecycle = { version: 1, entries: {}, audit: [] };
+    state.imessageBetaLifecycle = { version: 1, entries: {}, audit: [] };
+
+    for (const [index, accountId] of rawAccounts.drive.entries()) {
+      const suffix = index + 1;
+      const folderId = `legacy-drive-folder-${suffix}`;
+      const sourceRecordId = `legacy-drive-record-${suffix}`;
+      rawIdentifiers.push(
+        accountId,
+        folderId,
+        sourceRecordId,
+        `legacy-drive-review-${suffix}`,
+        `legacy-drive-grant-${suffix}`,
+        `legacy-drive-operation-${suffix}`
+      );
+      state.googleDriveLifecycle.entries[`drive:${accountId}`] = {
+        source: "drive",
+        accountId,
+        status: "awaiting-authorization",
+        authorization: { status: "not-started", readOnly: false, metadataOnly: false, attempts: 0 },
+        authorizedFolderIds: [folderId],
+        reviewId: `legacy-drive-review-${suffix}`,
+        normalizedMetadataById: {
+          [sourceRecordId]: { sourceRecordId, folderId, source: "drive" }
+        },
+        audit: [{
+          type: "legacy-connector-checkpoint",
+          accountId,
+          reviewId: `legacy-drive-review-${suffix}`,
+          grantId: `legacy-drive-grant-${suffix}`,
+          sourceRecordId,
+          operationId: `legacy-drive-operation-${suffix}`
+        }]
+      };
+    }
+
+    for (const [index, accountId] of rawAccounts.imessage.entries()) {
+      const suffix = index + 1;
+      const sourceRecordId = `legacy-imessage-record-${suffix}`;
+      rawIdentifiers.push(
+        accountId,
+        sourceRecordId,
+        `legacy-imessage-review-${suffix}`,
+        `legacy-imessage-grant-${suffix}`,
+        `legacy-imessage-operation-${suffix}`
+      );
+      state.imessageBetaLifecycle.entries[`imessage:${accountId}`] = {
+        source: "imessage",
+        accountId,
+        status: "awaiting-macos-permission",
+        mode: null,
+        connectionTruth: "beta",
+        localAccess: { status: "not-attempted", attempts: 0 },
+        snapshot: { available: true, started: false, oneTime: true, live: false },
+        contactAndGroupPrivacyApplied: false,
+        sensitiveApprovals: {
+          attachments: { approved: false, approvedAt: null },
+          highRiskIdentifiers: { approved: false, approvedAt: null }
+        },
+        reviewId: `legacy-imessage-review-${suffix}`,
+        audit: [{
+          type: "legacy-connector-checkpoint",
+          accountId,
+          reviewId: `legacy-imessage-review-${suffix}`,
+          grantId: `legacy-imessage-grant-${suffix}`,
+          sourceRecordId,
+          operationId: `legacy-imessage-operation-${suffix}`
+        }]
+      };
+    }
+    await stateStore.save(state);
+
+    const firstHandoff = await getSourceStatusHandoff({ stateStore });
+    const firstIds = {
+      drive: firstHandoff.sourceStatusHandoff.sources
+        .filter((source) => source.source.adapter === "google-drive")
+        .map((source) => source.source.id).sort(),
+      imessage: firstHandoff.sourceStatusHandoff.sources
+        .filter((source) => source.source.adapter === "imessage-beta")
+        .map((source) => source.source.id).sort()
+    };
+    assert.equal(firstIds.drive.length, 2);
+    assert.equal(firstIds.imessage.length, 2);
+    assert.equal(new Set(firstIds.drive).size, 2, "legacy Drive accounts must not collapse");
+    assert.equal(new Set(firstIds.imessage).size, 2, "legacy iMessage accounts must not collapse");
+    firstIds.drive.forEach((id) => assert.match(id, /^drive:local-drive-account-[0-9a-f-]{36}$/));
+    firstIds.imessage.forEach((id) => assert.match(id, /^imessage:local-imessage-account-[0-9a-f-]{36}$/));
+    for (const raw of rawIdentifiers) {
+      assert.equal(JSON.stringify(firstHandoff).includes(raw), false);
+    }
+
+    const migrated = await stateStore.load();
+    for (const lifecycle of [migrated.googleDriveLifecycle, migrated.imessageBetaLifecycle]) {
+      for (const entry of Object.values(lifecycle.entries)) {
+        assert.deepEqual(
+          new Set(entry.publicIdentifierAliases.mappings.map((mapping) => mapping.kind)),
+          new Set(["account", "review", "grant", "reference", "generation"])
+        );
+      }
+    }
+
+    const restartedStore = new FileStateStore(stateStore.filePath);
+    const restartedHandoff = await getSourceStatusHandoff({ stateStore: restartedStore });
+    const restartedIds = {
+      drive: restartedHandoff.sourceStatusHandoff.sources
+        .filter((source) => source.source.adapter === "google-drive")
+        .map((source) => source.source.id).sort(),
+      imessage: restartedHandoff.sourceStatusHandoff.sources
+        .filter((source) => source.source.adapter === "imessage-beta")
+        .map((source) => source.source.id).sort()
+    };
+    assert.deepEqual(restartedIds, firstIds);
+
+    for (const sourceId of firstIds.drive) {
+      const accountId = sourceId.slice("drive:".length);
+      const status = await getGoogleDriveConnectionStatus({ stateStore: restartedStore, accountId });
+      const resumed = await authorizeGoogleDriveReadOnly({
+        message: "Keep this saved Drive account unapproved for now",
+        stateStore: restartedStore,
+        accountId,
+        authorizationApproved: false
+      });
+      assert.equal(status.drive.account.context, accountId);
+      assert.equal(resumed.drive.account.context, accountId);
+      for (const raw of rawIdentifiers) {
+        assert.equal(JSON.stringify({ status, resumed }).includes(raw), false);
+      }
+    }
+    for (const sourceId of firstIds.imessage) {
+      const accountId = sourceId.slice("imessage:".length);
+      const status = await getIMessageBetaStatus({ stateStore: restartedStore, accountId });
+      const resumed = await attemptIMessageLocalAccess({
+        message: "Keep this saved iMessage beta account unapproved for now",
+        stateStore: restartedStore,
+        accountId,
+        macOSPermissionApproved: false
+      });
+      assert.equal(status.iMessageBeta.account.context, accountId);
+      assert.equal(resumed.iMessageBeta.account.context, accountId);
+      for (const raw of rawIdentifiers) {
+        assert.equal(JSON.stringify({ status, resumed }).includes(raw), false);
+      }
+    }
   });
 });
 

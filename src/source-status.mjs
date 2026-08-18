@@ -3,17 +3,23 @@
  *
  * This module is a status boundary, not a connector SDK. It never opens an
  * OAuth flow, calls a real source, reads a source body, writes to a source, or
- * turns a reported adapter state into a claim that a connector is live. The
- * one import path is intentionally a simulated generic export that returns
- * opaque, snapshot-labelled references only after granular consent.
+ * turns a reported adapter state into a claim that a connector is live. A
+ * handoff may durably migrate private local aliases under the shared root lock;
+ * that migration uses only the already-loaded local root. The one import path
+ * is intentionally a simulated generic export that returns opaque,
+ * snapshot-labelled references only after granular consent.
  */
 
 import { randomUUID } from "node:crypto";
 import {
+  getSourcePermissionStatusFromState,
   withSourcePermissionStateLock,
   withSourcePermissionStateReadLock
 } from "./permissions/setup-source-permissions.mjs";
-import { isStableLocalAlias } from "./connectors/stable-local-aliases.mjs";
+import {
+  isStableLocalAlias,
+  migrateStableLocalAliases
+} from "./connectors/stable-local-aliases.mjs";
 
 const STATE_KEY = "sourceStatusV2";
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -1726,11 +1732,43 @@ function persistedLocalConnectorAccountAlias(entry, namespace) {
     && isStableLocalAlias(namespace, "account", mapping.alias)
     && mapping.alias !== rawAccountId
   ))?.alias;
-  if (persisted) return persisted;
-  return [
-    `local-${namespace}-account-unavailable`,
-    "local-source-account-unavailable"
-  ].find((candidate) => candidate !== rawAccountId);
+  return persisted ?? null;
+}
+
+const PERSISTED_ALIAS_LIFECYCLES = Object.freeze([
+  { adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, stateKey: "googleCalendarLifecycle", namespace: "calendar" },
+  { adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, stateKey: "googleDriveLifecycle", namespace: "drive" },
+  { adapter: SOURCE_ADAPTER_NAMES.IMESSAGE, stateKey: "imessageBetaLifecycle", namespace: "imessage" }
+]);
+
+/**
+ * Prepares durable local aliases on an already-loaded shared root. The caller
+ * owns the root write lock and must save the same root when this returns true.
+ * This is exported for additive specialized-connector integration; it does not
+ * load or save state and never invokes a source adapter.
+ */
+export function migratePersistedAdapterAliasesInState(state) {
+  let changed = false;
+  for (const { adapter, stateKey, namespace } of PERSISTED_ALIAS_LIFECYCLES) {
+    for (const entry of Object.values(state?.[stateKey]?.entries ?? {})) {
+      if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
+      try {
+        const permission = getSourcePermissionStatusFromState({
+          state,
+          source: adapter === SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR ? "calendar" : namespace,
+          accountId: entry.accountId
+        });
+        changed = migrateStableLocalAliases(entry, namespace, {
+          permissionReview: permission?.permissionReview,
+          approvedRecords: Object.values(entry.normalizedMetadataById ?? {})
+        }) || changed;
+      } catch {
+        // A malformed legacy entry is omitted from public handoff below. It
+        // must never be repaired by guessing or by projecting its raw ID.
+      }
+    }
+  }
+  return changed;
 }
 
 function authorizationOutcomeFor(adapter, reported) {
@@ -1830,8 +1868,10 @@ function persistedAdapterStatuses(state, language) {
 
   for (const entry of Object.values(state?.googleCalendarLifecycle?.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
+    const accountAlias = persistedLocalConnectorAccountAlias(entry, "calendar");
+    if (!accountAlias) continue;
     statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, entry.accountId),
+      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, accountAlias),
       adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR,
       adapterStatus: entry.status,
       language
@@ -1840,10 +1880,12 @@ function persistedAdapterStatuses(state, language) {
 
   for (const entry of Object.values(state?.googleDriveLifecycle?.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
+    const accountAlias = persistedLocalConnectorAccountAlias(entry, "drive");
+    if (!accountAlias) continue;
     statuses.push(persistedAdapterSourceStatus({
       sourceId: persistedSourceInstanceId(
         SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
-        persistedLocalConnectorAccountAlias(entry, "drive")
+        accountAlias
       ),
       adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
       adapterStatus: entry.status,
@@ -1853,10 +1895,12 @@ function persistedAdapterStatuses(state, language) {
 
   for (const entry of Object.values(state?.imessageBetaLifecycle?.entries ?? {})) {
     if (!entry || typeof entry !== "object") continue;
+    const accountAlias = persistedLocalConnectorAccountAlias(entry, "imessage");
+    if (!accountAlias) continue;
     statuses.push(persistedAdapterSourceStatus({
       sourceId: persistedSourceInstanceId(
         SOURCE_ADAPTER_NAMES.IMESSAGE,
-        persistedLocalConnectorAccountAlias(entry, "imessage")
+        accountAlias
       ),
       adapter: SOURCE_ADAPTER_NAMES.IMESSAGE,
       adapterStatus: entry.status,
@@ -1876,7 +1920,21 @@ export function getPersistedAdapterSourceStatus({ state, adapter, accountId, lan
   if (![SOURCE_ADAPTER_NAMES.GMAIL, SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, SOURCE_ADAPTER_NAMES.IMESSAGE].includes(normalizedAdapter)) {
     return null;
   }
-  const expectedId = persistedSourceInstanceId(normalizedAdapter, accountId);
+  const descriptor = PERSISTED_ALIAS_LIFECYCLES.find((candidate) => candidate.adapter === normalizedAdapter);
+  let publicAccountContext = accountId;
+  if (descriptor) {
+    const entries = Object.values(state?.[descriptor.stateKey]?.entries ?? {})
+      .filter((entry) => entry && typeof entry === "object");
+    const entry = entries.find((candidate) => (
+      candidate.accountId === accountId
+      || persistedLocalConnectorAccountAlias(candidate, descriptor.namespace) === accountId
+    ));
+    publicAccountContext = entry
+      ? persistedLocalConnectorAccountAlias(entry, descriptor.namespace)
+      : null;
+  }
+  if (typeof publicAccountContext !== "string" || !publicAccountContext) return null;
+  const expectedId = persistedSourceInstanceId(normalizedAdapter, publicAccountContext);
   return persistedAdapterStatuses(state, language === "es" ? "es" : "en")
     .find((status) => status.source.adapter === normalizedAdapter && status.source.id === expectedId) ?? null;
 }
@@ -1934,6 +1992,7 @@ function releaseGate(language, adapterStatuses) {
 async function getSourceStatusHandoffInternal({ stateStore, language } = {}) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
+  if (migratePersistedAdapterAliasesInState(state)) await stateStore.save(state);
   const safeLanguage = languageFor(state, language);
   const entries = persistedGenericSourceStatuses(state, safeLanguage);
   const adapters = persistedAdapterStatuses(state, safeLanguage);
@@ -1957,5 +2016,5 @@ async function getSourceStatusHandoffInternal({ stateStore, language } = {}) {
 }
 
 export async function getSourceStatusHandoff(args = {}) {
-  return withSourcePermissionStateReadLock(args?.stateStore, () => getSourceStatusHandoffInternal(args));
+  return withSourcePermissionStateLock(args?.stateStore, () => getSourceStatusHandoffInternal(args));
 }
