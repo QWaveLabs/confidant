@@ -801,6 +801,7 @@ export class LocalTemporaryStaging {
     this.initialization = null;
     this.expiryTimers = new Map();
     this.startupRemovedBatches = [];
+    this.startupCleanupNeedsAttentionBatches = [];
     this.retentionCoverageUnavailableBatches = [];
   }
 
@@ -874,6 +875,7 @@ export class LocalTemporaryStaging {
     // adapter starts so a restart does not depend on an old in-memory timer.
     const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow());
     this.startupRemovedBatches.push(...startupCleanup.removedBatches);
+    this.startupCleanupNeedsAttentionBatches.push(...startupCleanup.cleanupNeedsAttentionBatches);
     return rootReal;
   }
 
@@ -1390,6 +1392,68 @@ export class LocalTemporaryStaging {
     return true;
   }
 
+  async #unlinkUntrackedDataWithVerification(target) {
+    let before;
+    try {
+      before = await this.fileSystem.lstat(target);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new KnowledgeCompilationError(
+          "STAGING_FILE_IDENTITY_CHANGED",
+          "Untracked staging data disappeared before its unlink result was verified. Cleanup needs local review and was not reported complete."
+        );
+      }
+      throw error;
+    }
+
+    if (before.isSymbolicLink?.()) {
+      await unlinkAndSync(this.fileSystem, target, { ignoreMissing: false });
+      if (!await pathIsAbsent(this.fileSystem, target)) {
+        throw new KnowledgeCompilationError(
+          "STAGING_FILE_IDENTITY_CHANGED",
+          "An untracked staging symlink remained after cleanup. Cleanup needs local review and was not reported complete."
+        );
+      }
+      return;
+    }
+
+    assertSingleLinkRegularFile(before, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
+    let handle;
+    let failure = null;
+    let linksAfterUnlink = null;
+    try {
+      handle = await this.fileSystem.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const opened = await handle.stat();
+      assertSingleLinkRegularFile(opened, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
+      if (!sameFileIdentity(before, opened)) {
+        throw new KnowledgeCompilationError(
+          "STAGING_FILE_IDENTITY_CHANGED",
+          "Untracked staging data changed identity immediately before deletion. Cleanup needs local review and was not reported complete."
+        );
+      }
+      await unlinkAndSync(this.fileSystem, target, { ignoreMissing: false });
+      linksAfterUnlink = (await handle.stat()).nlink;
+    } catch (error) {
+      failure = error;
+    }
+    if (handle) {
+      try { await handle.close(); } catch (error) { failure ??= error; }
+    }
+    if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
+      throw new KnowledgeCompilationError(
+        "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+        "Another filesystem link retained untracked staging bytes after the private path was removed. Cleanup needs local review and was not reported complete."
+      );
+    }
+    if (failure) throw failure;
+    if (!await pathIsAbsent(this.fileSystem, target)) {
+      throw new KnowledgeCompilationError(
+        "STAGING_FILE_IDENTITY_CHANGED",
+        "Untracked staging data remained after cleanup. Cleanup needs local review and was not reported complete."
+      );
+    }
+  }
+
   async #deleteGenerationWithVerification(batchId, leaseId, knownRoot = null, options = {}) {
     const root = knownRoot ?? await this.#trustedRoot();
     const paths = this.#paths(root, batchId, leaseId);
@@ -1493,6 +1557,7 @@ export class LocalTemporaryStaging {
   async #cleanupExpiredInRoot(root, now) {
     const current = Date.parse(canonicalTimestamp(now, "STAGING_TIMESTAMP_INVALID"));
     const removedBatches = [];
+    const cleanupNeedsAttentionBatches = [];
     const entries = await this.fileSystem.readdir(root, { withFileTypes: true });
     const descriptors = new Map();
     for (const entry of entries) {
@@ -1513,9 +1578,15 @@ export class LocalTemporaryStaging {
       if (!descriptor.hasLease) {
         const orphanPath = resolve(root, `${STAGING_FILE_PREFIX}${descriptor.batchId}.${descriptor.generationTag}${STAGING_FILE_SUFFIX}`);
         try {
-          await unlinkAndSync(this.fileSystem, orphanPath);
+          await this.#unlinkUntrackedDataWithVerification(orphanPath);
           removedBatches.push({ batchId: descriptor.batchId, leaseId: null, reason: "orphaned-generation" });
-        } catch {}
+        } catch (error) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            leaseId: null,
+            reason: cleanupNeedsLocalAttention(error) ? error.code : "STAGING_DELETE_FAILED"
+          });
+        }
         continue;
       }
       const leasePath = resolve(root, `${STAGING_FILE_PREFIX}${descriptor.batchId}.${descriptor.generationTag}${STAGING_LEASE_SUFFIX}`);
@@ -1528,11 +1599,31 @@ export class LocalTemporaryStaging {
         manifest = this.#validatedManifest(rawManifest, descriptor.batchId, leaseId);
       } catch {
         const dataPath = resolve(root, `${STAGING_FILE_PREFIX}${descriptor.batchId}.${descriptor.generationTag}${STAGING_FILE_SUFFIX}`);
+        if (!descriptor.hasData) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            leaseId: null,
+            reason: "STAGING_FILE_IDENTITY_CHANGED"
+          });
+          continue;
+        }
         try {
-          await unlinkAndSync(this.fileSystem, dataPath);
-          await unlinkAndSync(this.fileSystem, leasePath);
+          await this.#unlinkUntrackedDataWithVerification(dataPath);
+          await unlinkAndSync(this.fileSystem, leasePath, { ignoreMissing: false });
+          if (!await pathIsAbsent(this.fileSystem, dataPath) || !await pathIsAbsent(this.fileSystem, leasePath)) {
+            throw new KnowledgeCompilationError(
+              "STAGING_FILE_IDENTITY_CHANGED",
+              "A malformed staging generation remained after cleanup. Cleanup needs local review and was not reported complete."
+            );
+          }
           removedBatches.push({ batchId: descriptor.batchId, leaseId: null, reason: "invalid-generation" });
-        } catch {}
+        } catch (error) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            leaseId: null,
+            reason: cleanupNeedsLocalAttention(error) ? error.code : "STAGING_DELETE_FAILED"
+          });
+        }
         continue;
       }
       const paths = this.#paths(root, descriptor.batchId, manifest.leaseId);
@@ -1583,6 +1674,7 @@ export class LocalTemporaryStaging {
     }
     return {
       removedBatches,
+      cleanupNeedsAttentionBatches,
       completionReceipts: await this.#discoverCompletionArtifacts(root)
     };
   }
@@ -1591,12 +1683,22 @@ export class LocalTemporaryStaging {
     const root = await this.#trustedRoot();
     const cleaned = await this.#cleanupExpiredInRoot(root, now);
     const removedBatches = [...this.startupRemovedBatches, ...cleaned.removedBatches];
+    const cleanupNeedsAttentionBatches = [...new Map([
+      ...this.startupCleanupNeedsAttentionBatches,
+      ...cleaned.cleanupNeedsAttentionBatches
+    ].map((entry) => [
+      `${entry.batchId}\u0000${entry.leaseId ?? ""}\u0000${entry.reason}`,
+      entry
+    ])).values()];
     const retentionCoverageUnavailableBatches = [...this.retentionCoverageUnavailableBatches];
     this.startupRemovedBatches = [];
+    this.startupCleanupNeedsAttentionBatches = [];
     this.retentionCoverageUnavailableBatches = [];
     return {
       removedBatches,
       removedBatchIds: [...new Set(removedBatches.map((entry) => entry.batchId))].sort(),
+      cleanupNeedsAttentionBatches,
+      cleanupNeedsAttentionBatchIds: [...new Set(cleanupNeedsAttentionBatches.map((entry) => entry.batchId))].sort(),
       retentionCoverageUnavailableBatches,
       retentionCoverageUnavailableBatchIds: [...new Set(retentionCoverageUnavailableBatches.map((entry) => entry.batchId))].sort(),
       completionReceipts: cleaned.completionReceipts
@@ -2533,7 +2635,11 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     }
     acknowledgements.push({ batchId, leaseId });
   }
-  return { changed, acknowledgements };
+  return {
+    changed,
+    acknowledgements,
+    cleanupNeedsAttentionBatches: cleaned.cleanupNeedsAttentionBatches ?? []
+  };
 }
 
 async function reconcileKnowledgeCleanup({ state, lifecycle, stateStore, staging, now }) {
@@ -2542,7 +2648,7 @@ async function reconcileKnowledgeCleanup({ state, lifecycle, stateStore, staging
   for (const acknowledgement of reconciliation.acknowledgements) {
     try { await acknowledgeVerifiedCleanup(staging, acknowledgement); } catch {}
   }
-  return reconciliation.changed;
+  return reconciliation;
 }
 
 function resultFingerprint(result) {
@@ -2983,11 +3089,14 @@ async function cleanupExpiredKnowledgeStagingLocked({ stateStore, staging, clock
   const now = isoNow(clock);
   const state = await loadState(stateStore);
   const lifecycle = compilationState(state);
-  await reconcileKnowledgeCleanup({ state, lifecycle, stateStore, staging, now });
+  const reconciliation = await reconcileKnowledgeCleanup({ state, lifecycle, stateStore, staging, now });
   return {
     cleanup: {
       simulated: true,
       rawSourceBodiesRetained: false,
+      needsAttentionBatchIds: [...new Set(
+        reconciliation.cleanupNeedsAttentionBatches.map((entry) => entry.batchId)
+      )].sort(),
       expiredBatchIds: Object.values(lifecycle.batches)
         .filter((entry) => entry.status === "expired")
         .map((entry) => entry.batchId)

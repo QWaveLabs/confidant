@@ -1903,6 +1903,118 @@ test("restart keeps unexplained prepared-file absence and hard-link residue arme
   }
 });
 
+test("restart keeps a hard-linked orphan generation as needs-attention without expired truth", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-orphan-hardlink-"));
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-orphan-hardlink";
+    const tag = "a".repeat(24);
+    const dataPath = path.join(root, `batch-${batchId}.${tag}.json`);
+    const survivor = path.join(directory, "orphan-survivor.json");
+    await mkdir(root, { mode: 0o700 });
+    await writeFile(dataPath, "SECRET-ORPHAN-STAGED-BYTES\n", "utf8");
+    await link(dataPath, survivor);
+
+    const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+    await startSetupSession({
+      message: "Set up my second brain",
+      answers: { displayName: "Fixture", focus: "verify orphan cleanup truth" },
+      decisions: { vaultName: "Fixture Second Brain", language: "en" },
+      stateStore,
+      adapters: {
+        environment: new SimulatedEnvironmentAdapter(),
+        obsidian: new SimulatedObsidianAdapter(),
+        vault: new SimulatedDesktopVaultAdapter()
+      },
+      clock: clockAt(startedAt),
+      installationIdFactory: () => "fixture-orphan-cleanup-installation"
+    });
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: fixtureStaging(root),
+      clock: clockAt(laterToday)
+    });
+
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, [batchId]);
+    assert.equal(await readFile(dataPath, "utf8"), "SECRET-ORPHAN-STAGED-BYTES\n");
+    assert.equal(await readFile(survivor, "utf8"), "SECRET-ORPHAN-STAGED-BYTES\n");
+    assert.equal((await lstat(dataPath)).nlink, 2);
+    assert.equal((await lstat(survivor)).nlink, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart keeps a hard-linked malformed generation and its lease as needs-attention", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-malformed-hardlink-"));
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const batchId = "fixture-malformed-hardlink";
+    const tag = "b".repeat(24);
+    const base = path.join(root, `batch-${batchId}.${tag}`);
+    const dataPath = `${base}.json`;
+    const leasePath = `${base}.lease.json`;
+    const survivor = path.join(directory, "malformed-survivor.json");
+    await mkdir(root, { mode: 0o700 });
+    await writeFile(dataPath, "SECRET-MALFORMED-STAGED-BYTES\n", "utf8");
+    await writeFile(leasePath, "{not-valid-json\n", "utf8");
+    await link(dataPath, survivor);
+
+    const staging = fixtureStaging(root);
+    await staging.initialize();
+    const cleanup = await staging.cleanupExpired({ now: laterToday });
+
+    assert.deepEqual(cleanup.removedBatchIds, []);
+    assert.deepEqual(cleanup.cleanupNeedsAttentionBatchIds, [batchId]);
+    assert.deepEqual(cleanup.cleanupNeedsAttentionBatches, [{
+      batchId,
+      leaseId: null,
+      reason: "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"
+    }]);
+    assert.equal(await readFile(dataPath, "utf8"), "SECRET-MALFORMED-STAGED-BYTES\n");
+    assert.equal(await readFile(survivor, "utf8"), "SECRET-MALFORMED-STAGED-BYTES\n");
+    assert.equal(await readFile(leasePath, "utf8"), "{not-valid-json\n");
+    assert.equal((await lstat(dataPath)).nlink, 2);
+    assert.equal((await lstat(survivor)).nlink, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart removes single-link orphan and malformed generations only after verified absence", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-untracked-cleanup-"));
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const orphanBatchId = "fixture-orphan-single-link";
+    const malformedBatchId = "fixture-malformed-single-link";
+    const orphanPath = path.join(root, `batch-${orphanBatchId}.${"c".repeat(24)}.json`);
+    const malformedBase = path.join(root, `batch-${malformedBatchId}.${"d".repeat(24)}`);
+    const malformedDataPath = `${malformedBase}.json`;
+    const malformedLeasePath = `${malformedBase}.lease.json`;
+    await mkdir(root, { mode: 0o700 });
+    await writeFile(orphanPath, "SAFE-ORPHAN-CLEANUP\n", "utf8");
+    await writeFile(malformedDataPath, "SAFE-MALFORMED-CLEANUP\n", "utf8");
+    await writeFile(malformedLeasePath, "{not-valid-json\n", "utf8");
+
+    const staging = fixtureStaging(root);
+    await staging.initialize();
+    const cleanup = await staging.cleanupExpired({ now: laterToday });
+
+    assert.deepEqual(cleanup.removedBatchIds, [malformedBatchId, orphanBatchId].sort());
+    assert.deepEqual(cleanup.cleanupNeedsAttentionBatchIds, []);
+    assert.deepEqual(cleanup.removedBatches.map(({ batchId, reason }) => ({ batchId, reason })).sort((a, b) => a.batchId.localeCompare(b.batchId)), [
+      { batchId: malformedBatchId, reason: "invalid-generation" },
+      { batchId: orphanBatchId, reason: "orphaned-generation" }
+    ].sort((a, b) => a.batchId.localeCompare(b.batchId)));
+    for (const target of [orphanPath, malformedDataPath, malformedLeasePath]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("retention arming occurs before a temporary batch write and fails closed when the service is unavailable", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-retention-arm-"));
   try {

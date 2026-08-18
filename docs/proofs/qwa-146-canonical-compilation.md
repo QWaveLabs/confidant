@@ -94,6 +94,12 @@ become a competing authority.
   tombstone and no completion receipt. A stale worker that finds both old
   generation paths already absent exits ownership without fabricating evidence
   and cannot affect a later same-ID generation.
+- Startup orphan and malformed-generation cleanup uses the same link-aware
+  `lstat`/no-follow `open`/`fstat` identity checks and requires both verified
+  zero-link data and path absence before reporting a removal. A hardlinked
+  orphan or malformed generation remains in place, is returned as
+  needs-attention, and cannot create recovered expired lifecycle truth; safe
+  single-link artifacts are removed only after their absence is verified.
 - Successful compilation deletes the protected batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
   `lstat`, then opened without following links and checked with `fstat`; exact
@@ -164,9 +170,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **42/42 passed**.
+- QWA-146 focused suite: **45/45 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **90/90 passed**.
+- Full repository suite: **93/93 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
