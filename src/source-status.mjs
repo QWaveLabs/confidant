@@ -20,6 +20,11 @@ import {
   isStableLocalAlias,
   migrateStableLocalAliases
 } from "./connectors/stable-local-aliases.mjs";
+import {
+  sanitizePersistedDriveFailureReasons,
+  sanitizePersistedIMessageEntryFailureReasons,
+  sanitizePersistedIMessageRootFailureReasons
+} from "./connectors/persisted-failure-reasons.mjs";
 
 const STATE_KEY = "sourceStatusV2";
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -1737,19 +1742,37 @@ function persistedLocalConnectorAccountAlias(entry, namespace) {
 
 const PERSISTED_ALIAS_LIFECYCLES = Object.freeze([
   { adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, stateKey: "googleCalendarLifecycle", namespace: "calendar" },
-  { adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, stateKey: "googleDriveLifecycle", namespace: "drive" },
-  { adapter: SOURCE_ADAPTER_NAMES.IMESSAGE, stateKey: "imessageBetaLifecycle", namespace: "imessage" }
+  {
+    adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
+    stateKey: "googleDriveLifecycle",
+    namespace: "drive",
+    sanitizeEntryFailureReasons: sanitizePersistedDriveFailureReasons
+  },
+  {
+    adapter: SOURCE_ADAPTER_NAMES.IMESSAGE,
+    stateKey: "imessageBetaLifecycle",
+    namespace: "imessage",
+    sanitizeEntryFailureReasons: sanitizePersistedIMessageEntryFailureReasons,
+    sanitizeRootFailureReasons: sanitizePersistedIMessageRootFailureReasons
+  }
 ]);
 
 /**
- * Prepares durable local aliases on an already-loaded shared root. The caller
- * owns the root write lock and must save the same root when this returns true.
- * This is exported for additive specialized-connector integration; it does not
- * load or save state and never invokes a source adapter.
+ * Prepares durable local aliases and normalizes recognized legacy failure
+ * events on an already-loaded shared root. The caller owns the root write lock
+ * and must save the same root when this returns true. This is exported for
+ * additive specialized-connector integration; it does not load or save state
+ * and never invokes a source adapter.
  */
 export function migratePersistedAdapterAliasesInState(state) {
   let changed = false;
-  for (const { adapter, stateKey, namespace } of PERSISTED_ALIAS_LIFECYCLES) {
+  for (const {
+    adapter,
+    stateKey,
+    namespace,
+    sanitizeEntryFailureReasons,
+    sanitizeRootFailureReasons
+  } of PERSISTED_ALIAS_LIFECYCLES) {
     for (const entry of Object.values(state?.[stateKey]?.entries ?? {})) {
       if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
       try {
@@ -1758,14 +1781,22 @@ export function migratePersistedAdapterAliasesInState(state) {
           source: adapter === SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR ? "calendar" : namespace,
           accountId: entry.accountId
         });
-        changed = migrateStableLocalAliases(entry, namespace, {
+        const aliasesChanged = migrateStableLocalAliases(entry, namespace, {
           permissionReview: permission?.permissionReview,
           approvedRecords: Object.values(entry.normalizedMetadataById ?? {})
-        }) || changed;
+        });
+        const failureReasonsChanged = sanitizeEntryFailureReasons?.(entry) ?? false;
+        changed = aliasesChanged || failureReasonsChanged || changed;
       } catch {
         // A malformed legacy entry is omitted from public handoff below. It
         // must never be repaired by guessing or by projecting its raw ID.
       }
+    }
+    try {
+      changed = (sanitizeRootFailureReasons?.(state) ?? false) || changed;
+    } catch {
+      // A malformed lifecycle audit remains private and is not repaired by
+      // inference. Public handoff continues to omit malformed entries.
     }
   }
   return changed;

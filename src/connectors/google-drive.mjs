@@ -19,6 +19,11 @@ import {
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 import {
+  DRIVE_FAILURE_REASONS,
+  driveFailureReason,
+  sanitizePersistedDriveFailureReasons
+} from "./persisted-failure-reasons.mjs";
+import {
   getRawIdentifierForAlias,
   internalPermissionScopeFromStableAliases,
   projectApprovedReferencesWithStableAliases,
@@ -52,12 +57,6 @@ const REVOKED_AUTHORIZATION_CODES = new Set([
   "UNAUTHENTICATED",
   "UNAUTHORIZED"
 ]);
-const DRIVE_FAILURE_REASONS = Object.freeze({
-  METADATA_REVIEW: "DRIVE_METADATA_REVIEW_FAILED",
-  APPROVED_FETCH: "DRIVE_APPROVED_FETCH_FAILED",
-  APPROVED_FETCH_AUTHORIZATION_REVOKED: "DRIVE_APPROVED_FETCH_AUTHORIZATION_REVOKED"
-});
-const ALLOWED_DRIVE_FAILURE_REASONS = new Set(Object.values(DRIVE_FAILURE_REASONS));
 
 export class GoogleDriveLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -275,13 +274,6 @@ function uniqueOpaqueGoogleIds(values) {
   return uniqueStrings(values).filter(isOpaqueGoogleId);
 }
 
-function driveFailureReason(reason) {
-  if (!ALLOWED_DRIVE_FAILURE_REASONS.has(reason)) {
-    throw new TypeError("A fixed Drive failure reason is required.");
-  }
-  return reason;
-}
-
 function isRevokedAuthorizationFailure(error) {
   try {
     return REVOKED_AUTHORIZATION_CODES.has(error?.code);
@@ -309,25 +301,6 @@ function driveAliasRecords(entry) {
   ];
 }
 
-function sanitizePersistedDriveFailureReasons(entry) {
-  let changed = false;
-  for (const event of Array.isArray(entry?.audit) ? entry.audit : []) {
-    if (event?.type === "drive-metadata-review-unavailable"
-      && event.reason !== DRIVE_FAILURE_REASONS.METADATA_REVIEW) {
-      event.reason = driveFailureReason(DRIVE_FAILURE_REASONS.METADATA_REVIEW);
-      changed = true;
-    }
-    if (event?.type === "drive-approved-reference-fetch-interrupted"
-      && !ALLOWED_DRIVE_FAILURE_REASONS.has(event.reason)) {
-      event.reason = driveFailureReason(entry.status === "revoked"
-        ? DRIVE_FAILURE_REASONS.APPROVED_FETCH_AUTHORIZATION_REVOKED
-        : DRIVE_FAILURE_REASONS.APPROVED_FETCH);
-      changed = true;
-    }
-  }
-  return changed;
-}
-
 function migrateDriveAliasesInState(state) {
   let changed = false;
   for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
@@ -338,11 +311,12 @@ function migrateDriveAliasesInState(state) {
         source: SOURCE,
         accountId: entry.accountId
       });
-      changed = sanitizePersistedDriveFailureReasons(entry) || changed;
-      changed = migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
+      const aliasesChanged = migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
         permissionReview: permission?.permissionReview,
         approvedRecords: driveAliasRecords(entry)
-      }) || changed;
+      });
+      const failureReasonsChanged = sanitizePersistedDriveFailureReasons(entry);
+      changed = aliasesChanged || failureReasonsChanged || changed;
     } catch {
       // Resolution below translates a corrupt alias map to the connector's
       // fail-closed local-reference error without exposing the raw account.

@@ -91,9 +91,17 @@ primary Calendar connector.
 
 Drive and iMessage adapter exceptions are classified into fixed internal
 failure reasons before any audit save or public projection. Arbitrary adapter
-`error.code` strings are neither stored nor returned. Adversarial metadata and
-approved-fetch regressions inject recognizable raw codes and sweep both the
-public result and persisted root to prove those strings are absent.
+`error.code` strings are neither stored nor returned. A handoff-first
+process-restart regression seeds recognized valid legacy Drive metadata,
+approved-fetch, and revoked-fetch events plus iMessage entry and root-audit
+events with recognizable hostile values. While holding the shared root write
+lock, handoff prepares the stable aliases and fixed failure reasons on the
+same loaded root, performs one save, and only then projects status. The
+regression sweeps the entire persisted root and the public handoff and
+specialized status views to prove every hostile value is absent; the proof
+export repeats that restart path and publishes only the allowlisted internal
+enums. Malformed legacy entries are not guessed into validity and remain
+omitted from public projection.
 Metadata preflight recursively normalizes field names and rejects body-shaped
 keys before a grant, including singular `Attachment` and nested/case-variant
 message/email body fields.
@@ -133,7 +141,7 @@ message body, email body, attachment, payload, and header variants before an
 untrusted value can be displayed or persisted; the regression matrix records
 zero source-body consumption and exposes zero rejected records.
 
-Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, and the release-gate result.
+Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, the release-gate result, and `legacyFailureMigration` evidence showing a process restart before handoff, exactly one handoff migration save, non-colliding aliases, normalized root iMessage audit, fixed Drive/iMessage reasons, `rawAdapterFailureCodesPersisted: false`, and `rawAdapterFailureCodesProjected: false`.
 
 ## Release gate
 
@@ -154,13 +162,13 @@ QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **28/28** focused checks passed.
+- `npm run test:qwa-149` — **29/29** focused checks passed.
 - `npm run test:qwa-145` — **17/17** Gmail compatibility checks passed.
 - `npm run test:qwa-139` — **12/12** shared permission checks passed.
 - `npm run test:qwa-142` — **9/9** Google Drive compatibility checks passed.
 - `npm run test:qwa-150` — **7/7** iMessage compatibility checks passed.
-- `npm test` — **96/96** repository checks passed in this isolated candidate.
-- `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
+- `npm test` — **97/97** repository checks passed in this isolated candidate.
+- `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, an unsatisfied live-connector gate, and restart-first legacy failure migration evidence with no raw adapter failure code persisted or projected.
 
 ## Boundaries and limitations
 

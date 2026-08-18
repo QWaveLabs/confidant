@@ -1636,6 +1636,196 @@ test("valid pre-alias Drive and iMessage accounts migrate durably before handoff
   });
 });
 
+test("handoff-first restart durably normalizes recognized legacy Drive and iMessage failure codes", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const rawFailureCodes = [
+      "RAW_LEGACY_DRIVE_METADATA_CODE",
+      "RAW_LEGACY_DRIVE_FETCH_CODE",
+      "RAW_LEGACY_DRIVE_REVOKED_CODE",
+      "RAW_LEGACY_IMESSAGE_METADATA_CODE",
+      "RAW_LEGACY_IMESSAGE_ROOT_CODE"
+    ];
+    const state = await stateStore.load();
+    state.googleDriveLifecycle = {
+      version: 1,
+      entries: {
+        "drive:legacy-drive-attention": {
+          source: "drive",
+          accountId: "legacy-drive-attention",
+          status: "needs-attention",
+          authorization: { status: "unavailable", readOnly: false, metadataOnly: false, attempts: 1 },
+          authorizedFolderIds: ["legacy-drive-folder"],
+          reviewId: "legacy-drive-review",
+          normalizedMetadataById: {
+            "legacy-drive-record": {
+              source: "drive",
+              sourceRecordId: "legacy-drive-record",
+              folderId: "legacy-drive-folder"
+            }
+          },
+          audit: [{
+            type: "drive-metadata-review-unavailable",
+            accountId: "legacy-drive-attention",
+            reviewId: "legacy-drive-review",
+            grantId: "legacy-drive-grant",
+            sourceRecordId: "legacy-drive-record",
+            operationId: "legacy-drive-metadata-operation",
+            reason: rawFailureCodes[0],
+            contentBodiesRead: false
+          }, {
+            type: "drive-approved-reference-fetch-interrupted",
+            accountId: "legacy-drive-attention",
+            reviewId: "legacy-drive-review",
+            grantId: "legacy-drive-grant",
+            sourceRecordId: "legacy-drive-record",
+            operationId: "legacy-drive-fetch-operation",
+            reason: rawFailureCodes[1],
+            contentBodiesRead: false
+          }]
+        },
+        "drive:legacy-drive-revoked": {
+          source: "drive",
+          accountId: "legacy-drive-revoked",
+          status: "revoked",
+          authorization: { status: "revoked", readOnly: false, metadataOnly: false, attempts: 1 },
+          authorizedFolderIds: [],
+          reviewId: "legacy-drive-revoked-review",
+          normalizedMetadataById: {},
+          audit: [{
+            type: "drive-approved-reference-fetch-interrupted",
+            accountId: "legacy-drive-revoked",
+            reviewId: "legacy-drive-revoked-review",
+            grantId: "legacy-drive-revoked-grant",
+            operationId: "legacy-drive-revoked-operation",
+            reason: rawFailureCodes[2],
+            contentBodiesRead: false
+          }]
+        }
+      },
+      audit: []
+    };
+    state.imessageBetaLifecycle = {
+      version: 1,
+      entries: {
+        "imessage:legacy-imessage-fallback": {
+          source: "imessage",
+          accountId: "legacy-imessage-fallback",
+          status: "snapshot-available",
+          mode: "snapshot",
+          connectionTruth: "beta",
+          localAccess: { status: "unavailable", attempts: 1 },
+          snapshot: { available: true, started: false, oneTime: true, live: false },
+          contactAndGroupPrivacyApplied: false,
+          sensitiveApprovals: {
+            attachments: { approved: false, approvedAt: null },
+            highRiskIdentifiers: { approved: false, approvedAt: null }
+          },
+          reviewId: "legacy-imessage-review",
+          audit: [{
+            type: "imessage-metadata-review-unavailable",
+            accountId: "legacy-imessage-fallback",
+            reviewId: "legacy-imessage-review",
+            grantId: "legacy-imessage-grant",
+            sourceRecordId: "legacy-imessage-record",
+            operationId: "legacy-imessage-operation",
+            reason: rawFailureCodes[3],
+            contentBodiesRead: false
+          }]
+        }
+      },
+      audit: [{
+        type: "imessage-snapshot-fallback-available",
+        accountId: "legacy-imessage-fallback",
+        reason: rawFailureCodes[4]
+      }]
+    };
+    await stateStore.save(state);
+
+    const restartedStore = new FileStateStore(stateStore.filePath);
+    let handoffSaveCalls = 0;
+    const countingRestartedStore = {
+      async load() {
+        return restartedStore.load();
+      },
+      async save(nextState) {
+        handoffSaveCalls += 1;
+        return restartedStore.save(nextState);
+      }
+    };
+    const handoff = await getSourceStatusHandoff({ stateStore: countingRestartedStore });
+    assert.equal(handoffSaveCalls, 1, "handoff migration must save the loaded root exactly once");
+
+    const persisted = await restartedStore.load();
+    const driveAttention = persisted.googleDriveLifecycle.entries["drive:legacy-drive-attention"];
+    const driveRevoked = persisted.googleDriveLifecycle.entries["drive:legacy-drive-revoked"];
+    const imessage = persisted.imessageBetaLifecycle.entries["imessage:legacy-imessage-fallback"];
+    const accountAlias = (entry) => entry.publicIdentifierAliases.mappings
+      .find((mapping) => mapping.kind === "account" && mapping.raw === entry.accountId).alias;
+    const driveAttentionAlias = accountAlias(driveAttention);
+    const driveRevokedAlias = accountAlias(driveRevoked);
+    const imessageAlias = accountAlias(imessage);
+    assert.match(driveAttentionAlias, /^local-drive-account-[0-9a-f-]{36}$/);
+    assert.match(driveRevokedAlias, /^local-drive-account-[0-9a-f-]{36}$/);
+    assert.match(imessageAlias, /^local-imessage-account-[0-9a-f-]{36}$/);
+    assert.notEqual(driveAttentionAlias, driveRevokedAlias, "distinct legacy Drive accounts must not collapse");
+
+    assert.deepEqual(
+      driveAttention.audit.map((event) => event.reason),
+      ["DRIVE_METADATA_REVIEW_FAILED", "DRIVE_APPROVED_FETCH_FAILED"]
+    );
+    assert.equal(
+      driveRevoked.audit[0].reason,
+      "DRIVE_APPROVED_FETCH_AUTHORIZATION_REVOKED"
+    );
+    assert.equal(imessage.audit[0].reason, "IMESSAGE_METADATA_REVIEW_FAILED");
+    assert.equal(
+      persisted.imessageBetaLifecycle.audit[0].reason,
+      "IMESSAGE_METADATA_REVIEW_FAILED"
+    );
+
+    const driveAttentionStatus = await getGoogleDriveConnectionStatus({
+      stateStore: restartedStore,
+      accountId: driveAttentionAlias
+    });
+    const driveRevokedStatus = await getGoogleDriveConnectionStatus({
+      stateStore: restartedStore,
+      accountId: driveRevokedAlias
+    });
+    const imessageStatus = await getIMessageBetaStatus({
+      stateStore: restartedStore,
+      accountId: imessageAlias
+    });
+    assert.deepEqual(
+      driveAttentionStatus.drive.audit.map((event) => event.reason),
+      ["DRIVE_METADATA_REVIEW_FAILED", "DRIVE_APPROVED_FETCH_FAILED"]
+    );
+    assert.equal(
+      driveRevokedStatus.drive.audit[0].reason,
+      "DRIVE_APPROVED_FETCH_AUTHORIZATION_REVOKED"
+    );
+    assert.equal(imessageStatus.iMessageBeta.audit[0].reason, "IMESSAGE_METADATA_REVIEW_FAILED");
+
+    const publicEvidence = JSON.stringify({
+      handoff,
+      driveAttentionStatus,
+      driveRevokedStatus,
+      imessageStatus
+    });
+    const persistedRoot = JSON.stringify(persisted);
+    for (const rawFailureCode of rawFailureCodes) {
+      assert.equal(persistedRoot.includes(rawFailureCode), false);
+      assert.equal(publicEvidence.includes(rawFailureCode), false);
+    }
+    for (const rawAccountId of [
+      "legacy-drive-attention",
+      "legacy-drive-revoked",
+      "legacy-imessage-fallback"
+    ]) {
+      assert.equal(publicEvidence.includes(rawAccountId), false);
+    }
+  });
+});
+
 test("unsupported sources are explained safely and the release gate ignores forged caller evidence", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     const unsupported = await explainUnsupportedSource({
