@@ -1038,25 +1038,20 @@ test("same-context public re-entry is blocked so descendant callbacks cannot res
       people: [{ id: "connector-reentry-person", label: "Person", accessLevel: "allowed" }],
       items: [{ id: "connector-reentry-thread", kind: "conversation", conversation: "connector-reentry-thread", category: "work", participantIds: ["connector-reentry-person"], label: "Thread" }]
     });
-    const realPrepare = connector.preparePermissionGrant.bind(connector);
-    let blockedWriter;
-    connector.preparePermissionGrant = async (request) => {
-      try {
-        await beginSourcePermissionReview({
-          message: "A hooked connector tries a public cross-source write",
-          stateStore,
-          connector: gmail,
-          source: "gmail",
-          clock,
-          reviewIdFactory: () => "connector-reentry-gmail-review"
-        });
-      } catch (error) {
-        blockedWriter = error;
-        throw error;
-      }
-      return realPrepare(request);
+    let publicHookCalls = 0;
+    connector.preparePermissionGrant = async () => {
+      publicHookCalls += 1;
+      await beginSourcePermissionReview({
+        message: "A hooked connector tries a public cross-source write",
+        stateStore,
+        connector: gmail,
+        source: "gmail",
+        clock,
+        reviewIdFactory: () => "connector-reentry-gmail-review"
+      });
+      throw new Error("the lifecycle must never invoke this public hook");
     };
-    await assert.rejects(() => grantWhatsAppSnapshotContent({
+    const granted = await grantWhatsAppSnapshotContent({
       message: "Grant while the connector callback re-enters",
       stateStore,
       connector,
@@ -1065,11 +1060,12 @@ test("same-context public re-entry is blocked so descendant callbacks cannot res
       reviewId: "connector-reentry-review",
       clock,
       grantIdFactory: () => "connector-reentry-grant"
-    }), /could not activate that read-only permission safely/i);
-    assert.equal(blockedWriter?.code, "REENTRANT_PUBLIC_STATE_MUTATION_BLOCKED");
+    });
+    assert.equal(granted.whatsAppSnapshot.status, "ready-to-process");
+    assert.equal(publicHookCalls, 0);
     const root = await stateStore.load();
-    assert.equal(root.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`].status, "awaiting-content-grant");
-    assert.equal(root.sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "awaiting-grant");
+    assert.equal(root.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`].status, "ready-to-process");
+    assert.equal(root.sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "granted");
     assert.equal(root.sourcePermissionLifecycle.entries["gmail:connector-reentry-gmail"], undefined);
     assert.equal(connector.recordFileReads, 0);
     assert.equal(connector.mediaFileReads, 0);
@@ -1232,33 +1228,13 @@ test("deny, cancel, revoke, restart, status reconciliation, and cleanup remain t
       people: [ids.allowedPerson],
       grantId: "lying-revoke-grant"
     });
-    const realRevoke = connector.revokePermissionGrant.bind(connector);
-    connector.revokePermissionGrant = async () => ({ revoked: true });
-    const unconfirmed = await revokeWhatsAppSnapshotContent({
-      message: "Revoke through a nonthrowing but lying adapter",
-      stateStore,
-      connector,
-      accountId,
-      generation: 1,
-      reviewId: "lying-revoke-review",
-      clock
-    });
-    assert.equal(unconfirmed.revocationConfirmed, false);
-    assert.equal(unconfirmed.retryRequired, true);
-    assert.equal(unconfirmed.whatsAppSnapshot.status, "revoke-unconfirmed");
-    assert.equal(unconfirmed.whatsAppSnapshot.nextAction, "retry-local-revocation");
-    const stillActive = await connector.readPermissionGrantStatus({
-      grantId: "lying-revoke-grant",
-      snapshotBinding: connector.getSnapshotBinding()
-    });
-    assert.deepEqual(stillActive, { grantId: "lying-revoke-grant", active: true, revoked: false });
-    assert.equal((await stateStore.load()).sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "granted");
-    assert.equal(connector.recordFileReads, 0);
-    assert.equal(connector.mediaFileReads, 0);
-
-    connector.revokePermissionGrant = realRevoke;
+    let publicRevokeHookCalls = 0;
+    connector.revokePermissionGrant = async () => {
+      publicRevokeHookCalls += 1;
+      return { revoked: true };
+    };
     const confirmed = await revokeWhatsAppSnapshotContent({
-      message: "Retry the exact grant revocation",
+      message: "Revoke without crossing the public connector hook",
       stateStore,
       connector,
       accountId,
@@ -1267,6 +1243,15 @@ test("deny, cancel, revoke, restart, status reconciliation, and cleanup remain t
       clock
     });
     assert.equal(confirmed.whatsAppSnapshot.status, "revoked");
+    assert.equal(publicRevokeHookCalls, 0);
+    const inactive = await connector.readPermissionGrantStatus({
+      grantId: "lying-revoke-grant",
+      snapshotBinding: connector.getSnapshotBinding()
+    });
+    assert.deepEqual(inactive, { grantId: "lying-revoke-grant", active: false, revoked: true });
+    assert.equal((await stateStore.load()).sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "revoked");
+    assert.equal(connector.recordFileReads, 0);
+    assert.equal(connector.mediaFileReads, 0);
     assert.equal(connector.grantRevocationCalls, 1);
   });
 });
@@ -1681,6 +1666,201 @@ test("direct caller-fabricated active grants cannot activate or read the exporte
     assert.equal(directConnector.rawMessageBodiesRead, 0);
     assert.equal(directConnector.rawMediaBodiesRead, 0);
   });
+});
+
+test("an inspecting subclass and wrapper cannot observe or reuse lifecycle authority for a fabricated grant or read", async () => {
+  await withFixture(async ({ stateStore, bundleRoot, bundle }) => {
+    const observed = [];
+    class InspectingConnector extends LocalWhatsAppSnapshotConnector {
+      #observe(method, request) {
+        observed.push({ method, request: request === undefined ? undefined : structuredClone(request) });
+      }
+      async discoverMetadata(request) {
+        this.#observe("discoverMetadata", request);
+        return super.discoverMetadata(request);
+      }
+      getSnapshotBinding() {
+        this.#observe("getSnapshotBinding");
+        return super.getSnapshotBinding();
+      }
+      validateSelection(request) {
+        this.#observe("validateSelection", request);
+        return super.validateSelection(request);
+      }
+      async preparePermissionGrant(request) {
+        this.#observe("preparePermissionGrant", request);
+        return super.preparePermissionGrant(request);
+      }
+      async registerPermissionGrant(request) {
+        this.#observe("registerPermissionGrant", request);
+        return super.registerPermissionGrant(request);
+      }
+      async revokePermissionGrant(request) {
+        this.#observe("revokePermissionGrant", request);
+        return super.revokePermissionGrant(request);
+      }
+      createApprovedFetchPlan(request) {
+        this.#observe("createApprovedFetchPlan", request);
+        return super.createApprovedFetchPlan(request);
+      }
+      async fetchApprovedContent(request) {
+        this.#observe("fetchApprovedContent", request);
+        return super.fetchApprovedContent(request);
+      }
+      cleanupPrivateMemory() {
+        this.#observe("cleanupPrivateMemory");
+        return super.cleanupPrivateMemory();
+      }
+    }
+
+    const connector = new InspectingConnector({ manifestPath: bundle.manifestPath, permittedRoot: bundleRoot });
+    const reviewId = "inspecting-subclass-review";
+    const grantId = "inspecting-subclass-grant";
+    const reviewed = await review({ stateStore, connector, reviewId });
+    const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+    await selectAndGrant({
+      stateStore,
+      connector,
+      permissionReview: reviewed.whatsAppSnapshot.permissionReview,
+      reviewId,
+      chats: [ids.allowedChat],
+      people: [ids.allowedPerson],
+      grantId
+    });
+    assert.deepEqual(observed, [], "guided lifecycle calls must bypass every application override");
+
+    const root = await stateStore.load();
+    const entry = root.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`];
+    const authorized = root.sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].grants
+      .find((grant) => grant.id === grantId);
+    const fabricated = { ...structuredClone(authorized), id: "inspecting-subclass-fabricated-grant", status: "active" };
+    const snapshotBinding = connector.getSnapshotBinding();
+    const selection = structuredClone(entry.selection);
+    const plan = connector.createApprovedFetchPlan({ snapshotBinding, selection });
+    const readsBeforeAttacks = {
+      records: connector.recordFileReads,
+      media: connector.mediaFileReads,
+      messageBodies: connector.rawMessageBodiesRead,
+      mediaBodies: connector.rawMediaBodiesRead
+    };
+
+    await assert.rejects(() => connector.registerPermissionGrant({
+      grant: fabricated,
+      snapshotBinding,
+      selection
+    }), (error) => error?.code === "WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED");
+    await assert.rejects(() => connector.fetchApprovedContent({
+      source: "whatsapp",
+      accountId,
+      grant: fabricated,
+      snapshotBinding,
+      selection,
+      fetchUnit: { planBinding: plan.planBinding, index: 0, unit: plan.units[0] },
+      completedReceipts: []
+    }), (error) => error?.code === "WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED");
+
+    let wrapperPropertyReads = 0;
+    const wrapped = new Proxy(connector, {
+      get(target, property, receiver) {
+        wrapperPropertyReads += 1;
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    await assert.rejects(() => fetchApprovedWhatsAppSnapshotContent({
+      message: "A wrapper must not inherit exact-instance lifecycle authority",
+      stateStore,
+      connector: wrapped,
+      accountId,
+      generation: 1,
+      reviewId,
+      clock
+    }), (error) => error?.code === "WHATSAPP_CONNECTOR_NOT_REGISTERED");
+    assert.equal(wrapperPropertyReads, 0, "exact-instance rejection must occur without consulting wrapper properties");
+
+    assert.deepEqual({
+      records: connector.recordFileReads,
+      media: connector.mediaFileReads,
+      messageBodies: connector.rawMessageBodiesRead,
+      mediaBodies: connector.rawMediaBodiesRead
+    }, readsBeforeAttacks);
+    assert.equal(connector.grantRegistrationCalls, 1, "only the legitimate lifecycle activation registered");
+    const observedText = JSON.stringify(observed);
+    assert.doesNotMatch(observedText, /lifecycle.?capability|credential|authorization/i);
+    assert.deepEqual(observed.map(({ method }) => method), [
+      "getSnapshotBinding",
+      "createApprovedFetchPlan",
+      "registerPermissionGrant",
+      "fetchApprovedContent"
+    ]);
+  });
+});
+
+test("prototype monkeypatches cannot intercept legitimate review, grant, fetch, or revoke operations", async () => {
+  const prototype = LocalWhatsAppSnapshotConnector.prototype;
+  const methodNames = [
+    "discoverMetadata",
+    "getSnapshotBinding",
+    "validateSelection",
+    "preparePermissionGrant",
+    "registerPermissionGrant",
+    "revokePermissionGrant",
+    "createApprovedFetchPlan",
+    "fetchApprovedContent",
+    "cleanupPrivateMemory"
+  ];
+  const originalDescriptors = new Map(methodNames.map((name) => [name, Object.getOwnPropertyDescriptor(prototype, name)]));
+  const intercepted = [];
+  for (const name of methodNames) {
+    Object.defineProperty(prototype, name, {
+      ...originalDescriptors.get(name),
+      value(...args) {
+        intercepted.push({ name, args: structuredClone(args) });
+        throw new Error(`prototype interception reached ${name}`);
+      }
+    });
+  }
+  try {
+    await withFixture(async ({ stateStore, connector }) => {
+      const reviewId = "prototype-monkeypatch-review";
+      const reviewed = await review({ stateStore, connector, reviewId });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({
+        stateStore,
+        connector,
+        permissionReview: reviewed.whatsAppSnapshot.permissionReview,
+        reviewId,
+        chats: [ids.allowedChat],
+        people: [ids.allowedPerson],
+        grantId: "prototype-monkeypatch-grant"
+      });
+      const fetched = await fetchApprovedWhatsAppSnapshotContent({
+        message: "Read through exact private operations",
+        stateStore,
+        connector,
+        accountId,
+        generation: 1,
+        reviewId,
+        clock
+      });
+      assert.equal(fetched.whatsAppSnapshot.status, "processed");
+      assert.equal(fetched.approvedRecords.length, 1);
+      const revoked = await revokeWhatsAppSnapshotContent({
+        message: "Revoke through exact private operations",
+        stateStore,
+        connector,
+        accountId,
+        generation: 1,
+        reviewId,
+        clock
+      });
+      assert.equal(revoked.whatsAppSnapshot.status, "revoked");
+      assert.equal(connector.recordFileReads, 1);
+      assert.equal(connector.rawMessageBodiesRead, 1);
+      assert.deepEqual(intercepted, []);
+    });
+  } finally {
+    for (const [name, descriptor] of originalDescriptors) Object.defineProperty(prototype, name, descriptor);
+  }
 });
 
 test("two-instance replay transfers one authoritative activation and revoke confirms every registration inactive", async () => {

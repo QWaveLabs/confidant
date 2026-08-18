@@ -7,6 +7,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
   beginSpecializedWhatsAppPermissionReview,
   denySpecializedWhatsAppPermission,
@@ -18,7 +19,7 @@ import {
 } from "../permissions/setup-source-permissions.mjs";
 import {
   DEFAULT_WHATSAPP_SNAPSHOT_ACCOUNT_REF,
-  LocalWhatsAppSnapshotConnector,
+  getLocalWhatsAppSnapshotLifecycleOperations,
   WHATSAPP_SNAPSHOT_BUNDLE_FORMAT,
   WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL
 } from "./local-whatsapp-snapshot-connector.mjs";
@@ -28,8 +29,8 @@ const SOURCE = "whatsapp";
 const SOURCE_PERMISSION_KEY_PREFIX = `${SOURCE}:`;
 const MAX_CAPTURE_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const DEFAULT_OFFICIAL_BUSINESS_ACCOUNT_REF = "wa-account-business-1";
-const LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY = Object.freeze({});
 const LOCAL_WHATSAPP_SNAPSHOT_REGISTRATIONS = new Map();
+const LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS = new WeakMap();
 export const OFFICIAL_WHATSAPP_BUSINESS_VERIFICATION_PROTOCOL = "qwave.shared-connector-verification/v1";
 
 export class WhatsAppSnapshotError extends Error {
@@ -41,15 +42,21 @@ export class WhatsAppSnapshotError extends Error {
   }
 }
 
-// Imported only by the local connector module. The capability itself remains
-// module-private, so public connector calls cannot forge lifecycle authority.
-export function assertLocalWhatsAppSnapshotLifecycleCapability(candidate) {
-  if (candidate !== LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY) {
+// Deliberately not re-exported from the package entrypoint. A connector's
+// private operation consumes this process-local, one-shot authorization
+// synchronously. No secret or capability is passed through the connector call.
+export function assertLocalWhatsAppSnapshotLifecycleOperationAuthorized(connector, operation, request) {
+  const authorization = LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.get(connector);
+  if (!authorization || authorization.consumed === true
+    || authorization.operation !== operation
+    || !isDeepStrictEqual(authorization.request, request)) {
     throw new WhatsAppSnapshotError(
       "WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED",
       "Local WhatsApp snapshot grants can only be activated, revoked, or read through the durable permission lifecycle."
     );
   }
+  authorization.consumed = true;
+  LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.delete(connector);
 }
 
 function clone(value) {
@@ -58,6 +65,31 @@ function clone(value) {
 
 function hash(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function invokeLocalConnectorOperation(connector, operation, request, invoke) {
+  if (LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.has(connector)) {
+    throw new WhatsAppSnapshotError(
+      "WHATSAPP_LIFECYCLE_REENTRY_BLOCKED",
+      "A local WhatsApp lifecycle operation was already in progress, so the overlapping request was blocked."
+    );
+  }
+  const authorization = { operation, request: clone(request), consumed: false };
+  LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.set(connector, authorization);
+  try {
+    const result = invoke();
+    if (authorization.consumed !== true) {
+      throw new WhatsAppSnapshotError(
+        "WHATSAPP_LIFECYCLE_AUTHORIZATION_UNUSED",
+        "The private local WhatsApp connector did not consume its exact lifecycle authorization."
+      );
+    }
+    return result;
+  } finally {
+    if (LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.get(connector) === authorization) {
+      LOCAL_WHATSAPP_SNAPSHOT_INVOCATIONS.delete(connector);
+    }
+  }
 }
 
 function isoNow(clock) {
@@ -244,10 +276,16 @@ function assertGeneration(entry, generation) {
   }
 }
 
-function assertConnector(connector) {
-  if (!(connector instanceof LocalWhatsAppSnapshotConnector)) {
+function connectorOperations(connector) {
+  const operations = getLocalWhatsAppSnapshotLifecycleOperations(connector);
+  if (!operations) {
     throw new WhatsAppSnapshotError("WHATSAPP_CONNECTOR_NOT_REGISTERED", "Only the registered private local WhatsApp snapshot connector can be used for this flow.");
   }
+  return operations;
+}
+
+function assertConnector(connector) {
+  connectorOperations(connector);
 }
 
 function safeFailure(error, fallback, at) {
@@ -627,12 +665,15 @@ function trackLocalConnector(connector, entry, grantId = entry.grantId) {
 
 async function revokeTrackedConnector(connector, entry, grantId) {
   const snapshotBinding = clone(entry.snapshotBinding);
-  await connector.revokePermissionGrant({
-    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
-    grantId,
-    snapshotBinding
-  });
-  const readback = await connector.readPermissionGrantStatus({ grantId, snapshotBinding });
+  const operations = connectorOperations(connector);
+  const request = { grantId, snapshotBinding };
+  await invokeLocalConnectorOperation(
+    connector,
+    "revokePermissionGrant",
+    request,
+    () => operations.revokePermissionGrant(request)
+  );
+  const readback = await operations.readPermissionGrantStatus({ grantId, snapshotBinding });
   if (readback?.grantId !== grantId || readback.active !== false
     || readback.pending === true || readback.revoked !== true) {
     throw new WhatsAppSnapshotError(
@@ -660,9 +701,9 @@ async function revokeEveryTrackedConnector(connector, entry, grantId) {
 }
 
 async function ensureConnectorBinding(connector, entry) {
-  assertConnector(connector);
-  await connector.discoverMetadata({ source: SOURCE });
-  const binding = connector.getSnapshotBinding();
+  const operations = connectorOperations(connector);
+  await operations.discoverMetadata({ source: SOURCE });
+  const binding = operations.getSnapshotBinding();
   if (binding.accountRef !== entry.accountId || (entry.snapshotBinding && JSON.stringify(binding) !== JSON.stringify(entry.snapshotBinding))) {
     throw new WhatsAppSnapshotError("SNAPSHOT_CONNECTOR_SUBSTITUTION", "The local connector does not match this immutable snapshot generation.");
   }
@@ -673,12 +714,13 @@ async function ensureConnectorBinding(connector, entry) {
 }
 
 function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts = [], registrationMode = "activate" } = {}) {
+  const operations = connectorOperations(connector);
   const selection = clone(entry.selection);
   const snapshotBinding = clone(entry.snapshotBinding);
   const revocation = clone(entry.revocation);
   const grantActivation = clone(entry.grantActivation);
   return {
-    discoverMetadata: (request) => connector.discoverMetadata(request),
+    discoverMetadata: (request) => operations.discoverMetadata(request),
     registerPermissionGrant: async ({ grant }) => {
       if (revocation?.status === "pending") {
         throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "A pending WhatsApp revocation cannot restore or register source access.");
@@ -711,8 +753,7 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
       if (grantActivation?.status === "pending") {
         throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_PENDING", "A pending WhatsApp grant activation blocks every content read.");
       }
-      return connector.fetchApprovedContent({
-        lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
+      const request = {
         source,
         accountId,
         grant,
@@ -720,9 +761,28 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
         selection,
         fetchUnit: clone(fetchUnit),
         completedReceipts: clone(completedReceipts)
-      });
+      };
+      return invokeLocalConnectorOperation(
+        connector,
+        "fetchApprovedContent",
+        request,
+        () => operations.fetchApprovedContent(request)
+      );
     }
   };
+}
+
+function permissionReviewProxy(connector) {
+  const operations = connectorOperations(connector);
+  return Object.freeze({
+    discoverMetadata: (request) => operations.discoverMetadata(request),
+    fetchApprovedContent: async () => {
+      throw new WhatsAppSnapshotError(
+        "WHATSAPP_GRANT_REQUIRED",
+        "Metadata review cannot read WhatsApp snapshot content."
+      );
+    }
+  });
 }
 
 function exactGrantScopeMatchesSelection(grantScope, exactScope) {
@@ -758,13 +818,19 @@ async function prepareExactConnectorGrant(connector, entry, grant) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact durable pending activation intent could not be confirmed.");
   }
   trackLocalConnector(connector, entry, grant.id);
-  const result = await connector.preparePermissionGrant({
-    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
+  const operations = connectorOperations(connector);
+  const request = {
     grant,
     snapshotBinding: clone(entry.snapshotBinding),
     selection: clone(entry.selection)
-  });
-  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
+  };
+  const result = await invokeLocalConnectorOperation(
+    connector,
+    "preparePermissionGrant",
+    request,
+    () => operations.preparePermissionGrant(request)
+  );
+  const readback = await operations.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
   if (readback?.grantId !== grant.id || readback.active !== false
     || readback.revoked !== false || readback.pending !== true) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_PREPARATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed pending and non-readable, so activation remains denied.");
@@ -782,13 +848,19 @@ async function activateExactConnectorGrant(connector, entry, grant) {
     await revokeTrackedConnector(current, entry, grant.id);
     registration.authoritative = null;
   }
-  const result = await connector.registerPermissionGrant({
-    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
+  const operations = connectorOperations(connector);
+  const request = {
     grant,
     snapshotBinding: clone(entry.snapshotBinding),
     selection: clone(entry.selection)
-  });
-  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
+  };
+  const result = await invokeLocalConnectorOperation(
+    connector,
+    "registerPermissionGrant",
+    request,
+    () => operations.registerPermissionGrant(request)
+  );
+  const readback = await operations.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
   if (readback?.grantId !== grant.id || readback.active !== true
     || readback.revoked !== false || readback.pending === true) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed active, so content access remains denied.");
@@ -799,7 +871,7 @@ async function activateExactConnectorGrant(connector, entry, grant) {
 
 async function ensureExactConnectorGrantActive(connector, entry, grant) {
   const snapshotBinding = clone(entry.snapshotBinding);
-  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
+  const readback = await connectorOperations(connector).readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
   if (readback?.grantId !== grant.id || readback.revoked === true) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant could not be reconciled as active, so content access remains denied.");
   }
@@ -987,6 +1059,7 @@ async function beginImportUnlocked({ message, stateStore, connector, accountId =
     throw new WhatsAppSnapshotError("GUIDED_EXPORT_REQUIRED", "Confirm the private export before starting its local metadata preflight.");
   }
   assertConnector(connector);
+  const operations = connectorOperations(connector);
   const now = isoNow(clock);
   entry.status = "snapshot-review-pending";
   entry.snapshot.importStatus = "metadata-preflight-pending";
@@ -999,7 +1072,7 @@ async function beginImportUnlocked({ message, stateStore, connector, accountId =
   let recoverableReviewId = null;
   let recoverableBinding = null;
   try {
-    const discoveredMetadata = await connector.discoverMetadata({ source: SOURCE });
+    const discoveredMetadata = await operations.discoverMetadata({ source: SOURCE });
     const existing = await currentPermission(stateStore, accountId, language);
     let review = entry.reviewId && existing?.permissionReview?.status === "awaiting-grant"
       && existing.permissionReview.permissionRequest.reviewId === entry.reviewId
@@ -1015,7 +1088,7 @@ async function beginImportUnlocked({ message, stateStore, connector, accountId =
       review = await beginSpecializedWhatsAppPermissionReview({
         message: languageFor(state, language) === "es" ? "Quiero revisar la instantánea para mi segundo cerebro" : "I want to review the snapshot for my second brain",
         stateStore,
-        connector,
+        connector: permissionReviewProxy(connector),
         source: SOURCE,
         language,
         clock,
@@ -1031,7 +1104,7 @@ async function beginImportUnlocked({ message, stateStore, connector, accountId =
     if (!metadataMatchesPermissionReview(discoveredMetadata, review.permissionReview)) {
       throw new WhatsAppSnapshotError("SNAPSHOT_PERMISSION_METADATA_MISMATCH", "An existing permission review does not match this immutable local snapshot manifest.");
     }
-    const binding = connector.getSnapshotBinding();
+    const binding = operations.getSnapshotBinding();
     if (binding.accountRef !== accountId || binding.capturedAt !== entry.snapshot.capturedAt) {
       throw new WhatsAppSnapshotError("SNAPSHOT_CAPTURE_BINDING_MISMATCH", "The immutable manifest does not match the confirmed account and capture time.");
     }
@@ -1088,7 +1161,7 @@ async function selectScopeUnlocked({ message, stateStore, connector, accountId =
     throw new WhatsAppSnapshotError("WHATSAPP_SELECTION_NOT_READY", "Complete the current manifest review before selecting snapshot content.");
   }
   await ensureConnectorBinding(connector, entry);
-  const selection = connector.validateSelection({ chatRefs, personRefs, from, to, includeMedia, sensitiveCategories });
+  const selection = connectorOperations(connector).validateSelection({ chatRefs, personRefs, from, to, includeMedia, sensitiveCategories });
   const permission = await currentPermission(stateStore, accountId, language);
   const requested = permission?.permissionReview?.permissionRequest?.requestedScope;
   if (!requested || Date.parse(selection.from) < Date.parse(requested.dateRange.from) || Date.parse(selection.to) > Date.parse(requested.dateRange.to)) {
@@ -1316,7 +1389,7 @@ async function fetchUnlocked({ message, stateStore, connector, accountId = DEFAU
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_REQUIRED", "An active exact WhatsApp snapshot grant is required before local content is read.");
   }
   await ensureConnectorBinding(connector, entry);
-  const connectorPlan = assertFetchPlan(connector.createApprovedFetchPlan({
+  const connectorPlan = assertFetchPlan(connectorOperations(connector).createApprovedFetchPlan({
     snapshotBinding: clone(entry.snapshotBinding),
     selection: clone(entry.selection)
   }));
@@ -1648,7 +1721,7 @@ export async function cleanupWhatsAppSnapshotPrivateMemory({ message, stateStore
     assertGeneration(entry, generation);
     assertNoRevocationPending(entry);
     assertNoGrantActivationPending(entry);
-    const result = connector.cleanupPrivateMemory();
+    const result = connectorOperations(connector).cleanupPrivateMemory();
     entry.audit.push({ type: "whatsapp-private-memory-cleared", at: isoNow(clock), sourceFilesDeleted: false, stagingFilesCreated: false });
     await stateStore.save(state);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), cleanup: result };

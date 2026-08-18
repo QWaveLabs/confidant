@@ -14,7 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 import { SENSITIVE_CATEGORIES } from "../permissions/setup-source-permissions.mjs";
-import { assertLocalWhatsAppSnapshotLifecycleCapability } from "./whatsapp-snapshot.mjs";
+import { assertLocalWhatsAppSnapshotLifecycleOperationAuthorized } from "./whatsapp-snapshot.mjs";
 
 export const WHATSAPP_SNAPSHOT_BUNDLE_FORMAT = "qwave.whatsapp-snapshot-bundle/v1";
 export const WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL = "qwave.local-whatsapp-snapshot/v1";
@@ -61,6 +61,14 @@ const SAFE_MEDIA_MIME_TYPES = new Set([
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_REF = /^[A-Za-z0-9._:-]{1,160}$/;
 const ACCOUNT_REF = /^wa-account-[a-z0-9._:-]{1,128}$/;
+const LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_OPERATIONS = new WeakMap();
+
+// Deliberately not re-exported from the package entrypoint. High-authority
+// closures still require a synchronous one-shot authorization held entirely
+// inside the lifecycle module; this bridge never receives or exposes a token.
+export function getLocalWhatsAppSnapshotLifecycleOperations(connector) {
+  return LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_OPERATIONS.get(connector) ?? null;
+}
 
 export class LocalWhatsAppSnapshotError extends Error {
   constructor(code, customerMessage) {
@@ -235,24 +243,26 @@ export class LocalWhatsAppSnapshotConnector {
     this.#repositoryRoots = [MODULE_REPOSITORY_ROOT, ...repositoryRoots];
     this.#accountRef = accountRef;
     this.#limits = normalizedLimits(limits);
+    LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_OPERATIONS.set(this, Object.freeze({
+      discoverMetadata: (request) => this.#discoverMetadata(request),
+      getSnapshotBinding: () => this.#getSnapshotBinding(),
+      validateSelection: (selection) => this.#validateSelection(selection),
+      preparePermissionGrant: (request) => this.#preparePermissionGrant(request),
+      registerPermissionGrant: (request) => this.#registerPermissionGrant(request),
+      revokePermissionGrant: (request) => this.#revokePermissionGrant(request),
+      readPermissionGrantStatus: (request) => this.#readPermissionGrantStatus(request),
+      createApprovedFetchPlan: (request) => this.#createApprovedFetchPlan(request),
+      fetchApprovedContent: (request) => this.#fetchApprovedContent(request),
+      cleanupPrivateMemory: () => this.#cleanupPrivateMemory()
+    }));
     // The exact grant readback is an own, non-replaceable function backed by
-    // connector-private maps. Tests and host adapters may hook the public
-    // revoke method, but they cannot forge this removal confirmation.
+    // connector-private maps. The lifecycle does not invoke this public
+    // wrapper; it uses the exact-instance private operation registered above.
     Object.defineProperty(this, "readPermissionGrantStatus", {
       configurable: false,
       enumerable: false,
       writable: false,
-      value: async ({ grantId, snapshotBinding } = {}) => {
-        this.#assertBinding(snapshotBinding);
-        if (!SAFE_REF.test(grantId)) fail("SNAPSHOT_GRANT_INVALID", "The WhatsApp snapshot grant identifier is invalid.");
-        const pending = this.#pendingGrantBindings.has(grantId);
-        return Object.freeze({
-          grantId,
-          active: this.#grantBindings.has(grantId),
-          revoked: this.#revokedGrants.has(grantId),
-          ...(pending ? { pending: true } : {})
-        });
-      }
+      value: (request) => this.#readPermissionGrantStatus(request)
     });
   }
 
@@ -266,6 +276,18 @@ export class LocalWhatsAppSnapshotConnector {
   get grantRegistrationCalls() { return this.#metrics.grantRegistrationCalls; }
   get grantRevocationCalls() { return this.#metrics.grantRevocationCalls; }
   get writeCalls() { return this.#metrics.writeCalls; }
+
+  async #readPermissionGrantStatus({ grantId, snapshotBinding } = {}) {
+    this.#assertBinding(snapshotBinding);
+    if (!SAFE_REF.test(grantId)) fail("SNAPSHOT_GRANT_INVALID", "The WhatsApp snapshot grant identifier is invalid.");
+    const pending = this.#pendingGrantBindings.has(grantId);
+    return Object.freeze({
+      grantId,
+      active: this.#grantBindings.has(grantId),
+      revoked: this.#revokedGrants.has(grantId),
+      ...(pending ? { pending: true } : {})
+    });
+  }
 
   async #canonicalRoots() {
     if (!path.isAbsolute(this.#permittedRoot)) fail("SNAPSHOT_ROOT_INVALID", "The private snapshot root must be an absolute local path.");
@@ -527,7 +549,7 @@ export class LocalWhatsAppSnapshotConnector {
     return { binding, manifestSha256: digest, roots, bundleRoot, peopleByAlias, chatsByAlias, generationSeed: seed };
   }
 
-  async discoverMetadata({ source } = {}) {
+  async #discoverMetadata({ source } = {}) {
     if (source !== "whatsapp") fail("SNAPSHOT_CONNECTOR_SUBSTITUTION", "This private snapshot connector can only review WhatsApp snapshot data.");
     this.#metrics.metadataPreflightCalls += 1;
     if (!this.#ready) {
@@ -577,12 +599,20 @@ export class LocalWhatsAppSnapshotConnector {
     };
   }
 
-  getSnapshotBinding() {
+  async discoverMetadata(request) {
+    return this.#discoverMetadata(request);
+  }
+
+  #getSnapshotBinding() {
     if (!this.#ready) fail("SNAPSHOT_PREFLIGHT_REQUIRED", "Approve the snapshot metadata preflight before continuing.");
     return clone(this.#ready.binding);
   }
 
-  validateSelection(selection) {
+  getSnapshotBinding() {
+    return this.#getSnapshotBinding();
+  }
+
+  #validateSelection(selection) {
     if (!this.#ready) fail("SNAPSHOT_PREFLIGHT_REQUIRED", "Approve the snapshot metadata preflight before continuing.");
     assertAllowedKeys(selection, ["chatRefs", "personRefs", "from", "to", "includeMedia", "sensitiveCategories", "selectionDigest", "mediaInventoryBinding"], "selection");
     if (!Array.isArray(selection.chatRefs) || selection.chatRefs.length < 1 || !Array.isArray(selection.personRefs) || selection.personRefs.length < 1) {
@@ -677,6 +707,10 @@ export class LocalWhatsAppSnapshotConnector {
     });
   }
 
+  validateSelection(selection) {
+    return this.#validateSelection(selection);
+  }
+
   #assertBinding(binding) {
     if (!this.#ready || !binding || JSON.stringify(binding) !== JSON.stringify(this.#ready.binding)) {
       fail("SNAPSHOT_CONNECTOR_SUBSTITUTION", "The connector no longer matches the immutable snapshot review, so I stopped safely.");
@@ -685,7 +719,7 @@ export class LocalWhatsAppSnapshotConnector {
 
   #grantBinding({ grant, snapshotBinding, selection }) {
     this.#assertBinding(snapshotBinding);
-    const normalized = this.validateSelection(selection);
+    const normalized = this.#validateSelection(selection);
     if (!grant || grant.accountId !== this.#accountRef || grant.source !== "whatsapp" || grant.status !== "active") {
       fail("SNAPSHOT_GRANT_INVALID", "The private snapshot grant does not match this reviewed account.");
     }
@@ -704,8 +738,8 @@ export class LocalWhatsAppSnapshotConnector {
     };
   }
 
-  async preparePermissionGrant({ lifecycleCapability, grant, snapshotBinding, selection }) {
-    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
+  async #preparePermissionGrant({ grant, snapshotBinding, selection }) {
+    assertLocalWhatsAppSnapshotLifecycleOperationAuthorized(this, "preparePermissionGrant", { grant, snapshotBinding, selection });
     const next = this.#grantBinding({ grant, snapshotBinding, selection });
     this.#metrics.grantPreparationCalls += 1;
     const active = this.#grantBindings.get(grant.id);
@@ -719,8 +753,8 @@ export class LocalWhatsAppSnapshotConnector {
     return { prepared: true, idempotent: Boolean(active || pending), alreadyActive: Boolean(active) };
   }
 
-  async registerPermissionGrant({ lifecycleCapability, grant, snapshotBinding, selection }) {
-    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
+  async #registerPermissionGrant({ grant, snapshotBinding, selection }) {
+    assertLocalWhatsAppSnapshotLifecycleOperationAuthorized(this, "registerPermissionGrant", { grant, snapshotBinding, selection });
     const next = this.#grantBinding({ grant, snapshotBinding, selection });
     this.#metrics.grantRegistrationCalls += 1;
     const existing = this.#grantBindings.get(grant.id);
@@ -735,8 +769,8 @@ export class LocalWhatsAppSnapshotConnector {
     return { registered: true, idempotent: Boolean(existing) };
   }
 
-  async revokePermissionGrant({ lifecycleCapability, grantId, snapshotBinding }) {
-    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
+  async #revokePermissionGrant({ grantId, snapshotBinding }) {
+    assertLocalWhatsAppSnapshotLifecycleOperationAuthorized(this, "revokePermissionGrant", { grantId, snapshotBinding });
     this.#assertBinding(snapshotBinding);
     if (!SAFE_REF.test(grantId)) fail("SNAPSHOT_GRANT_INVALID", "The WhatsApp snapshot grant identifier is invalid.");
     if (!this.#revokedGrants.has(grantId)) {
@@ -746,6 +780,18 @@ export class LocalWhatsAppSnapshotConnector {
       this.#grantBindings.delete(grantId);
     }
     return { revoked: true };
+  }
+
+  async preparePermissionGrant() {
+    fail("WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED", "Local snapshot grants can only be prepared by the durable permission lifecycle.");
+  }
+
+  async registerPermissionGrant() {
+    fail("WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED", "Local snapshot grants can only be activated by the durable permission lifecycle.");
+  }
+
+  async revokePermissionGrant() {
+    fail("WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED", "Local snapshot grants can only be revoked by the durable permission lifecycle.");
   }
 
   async #assertManifestUnchanged() {
@@ -842,9 +888,13 @@ export class LocalWhatsAppSnapshotConnector {
     });
   }
 
-  createApprovedFetchPlan({ snapshotBinding, selection } = {}) {
+  #createApprovedFetchPlan({ snapshotBinding, selection } = {}) {
     this.#assertBinding(snapshotBinding);
-    return clone(this.#approvedPlan(this.validateSelection(selection)));
+    return clone(this.#approvedPlan(this.#validateSelection(selection)));
+  }
+
+  createApprovedFetchPlan(request) {
+    return this.#createApprovedFetchPlan(request);
   }
 
   #safeReceipt(plan, unit, records) {
@@ -911,11 +961,19 @@ export class LocalWhatsAppSnapshotConnector {
     return unit;
   }
 
-  async fetchApprovedContent({ lifecycleCapability, source, accountId, grant, snapshotBinding, selection, fetchUnit, completedReceipts = [] }) {
-    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
+  async #fetchApprovedContent({ source, accountId, grant, snapshotBinding, selection, fetchUnit, completedReceipts = [] }) {
+    assertLocalWhatsAppSnapshotLifecycleOperationAuthorized(this, "fetchApprovedContent", {
+      source,
+      accountId,
+      grant,
+      snapshotBinding,
+      selection,
+      fetchUnit,
+      completedReceipts
+    });
     if (source !== "whatsapp" || accountId !== this.#accountRef) fail("SNAPSHOT_CONNECTOR_SUBSTITUTION", "The approved fetch does not match this WhatsApp snapshot account.");
     this.#assertBinding(snapshotBinding);
-    const normalized = this.validateSelection(selection);
+    const normalized = this.#validateSelection(selection);
     const registeredGrant = this.#grantBindings.get(grant?.id);
     if (!registeredGrant || this.#revokedGrants.has(grant.id)
       || registeredGrant.snapshotId !== snapshotBinding.snapshotId
@@ -1055,7 +1113,11 @@ export class LocalWhatsAppSnapshotConnector {
     return clone(result);
   }
 
-  cleanupPrivateMemory() {
+  async fetchApprovedContent() {
+    fail("WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED", "Local snapshot content can only be read by the durable permission lifecycle.");
+  }
+
+  #cleanupPrivateMemory() {
     this.#ready = null;
     this.#pendingGrantBindings.clear();
     this.#grantBindings.clear();
@@ -1067,5 +1129,9 @@ export class LocalWhatsAppSnapshotConnector {
       stagingFilesCreated: false,
       processExitCleanupClaimed: false
     };
+  }
+
+  cleanupPrivateMemory() {
+    return this.#cleanupPrivateMemory();
   }
 }

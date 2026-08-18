@@ -197,10 +197,22 @@ Callers may only lower these limits.
   durable and read back exactly before adapter activation. There is no durable
   save after activation, so the former active-before-save orphan seam no longer
   exists.
-- The exported local connector cannot prepare, activate, revoke, or read a
-  grant without the lifecycle's module-private capability. A caller-fabricated
-  `active` grant therefore cannot register itself or open a segment/media body,
-  even when the caller imports and invokes the connector class directly.
+- No lifecycle secret, capability, credential, or authorization value crosses
+  a connector method or request boundary. Each exact constructed connector is
+  associated with module-private operation closures in a `WeakMap`; the
+  lifecycle retrieves those closures without reading an application-controlled
+  property. High-authority operations additionally consume a synchronous,
+  one-shot, exact-operation authorization held only in the lifecycle module's
+  own `WeakMap`. Exported public prepare/register/revoke/fetch methods always
+  deny, so a caller-fabricated `active` grant cannot register itself or open a
+  segment/media body.
+- Lifecycle calls bypass subclass overrides and prototype monkeypatches. A
+  wrapper or proxy is not the exact registered instance and is rejected before
+  any wrapper property is read. The internal operation bridge is not exported
+  from the package entrypoint; even a direct deep import cannot perform a
+  high-authority operation without the matching one-shot authorization that
+  only the lifecycle can create. Generic permission review receives a frozen
+  internal metadata-only proxy whose content-read method always denies.
 - A retry or supported process restart reconciles the exact pending identifier;
   it never invokes the supplied grant-ID factory again. Persistence, readback,
   scope reconciliation, preparation, and activation-readback failures all fail
@@ -246,9 +258,10 @@ Callers may only lower these limits.
   Revoke is idempotent in process and never mutates source files.
 - All full-root permission and WhatsApp transactions use the canonical
   process-local re-entrant lock. Internal specialized permission primitives may
-  re-enter; descendant state-store and connector callbacks invoking a public
-  revoke or cross-source write are rejected before they can save, preventing a
-  stale outer save from erasing or resurrecting state.
+  re-enter; descendant state-store callbacks invoking a public revoke or
+  cross-source write are rejected before they can save, preventing a stale
+  outer save from erasing or resurrecting state. Connector overrides are not
+  lifecycle callbacks and are bypassed by the exact-instance private operations.
 
 Cleanup clears connector-private maps, and bounded file byte buffers are zeroed
 after each read. The implementation makes no claim about JavaScript garbage-
@@ -278,11 +291,11 @@ Final verified commands and exact results:
 
 | Command | Result |
 | --- | ---: |
-| `npm run test:qwa-147` | 65/65 passed |
+| `npm run test:qwa-147` | 67/67 passed |
 | `npm run test:qwa-139` | 10/10 passed |
 | `npm run test:qwa-142` | 8/8 passed |
 | `npm run test:qwa-150` | 6/6 passed |
-| `npm test` | 112/112 passed |
+| `npm test` | 114/114 passed |
 | `node --check` over source/test/test-support `*.mjs` | 21/21 passed; no `test-support` directory exists |
 | process-leak check after tests | 0 matching Node/npm test processes |
 | `git diff --check` | passed |
@@ -317,6 +330,16 @@ authoritative, that a retry factory proposing another ID is never called, and
 that public revoke confirms both registrations inactive before reporting the
 durable grant revoked. A post-revoke fetch remains denied with every body-read
 counter unchanged.
+
+Adversarial connector regressions also run a legitimate guided review and
+grant through an inspecting application subclass, then attempt a fabricated
+direct activation and fetch. Every subclass override sees zero legitimate
+lifecycle requests, no lifecycle credential is observable or reusable, and
+the fabricated operations leave file/body-read counters unchanged. An
+application proxy is rejected by exact instance identity without invoking its
+property trap. A separate prototype-monkeypatch regression replaces every
+public connector operation with an interceptor and proves that legitimate
+review, grant, fetch, and revoke complete with zero interceptions.
 
 ## Honest release limitations
 
