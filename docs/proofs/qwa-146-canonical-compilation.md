@@ -82,10 +82,10 @@ become a competing authority.
   resume completes without data loss. If only the later deletion-receipt save
   fails, the durable compiled result remains authoritative and resume finishes
   the bookkeeping without recompiling or losing output.
-- Permission lifecycle operations and compilation share one canonical,
-  full-root, re-entrant in-process lock. An adversarial lexical-path-alias race
-  proves compilation cannot overwrite a concurrent revocation with a stale
-  root save in the same process.
+- Compilation and the generic QWA-139 lifecycle share one canonical,
+  full-root, re-entrant in-process lock. This proof does not claim that every
+  specialized lifecycle writer is covered: QWA-149 must wrap those writers
+  before whole-lifecycle race protection can be claimed.
 - Exact-boundary expiry, restart cleanup, permission broadening, revocation
   before ordinary and untracked recovery, retention-service failure, and
   creator-process exit all have focused failure-path coverage.
@@ -114,4 +114,6 @@ The shared state lock is in-process only; it does not provide cross-process
 atomicity. The detached retention worker survives the compiler creator process
 exiting, but a host shutdown can interrupt that worker. On the next adapter
 startup, durable staging is rechecked and either re-armed or deleted early if
-coverage cannot be restored.
+coverage cannot be restored. A running worker retries an unlink until absence
+is confirmed, records a content-free generation-bound deletion receipt, and
+will not delete a newer generation that reuses the same batch ID.

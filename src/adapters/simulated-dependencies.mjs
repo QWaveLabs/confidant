@@ -3,7 +3,7 @@
  * install Obsidian, or access customer sources.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export class FileStateStore {
@@ -24,7 +24,11 @@ export class FileStateStore {
     await mkdir(dirname(this.filePath), { recursive: true });
     const temporary = `${this.filePath}.tmp`;
     await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    const staged = await open(temporary, "r");
+    try { await staged.sync(); } finally { await staged.close(); }
     await rename(temporary, this.filePath);
+    const parent = await open(dirname(this.filePath), "r");
+    try { await parent.sync(); } finally { await parent.close(); }
   }
 }
 

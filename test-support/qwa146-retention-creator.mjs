@@ -4,5 +4,5 @@
 
 import { DetachedLocalRetentionService } from "../src/knowledge/approved-record-compiler.mjs";
 
-const [root, batchId, expiresAt] = process.argv.slice(2);
-await new DetachedLocalRetentionService().arm({ root, batchId, expiresAt });
+const [root, batchId, expiresAt, leaseId = "lease-fixture-worker"] = process.argv.slice(2);
+await new DetachedLocalRetentionService().arm({ root, batchId, expiresAt, leaseId });

@@ -7,8 +7,8 @@
  * scheduled deletion dependent on an in-memory timer.
  */
 
-import { lstat, realpath, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { lstat, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 const STAGING_DIRECTORY_NAME = ".qwave-second-brain-staging";
 const STAGING_FILE_PREFIX = "batch-";
@@ -16,7 +16,7 @@ const STAGING_FILE_SUFFIX = ".json";
 const BATCH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
 function safeArguments(argv) {
-  const [rootInput, batchId, expiresAt] = argv;
+  const [rootInput, batchId, expiresAt, leaseId] = argv;
   if (
     typeof rootInput !== "string"
     || !isAbsolute(rootInput)
@@ -25,32 +25,44 @@ function safeArguments(argv) {
     || !BATCH_ID.test(batchId)
     || typeof expiresAt !== "string"
     || !Number.isFinite(Date.parse(expiresAt))
+    || typeof leaseId !== "string" || !BATCH_ID.test(leaseId)
   ) {
     return null;
   }
   return {
     root: resolve(rootInput),
     batchId,
-    expiresAt: new Date(expiresAt).toISOString()
+    expiresAt: new Date(expiresAt).toISOString(),
+    leaseId
   };
 }
 
-async function safeDeleteAtExpiry({ root, batchId }) {
+async function safeDeleteAtExpiry({ root, batchId, leaseId }) {
   const rootStats = await lstat(root).catch(() => null);
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) return;
   const rootReal = await realpath(root).catch(() => null);
   if (!rootReal || rootReal !== root) return;
 
+  const leasePath = resolve(root, `${STAGING_FILE_PREFIX}${batchId}.lease`);
+  if ((await readFile(leasePath, "utf8").catch(() => "")).trim() !== leaseId) return "superseded";
   const filePath = resolve(root, `${STAGING_FILE_PREFIX}${batchId}${STAGING_FILE_SUFFIX}`);
   if (dirname(filePath) !== root) return;
   const stats = await lstat(filePath).catch(() => null);
-  if (!stats || stats.isSymbolicLink() || !stats.isFile()) return;
+  if (!stats) return "deleted";
+  if (stats.isSymbolicLink() || !stats.isFile()) return "superseded";
 
   // The trusted parent armed this exact opaque filename before it wrote the
   // batch. Never inspect its records: after that independently scheduled
   // deadline, removing this one file is safer than retaining any malformed or
   // tampered private staging beyond the maximum retention window.
-  await unlink(filePath).catch(() => undefined);
+  try { await unlink(filePath); } catch { return "retry"; }
+  if (await lstat(filePath).catch((error) => error?.code === "ENOENT" ? null : {})) return "retry";
+  if ((await readFile(leasePath, "utf8").catch(() => "")).trim() !== leaseId) return "superseded";
+  await unlink(leasePath).catch(() => undefined);
+  const receipt = resolve(root, `${STAGING_FILE_PREFIX}${batchId}.receipt.json`);
+  const temporary = `${receipt}.${process.pid}.tmp`;
+  await writeFile(temporary, `${JSON.stringify({ version: 1, batchId, leaseId, deletedAt: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" }).then(() => rename(temporary, receipt)).catch(() => undefined);
+  return "deleted";
 }
 
 async function confirmSchedule(batchId) {
@@ -86,7 +98,11 @@ async function main() {
     return;
   }
   await expiry;
-  await safeDeleteAtExpiry(job);
+  while (true) {
+    const outcome = await safeDeleteAtExpiry(job).catch(() => "retry");
+    if (outcome === "deleted" || outcome === "superseded") return;
+    await new Promise((resolveRetry) => setTimeout(resolveRetry, 250));
+  }
 }
 
 await main();

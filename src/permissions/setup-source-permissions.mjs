@@ -344,6 +344,17 @@ function normalizeMetadata(preflight, source) {
     if (!item || typeof item.id !== "string" || !item.id.trim()) {
       throw new PermissionLifecycleError("METADATA_PREFLIGHT_INVALID", "I could not safely identify one of the reviewed source items, so I stopped before requesting content access.");
     }
+    // An omitted participant list is a source-specific no-participant record.
+    // A supplied list is a privacy boundary and must not be silently coerced
+    // into [] when it is malformed.
+    if (item.participantIds != null
+      && (!Array.isArray(item.participantIds)
+        || item.participantIds.some((id) => typeof id !== "string" || !id.trim()))) {
+      throw new PermissionLifecycleError(
+        "METADATA_PARTICIPANT_BOUNDARY_INVALID",
+        "The metadata did not safely describe record participants, so I stopped before requesting content access."
+      );
+    }
     return {
       id: item.id.trim(),
       kind: item.kind === "conversation" ? "conversation" : "item",
@@ -355,7 +366,7 @@ function normalizeMetadata(preflight, source) {
       timestamp: normalizedMetadataTimestamp(item.timestamp),
       sensitiveCategories: normalizedSensitiveCategories(item),
       isGroup: item.isGroup === true,
-      participantIds: uniqueStrings(item.participantIds),
+      participantIds: item.participantIds == null ? [] : uniqueStrings(item.participantIds),
       label: redactUntrustedLabel(item.label ?? item.title),
       stableLink: safeMetadataLink(item.stableLink ?? item.webUrl ?? item.url)
     };
@@ -564,6 +575,10 @@ function normalizedScope(inputScope, review, kind, now) {
   const allowedPeople = assertSubset(requested.people?.allowed, allPeople, "people");
   const restrictedPeople = assertSubset(requested.people?.restricted, allPeople, "people");
   const blockedPeople = assertSubset(requested.people?.blocked, allPeople, "people");
+  const selectedPeople = [allowedPeople, restrictedPeople, blockedPeople];
+  if (new Set(selectedPeople.flat()).size !== selectedPeople.flat().length) {
+    throw new PermissionLifecycleError("PERSON_POLICY_OVERLAP", "Each reviewed person must remain in one privacy classification; overlapping classifications cannot be approved.");
+  }
   for (const personId of allowedPeople) {
     if (peopleById.get(personId)?.accessLevel !== "allowed") {
       throw new PermissionLifecycleError("PERSON_POLICY_CANNOT_BE_BROADENED", "A Restricted or Blocked person cannot be promoted to Allowed through this permission request.");

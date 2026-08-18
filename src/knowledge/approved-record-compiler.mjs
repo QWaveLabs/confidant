@@ -9,7 +9,7 @@
  * saved by that caller's already-private state store.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import {
@@ -19,7 +19,10 @@ import {
   open,
   readdir,
   realpath,
-  unlink
+  readFile,
+  rename,
+  unlink,
+  writeFile
 } from "node:fs/promises";
 import {
   basename,
@@ -37,6 +40,8 @@ const STATE_KEY = "knowledgeCompilationLifecycle";
 const STAGING_DIRECTORY_NAME = ".qwave-second-brain-staging";
 const STAGING_FILE_PREFIX = "batch-";
 const STAGING_FILE_SUFFIX = ".json";
+const STAGING_LEASE_SUFFIX = ".lease";
+const STAGING_RECEIPT_SUFFIX = ".receipt.json";
 const STAGING_VERSION = 1;
 const MAX_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_BATCH_RECORDS = 100;
@@ -284,7 +289,11 @@ function stagingFileName(batchId) {
   return `${STAGING_FILE_PREFIX}${assertBatchId(batchId)}${STAGING_FILE_SUFFIX}`;
 }
 
+function stagingLeaseFileName(batchId) { return `${STAGING_FILE_PREFIX}${assertBatchId(batchId)}${STAGING_LEASE_SUFFIX}`; }
+function stagingReceiptFileName(batchId) { return `${STAGING_FILE_PREFIX}${assertBatchId(batchId)}${STAGING_RECEIPT_SUFFIX}`; }
+
 function parseBatchFileName(name) {
+  if (typeof name === "string" && name.endsWith(STAGING_RECEIPT_SUFFIX)) return null;
   if (typeof name !== "string" || !name.startsWith(STAGING_FILE_PREFIX) || !name.endsWith(STAGING_FILE_SUFFIX)) return null;
   const batchId = name.slice(STAGING_FILE_PREFIX.length, -STAGING_FILE_SUFFIX.length);
   return BATCH_ID.test(batchId) ? batchId : null;
@@ -326,6 +335,7 @@ function validatedStagingPayload(payload, batchId, maxRecords) {
   }
   assertNoRawStagingMaterial(payload.records);
   const records = normalizeInertStagingRecords(payload.records, { maxRecords });
+  const leaseId = assertOpaqueId(payload.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
   const createdAt = canonicalTimestamp(payload.createdAt, "STAGING_TIMESTAMP_INVALID");
   const expiresAt = canonicalTimestamp(payload.expiresAt, "STAGING_TIMESTAMP_INVALID");
   if (expiresAt !== addHours(createdAt, 24)) {
@@ -334,7 +344,7 @@ function validatedStagingPayload(payload, batchId, maxRecords) {
       "The protected temporary batch did not preserve its fixed 24-hour expiry, so it was not compiled."
     );
   }
-  return { batchId, createdAt, expiresAt, records };
+  return { batchId, leaseId, createdAt, expiresAt, records };
 }
 
 function retentionWorkerKey(root, batchId) {
@@ -353,10 +363,11 @@ export class DetachedLocalRetentionService {
     this.workers = new Map();
   }
 
-  async arm({ root, batchId, expiresAt }) {
+  async arm({ root, batchId, expiresAt, leaseId = batchId }) {
     const safeRoot = assertDedicatedStagingRoot(root);
     const safeBatchId = assertBatchId(batchId);
     const safeExpiresAt = canonicalTimestamp(expiresAt, "STAGING_TIMESTAMP_INVALID");
+    const safeLeaseId = assertOpaqueId(leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     const key = retentionWorkerKey(safeRoot, safeBatchId);
     await this.disarm({ root: safeRoot, batchId: safeBatchId });
 
@@ -395,10 +406,13 @@ export class DetachedLocalRetentionService {
         resolveArm({ armed: true });
       };
       try {
-        child = spawn(process.execPath, [this.workerPath, safeRoot, safeBatchId, safeExpiresAt], {
+        child = spawn(process.execPath, [this.workerPath, safeRoot, safeBatchId, safeExpiresAt, safeLeaseId], {
           detached: true,
           stdio: ["ignore", "ignore", "ignore", "ipc"],
-          windowsHide: true
+          windowsHide: true,
+          // Do not carry caller secrets or ambient process configuration into
+          // a detached deletion worker.
+          env: { PATH: process.env.PATH ?? "" }
         });
       } catch {
         failBeforeArm();
@@ -447,6 +461,7 @@ export class LocalTemporaryStaging {
     this.initialization = null;
     this.expiryTimers = new Map();
     this.startupRemovedBatchIds = new Set();
+    this.workerCompletionReceiptBatchIds = new Set();
     this.retentionCoverageUnavailableBatchIds = new Set();
   }
 
@@ -567,18 +582,19 @@ export class LocalTemporaryStaging {
           this.startupRemovedBatchIds.add(batchId);
         }
       } catch {
-        // Every public compiler entry also performs expiry cleanup. This timer
-        // is an additional in-process safeguard and never exposes batch data.
+        // Keep retrying on a running host. A refusal to unlink must never
+        // silently disarm the only local cleanup coverage.
+        this.#scheduleExpiry(batchId, new Date(Date.now() + 250).toISOString());
       }
     }, delay);
     timer.unref?.();
     this.expiryTimers.set(batchId, timer);
   }
 
-  async #armRetention(batchId, expiresAt, knownTrustedRoot = null) {
+  async #armRetention(batchId, expiresAt, leaseId, knownTrustedRoot = null) {
     const root = knownTrustedRoot ?? await this.#trustedRoot();
     try {
-      await this.retentionService.arm({ root, batchId, expiresAt });
+      await this.retentionService.arm({ root, batchId, expiresAt, leaseId });
     } catch (error) {
       if (error instanceof KnowledgeCompilationError) throw error;
       throw new KnowledgeCompilationError(
@@ -610,9 +626,11 @@ export class LocalTemporaryStaging {
     assertNoRawStagingMaterial(records);
     const normalizedRecords = normalizeInertStagingRecords(records, { maxRecords: this.maxRecords });
     const normalizedCreatedAt = canonicalTimestamp(createdAt, "STAGING_TIMESTAMP_INVALID");
+    const leaseId = `lease-${randomUUID()}`;
     const payload = {
       version: STAGING_VERSION,
       batchId: safeBatchId,
+      leaseId,
       createdAt: normalizedCreatedAt,
       expiresAt: addHours(normalizedCreatedAt, 24),
       records: normalizedRecords
@@ -641,7 +659,7 @@ export class LocalTemporaryStaging {
     // Arm the independent worker before the file is created. If this process
     // exits during the write or immediately after it, the named private batch
     // remains covered by the already-scheduled 24-hour deletion.
-    await this.#armRetention(safeBatchId, payload.expiresAt);
+    await this.#armRetention(safeBatchId, payload.expiresAt, leaseId);
     let handle;
     try {
       handle = await open(
@@ -649,8 +667,13 @@ export class LocalTemporaryStaging {
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
         0o600
       );
+      // A sidecar contains only the generation identity. The detached worker
+      // checks it before deletion, so an old worker cannot remove a reused ID.
+      await writeFile(join(await this.#trustedRoot(), stagingLeaseFileName(safeBatchId)), `${leaseId}\n`, { mode: 0o600, flag: "wx" });
       await handle.writeFile(serialized, "utf8");
       await handle.sync();
+      await handle.close();
+      handle = null;
     } catch (error) {
       if (error?.code === "EEXIST") {
         await this.#disarmRetention(safeBatchId);
@@ -659,15 +682,24 @@ export class LocalTemporaryStaging {
           "A protected temporary batch with that ID already exists. Resume it instead of replacing it."
         );
       }
-      await this.#disarmRetention(safeBatchId);
+      // Never disarm before verified absence. A partial create/write/fsync/close
+      // failure may have left a private file behind, and the independent worker
+      // must remain armed until deletion is confirmed.
+      await this.#deleteWithVerification(safeBatchId).catch(() => undefined);
       throw error instanceof KnowledgeCompilationError
         ? error
         : new KnowledgeCompilationError("STAGING_WRITE_FAILED", "I could not save the protected temporary batch, so no compilation started.");
     } finally {
-      await handle?.close();
+      if (handle) {
+        try { await handle.close(); } catch {
+          await this.#deleteWithVerification(safeBatchId).catch(() => undefined);
+          throw new KnowledgeCompilationError("STAGING_WRITE_FAILED", "I could not close the protected temporary batch. Cleanup remains armed and can be retried.");
+        }
+      }
     }
     const receipt = {
       batchId: safeBatchId,
+      leaseId,
       createdAt: payload.createdAt,
       expiresAt: payload.expiresAt,
       retention: "delete-after-compilation-or-within-24-hours"
@@ -717,24 +749,45 @@ export class LocalTemporaryStaging {
     }
   }
 
-  async delete({ batchId }) {
-    const filePath = await this.#filePath(batchId);
+  async #writeCompletionReceipt(batchId, leaseId) {
+    const root = await this.#trustedRoot();
+    const receipt = JSON.stringify({ version: 1, batchId, leaseId, deletedAt: new Date().toISOString() });
+    const target = join(root, stagingReceiptFileName(batchId));
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${receipt}\n`, { mode: 0o600, flag: "wx" });
+    await rename(temporary, target);
+  }
+
+  async #deleteWithVerification(batchId, knownRoot = null) {
+    const root = knownRoot ?? await this.#trustedRoot();
+    const filePath = resolve(root, stagingFileName(batchId));
+    let leaseId = null;
+    try { leaseId = (await readFile(join(root, stagingLeaseFileName(batchId)), "utf8")).trim(); } catch {}
+    try { await unlink(filePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    // unlink success alone is not a receipt. Confirm the exact path has gone
+    // before clearing local timers or disarming the independent worker.
     try {
       await lstat(filePath);
+      throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "The protected temporary batch still exists; cleanup remains armed and can be retried.");
     } catch (error) {
-      if (error?.code === "ENOENT") return false;
-      throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "I could not verify removal of the protected temporary batch.");
+      if (error?.code !== "ENOENT") throw error;
     }
+    await unlink(join(root, stagingLeaseFileName(batchId))).catch(() => undefined);
+    // The detached worker writes the crash-recovery completion receipt. The
+    // foreground transaction already has the verified absence in hand and
+    // records its own receipt in the private lifecycle state.
+    const timer = this.expiryTimers.get(batchId);
+    if (timer) clearTimeout(timer);
+    this.expiryTimers.delete(batchId);
+    if (!knownRoot) await this.#disarmRetention(batchId);
+    return true;
+  }
+
+  async delete({ batchId }) {
     try {
-      // unlink removes a symlink itself rather than following it.
-      await unlink(filePath);
-      const timer = this.expiryTimers.get(batchId);
-      if (timer) clearTimeout(timer);
-      this.expiryTimers.delete(batchId);
-      await this.#disarmRetention(batchId);
-      return true;
+      return await this.#deleteWithVerification(batchId);
     } catch {
-      throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "I could not remove the protected temporary batch.");
+      throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "I could not confirm removal of the protected temporary batch. Cleanup remains armed and will retry.");
     }
   }
 
@@ -742,6 +795,18 @@ export class LocalTemporaryStaging {
     const current = Date.parse(canonicalTimestamp(now, "STAGING_TIMESTAMP_INVALID"));
     const removedBatchIds = [];
     const entries = await readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.name.endsWith(STAGING_RECEIPT_SUFFIX)) continue;
+      const batchId = entry.name.slice(STAGING_FILE_PREFIX.length, -STAGING_RECEIPT_SUFFIX.length);
+      if (!BATCH_ID.test(batchId)) continue;
+      try {
+        const receipt = JSON.parse(await readFile(join(root, entry.name), "utf8"));
+        if (receipt?.batchId === batchId && typeof receipt?.leaseId === "string" && OPAQUE_ID.test(receipt.leaseId)) {
+          this.workerCompletionReceiptBatchIds.add(batchId);
+          await unlink(join(root, entry.name));
+        }
+      } catch { /* leave an untrusted receipt inert for later owner cleanup */ }
+    }
     for (const entry of entries) {
       const batchId = parseBatchFileName(entry.name);
       if (!batchId) continue;
@@ -752,11 +817,7 @@ export class LocalTemporaryStaging {
       try {
         const stats = await lstat(filePath);
         if (stats.isSymbolicLink() || !stats.isFile() || stats.size > this.maxBytes) {
-          await unlink(filePath);
-          const timer = this.expiryTimers.get(batchId);
-          if (timer) clearTimeout(timer);
-          this.expiryTimers.delete(batchId);
-          await this.#disarmRetention(batchId, root);
+          await this.#deleteWithVerification(batchId, root);
           removedBatchIds.push(batchId);
           continue;
         }
@@ -771,11 +832,7 @@ export class LocalTemporaryStaging {
         // A malformed file in this dedicated root is never compiled. Remove
         // only this filename-shaped batch, without traversing anything else.
         try {
-          await unlink(filePath);
-          const timer = this.expiryTimers.get(batchId);
-          if (timer) clearTimeout(timer);
-          this.expiryTimers.delete(batchId);
-          await this.#disarmRetention(batchId, root);
+          await this.#deleteWithVerification(batchId, root);
           removedBatchIds.push(batchId);
         } catch {
           // The next cleanup attempt can retry; no caller-visible path leaks.
@@ -784,11 +841,7 @@ export class LocalTemporaryStaging {
       }
       const expiresAt = Date.parse(validated.expiresAt);
       if (!Number.isFinite(expiresAt) || expiresAt <= current) {
-        await unlink(filePath);
-        const timer = this.expiryTimers.get(batchId);
-        if (timer) clearTimeout(timer);
-        this.expiryTimers.delete(batchId);
-        await this.#disarmRetention(batchId, root);
+        await this.#deleteWithVerification(batchId, root);
         removedBatchIds.push(batchId);
       } else {
         this.#scheduleExpiry(batchId, validated.expiresAt);
@@ -796,17 +849,13 @@ export class LocalTemporaryStaging {
         // durable batch it discovers. This closes the restart/crash gap even
         // if an earlier worker was interrupted outside the compiler process.
         try {
-          await this.#armRetention(batchId, validated.expiresAt, root);
+          await this.#armRetention(batchId, validated.expiresAt, validated.leaseId, root);
         } catch {
           // If a restarted process cannot restore independent expiry coverage,
           // delete this private batch early rather than retain it without the
           // promised crash-safe cleanup path.
           try {
-            await unlink(filePath);
-            const timer = this.expiryTimers.get(batchId);
-            if (timer) clearTimeout(timer);
-            this.expiryTimers.delete(batchId);
-            await this.#disarmRetention(batchId, root);
+            await this.#deleteWithVerification(batchId, root);
             this.retentionCoverageUnavailableBatchIds.add(batchId);
             removedBatchIds.push(batchId);
           } catch {
@@ -823,11 +872,14 @@ export class LocalTemporaryStaging {
     const cleaned = await this.#cleanupExpiredInRoot(root, now);
     const removedBatchIds = [...this.startupRemovedBatchIds, ...cleaned.removedBatchIds];
     const retentionCoverageUnavailableBatchIds = [...this.retentionCoverageUnavailableBatchIds];
+    const workerCompletionReceiptBatchIds = [...this.workerCompletionReceiptBatchIds];
     this.startupRemovedBatchIds.clear();
     this.retentionCoverageUnavailableBatchIds.clear();
+    this.workerCompletionReceiptBatchIds.clear();
     return {
       removedBatchIds: [...new Set(removedBatchIds)].sort(),
-      retentionCoverageUnavailableBatchIds: [...new Set(retentionCoverageUnavailableBatchIds)].sort()
+      retentionCoverageUnavailableBatchIds: [...new Set(retentionCoverageUnavailableBatchIds)].sort(),
+      workerCompletionReceiptBatchIds: [...new Set(workerCompletionReceiptBatchIds)].sort()
     };
   }
 }
@@ -1531,8 +1583,10 @@ function publicBatch(entry, language) {
   if (entry.status === "discarded") {
     return {
       ...base,
-      retryable: false,
-      message: "The temporary batch was discarded because its approved permission was no longer valid."
+      retryable: entry.staging?.status === "discarded-pending-deletion",
+      message: entry.staging?.status === "discarded-pending-deletion"
+        ? "The approved permission is no longer valid. The private batch is queued for confirmed deletion; retry this cleanup receipt on this host."
+        : "The temporary batch was discarded because its approved permission was no longer valid."
     };
   }
   return { ...base, retryable: true, message: text.interrupted };
@@ -1665,7 +1719,20 @@ async function recoverUntrackedStagedBatch({ staging, batchId, state, expectedRe
 async function markExpiredBatches({ lifecycle, staging, now }) {
   const cleaned = await staging.cleanupExpired({ now });
   const retentionCoverageUnavailable = new Set(cleaned.retentionCoverageUnavailableBatchIds ?? []);
+  const workerReceipts = new Set(cleaned.workerCompletionReceiptBatchIds ?? []);
   let changed = false;
+  for (const batchId of workerReceipts) {
+    const entry = lifecycle.batches[batchId];
+    if (entry?.status === "compiled" && entry.staging?.status === "result-persisted-pending-deletion") {
+      entry.staging = { ...entry.staging, status: "deleted-after-compilation", deletedAt: now };
+      entry.audit.push({ type: "temporary-staging-deletion-receipt-consumed", at: now, by: "retention-worker" });
+      lifecycle.audit.push({ type: "temporary-staging-deletion-receipt-consumed", at: now, batchId, by: "retention-worker" });
+      changed = true;
+    } else if (entry?.status === "discarded" && entry.staging?.status === "discarded-pending-deletion") {
+      entry.staging = { ...entry.staging, status: "discarded", deletedAt: now };
+      changed = true;
+    }
+  }
   for (const batchId of cleaned.removedBatchIds) {
     const entry = lifecycle.batches[batchId];
     if (retentionCoverageUnavailable.has(batchId) && entry?.status === "staged") {
@@ -2028,13 +2095,14 @@ async function compileApprovedRecordsLocked({
     if (error instanceof KnowledgeCompilationError && error.code === "STAGING_EXPIRED") throw error;
     if (error instanceof KnowledgeCompilationError && error.code === "COMPILATION_STATE_CONFLICT") throw error;
     if (shouldDiscardAfterFailure(error)) {
-      try {
-        await staging.delete({ batchId: safeBatchId });
-      } catch {
-        // Cleanup still runs at or before the staging expiry boundary.
-      }
+      let deleted = false;
+      try { deleted = await staging.delete({ batchId: safeBatchId }); } catch {}
       entry.status = "discarded";
-      entry.staging = entry.staging ? { ...entry.staging, status: "discarded", deletedAt: now } : null;
+      entry.staging = entry.staging ? {
+        ...entry.staging,
+        status: deleted ? "discarded" : "discarded-pending-deletion",
+        deletedAt: deleted ? now : null
+      } : null;
       entry.audit.push({ type: "temporary-batch-discarded", at: now, reason: safeFailureCode(error) });
       lifecycle.audit.push({ type: "temporary-batch-discarded", at: now, batchId: safeBatchId, reason: safeFailureCode(error) });
       await stateStore.save(state);

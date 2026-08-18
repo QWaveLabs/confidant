@@ -720,7 +720,7 @@ test("a transient staging interruption resumes the same protected batch and dele
     });
     assert.equal(interrupted.compilation.status, "staged");
     assert.equal(interrupted.interruption.retryable, true);
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), ["batch-fixture-resume-batch.json"]);
+    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-resume-batch.json"]);
 
     const resumed = await compileApprovedRecords({
       message: "Continue compiling my approved notes",
@@ -763,7 +763,7 @@ test("a disk-staged batch reconciles after a private state-save interruption ins
       }),
       /Simulated private state save interruption/
     );
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), ["batch-fixture-state-save-retry.json"]);
+    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-state-save-retry.json"]);
 
     // Recreate the adapter to model a restart: recovery comes from the
     // bounded on-disk batch, not from the prior instance's memory.
@@ -802,7 +802,7 @@ test("a persistent final result-save failure retains the protected stage and res
     });
     assert.equal(first.compilation.status, "staged");
     assert.equal(first.interruption.code, "RESULT_STATE_SAVE_FAILED");
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), [`batch-${batchId}.json`]);
+    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), [`batch-${batchId}.json`]);
 
     interruptedStore.failCompiledResultSaves = false;
     const resumed = await compileApprovedRecords({
@@ -998,7 +998,7 @@ test("the 24-hour cleanup deletes interrupted staging and makes resume fail clos
       ])],
       clock: clockAt(startedAt)
     });
-    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), ["batch-fixture-expiry-batch.json"]);
+    assert.deepEqual((await readdir(path.join(directory, ".qwave-second-brain-staging"))).filter((name) => name.endsWith(".json")), ["batch-fixture-expiry-batch.json"]);
 
     const cleanup = await cleanupExpiredKnowledgeStaging({
       stateStore,
@@ -1147,9 +1147,10 @@ test("the detached private retention worker removes a pre-armed batch after its 
     // creator's in-memory timer, performs the scheduled cleanup.
     await runRetentionCreator({ root, batchId, expiresAt });
     const stagedPath = path.join(root, `batch-${batchId}.json`);
+    await writeFile(path.join(root, `batch-${batchId}.lease`), "lease-fixture-worker\n", { encoding: "utf8", mode: 0o600 });
     await writeFile(stagedPath, `${JSON.stringify({ batchId, expiresAt })}\n`, { encoding: "utf8", mode: 0o600 });
     await waitFor(async () => !(await readdir(root)).includes(`batch-${batchId}.json`));
-    assert.deepEqual(await readdir(root), []);
+    assert.ok((await readdir(root)).every((name) => name === `batch-${batchId}.receipt.json`));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
