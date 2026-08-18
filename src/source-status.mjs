@@ -17,8 +17,8 @@ import {
   withSourcePermissionStateReadLock
 } from "./permissions/setup-source-permissions.mjs";
 import {
-  isStableLocalAlias,
-  migrateStableLocalAliases
+  migrateStableLocalAliases,
+  validStableLocalAliasLifecycleEntries
 } from "./connectors/stable-local-aliases.mjs";
 import {
   sanitizePersistedDriveFailureReasons,
@@ -1725,21 +1725,6 @@ function persistedGmailAccountAlias(entry) {
   return "local-gmail-account";
 }
 
-function persistedLocalConnectorAccountAlias(entry, namespace) {
-  const rawAccountId = typeof entry?.accountId === "string" ? entry.accountId : null;
-  const mappings = Array.isArray(entry?.publicIdentifierAliases?.mappings)
-    && entry.publicIdentifierAliases.namespace === namespace
-    ? entry.publicIdentifierAliases.mappings
-    : [];
-  const persisted = mappings.find((mapping) => (
-    mapping?.kind === "account"
-    && mapping.raw === rawAccountId
-    && isStableLocalAlias(namespace, "account", mapping.alias)
-    && mapping.alias !== rawAccountId
-  ))?.alias;
-  return persisted ?? null;
-}
-
 const PERSISTED_ALIAS_LIFECYCLES = Object.freeze([
   { adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, stateKey: "googleCalendarLifecycle", namespace: "calendar" },
   {
@@ -1774,7 +1759,14 @@ export function migratePersistedAdapterAliasesInState(state) {
     sanitizeRootFailureReasons
   } of PERSISTED_ALIAS_LIFECYCLES) {
     for (const entry of Object.values(state?.[stateKey]?.entries ?? {})) {
-      if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
+      if (!entry || typeof entry !== "object") continue;
+      try {
+        changed = (sanitizeEntryFailureReasons?.(entry) ?? false) || changed;
+      } catch {
+        // Recognized failure fields are sanitized independently from alias
+        // migration. A malformed failure record remains private and omitted.
+      }
+      if (typeof entry.accountId !== "string" || !entry.accountId) continue;
       try {
         const permission = getSourcePermissionStatusFromState({
           state,
@@ -1785,8 +1777,7 @@ export function migratePersistedAdapterAliasesInState(state) {
           permissionReview: permission?.permissionReview,
           approvedRecords: Object.values(entry.normalizedMetadataById ?? {})
         });
-        const failureReasonsChanged = sanitizeEntryFailureReasons?.(entry) ?? false;
-        changed = aliasesChanged || failureReasonsChanged || changed;
+        changed = aliasesChanged || changed;
       } catch {
         // A malformed legacy entry is omitted from public handoff below. It
         // must never be repaired by guessing or by projecting its raw ID.
@@ -1897,46 +1888,22 @@ function persistedAdapterStatuses(state, language) {
     }));
   }
 
-  for (const entry of Object.values(state?.googleCalendarLifecycle?.entries ?? {})) {
-    if (!entry || typeof entry !== "object") continue;
-    const accountAlias = persistedLocalConnectorAccountAlias(entry, "calendar");
-    if (!accountAlias) continue;
-    statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, accountAlias),
-      adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR,
-      adapterStatus: entry.status,
-      language
-    }));
-  }
-
-  for (const entry of Object.values(state?.googleDriveLifecycle?.entries ?? {})) {
-    if (!entry || typeof entry !== "object") continue;
-    const accountAlias = persistedLocalConnectorAccountAlias(entry, "drive");
-    if (!accountAlias) continue;
-    statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(
-        SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
-        accountAlias
-      ),
-      adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
-      adapterStatus: entry.status,
-      language
-    }));
-  }
-
-  for (const entry of Object.values(state?.imessageBetaLifecycle?.entries ?? {})) {
-    if (!entry || typeof entry !== "object") continue;
-    const accountAlias = persistedLocalConnectorAccountAlias(entry, "imessage");
-    if (!accountAlias) continue;
-    statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(
-        SOURCE_ADAPTER_NAMES.IMESSAGE,
-        accountAlias
-      ),
-      adapter: SOURCE_ADAPTER_NAMES.IMESSAGE,
-      adapterStatus: entry.status,
-      language
-    }));
+  for (const descriptor of PERSISTED_ALIAS_LIFECYCLES) {
+    const lifecycleEntries = Object.values(state?.[descriptor.stateKey]?.entries ?? {});
+    for (const { entry, accountAlias } of validStableLocalAliasLifecycleEntries(
+      lifecycleEntries,
+      descriptor.namespace
+    )) {
+      statuses.push(persistedAdapterSourceStatus({
+        sourceId: persistedSourceInstanceId(
+          descriptor.adapter,
+          accountAlias
+        ),
+        adapter: descriptor.adapter,
+        adapterStatus: entry.status,
+        language
+      }));
+    }
   }
   return statuses;
 }
@@ -1956,13 +1923,9 @@ export function getPersistedAdapterSourceStatus({ state, adapter, accountId, lan
   if (descriptor) {
     const entries = Object.values(state?.[descriptor.stateKey]?.entries ?? {})
       .filter((entry) => entry && typeof entry === "object");
-    const entry = entries.find((candidate) => (
-      candidate.accountId === accountId
-      || persistedLocalConnectorAccountAlias(candidate, descriptor.namespace) === accountId
-    ));
-    publicAccountContext = entry
-      ? persistedLocalConnectorAccountAlias(entry, descriptor.namespace)
-      : null;
+    const matches = validStableLocalAliasLifecycleEntries(entries, descriptor.namespace)
+      .filter(({ entry, accountAlias }) => entry.accountId === accountId || accountAlias === accountId);
+    publicAccountContext = matches.length === 1 ? matches[0].accountAlias : null;
   }
   if (typeof publicAccountContext !== "string" || !publicAccountContext) return null;
   const expectedId = persistedSourceInstanceId(normalizedAdapter, publicAccountContext);
@@ -2027,9 +1990,16 @@ async function getSourceStatusHandoffInternal({ stateStore, language } = {}) {
   const safeLanguage = languageFor(state, language);
   const entries = persistedGenericSourceStatuses(state, safeLanguage);
   const adapters = persistedAdapterStatuses(state, safeLanguage);
-  const sourceById = new Map();
-  for (const item of [...entries, ...adapters]) sourceById.set(item.source.id, item);
-  const sources = [...sourceById.values()].sort((a, b) => a.source.id.localeCompare(b.source.id));
+  const candidatesBySourceId = new Map();
+  for (const item of [...entries, ...adapters]) {
+    const participants = candidatesBySourceId.get(item.source.id) ?? [];
+    participants.push(item);
+    candidatesBySourceId.set(item.source.id, participants);
+  }
+  const sources = [...candidatesBySourceId.values()]
+    .filter((participants) => participants.length === 1)
+    .map(([item]) => item)
+    .sort((a, b) => a.source.id.localeCompare(b.source.id));
   const sections = Object.fromEntries(Object.values(SOURCE_HANDOFF_CATEGORIES).map((category) => [category, []]));
   for (const source of sources) sections[source.handoffCategory].push(source);
   return {

@@ -98,14 +98,13 @@ function assertAliasMappings(state, namespace) {
   }
 }
 
-function aliasState(entry, namespace) {
+function persistedAliasState(entry, namespace) {
   assertNamespace(namespace);
   if (!entry || typeof entry !== "object") throw new TypeError("A persisted connector entry is required.");
   const existing = entry.publicIdentifierAliases;
-  if (existing === undefined || existing === null) {
-    entry.publicIdentifierAliases = { version: 1, namespace, mappings: [] };
-  } else if (
-    typeof existing !== "object"
+  if (
+    !existing
+    || typeof existing !== "object"
     || existing.version !== 1
     || existing.namespace !== namespace
     || !Array.isArray(existing.mappings)
@@ -115,8 +114,92 @@ function aliasState(entry, namespace) {
       "The saved local source-reference map is invalid, so I stopped before exposing or resolving an adapter identifier."
     );
   }
-  assertAliasMappings(entry.publicIdentifierAliases, namespace);
-  return entry.publicIdentifierAliases;
+  assertAliasMappings(existing, namespace);
+  return existing;
+}
+
+function aliasState(entry, namespace) {
+  assertNamespace(namespace);
+  if (!entry || typeof entry !== "object") throw new TypeError("A persisted connector entry is required.");
+  const existing = entry.publicIdentifierAliases;
+  if (existing === undefined || existing === null) {
+    entry.publicIdentifierAliases = { version: 1, namespace, mappings: [] };
+  }
+  return persistedAliasState(entry, namespace);
+}
+
+/**
+ * Validates the complete persisted alias map for every entry in one connector
+ * lifecycle, then removes every participant in an account-id or public-alias
+ * collision. This is intentionally read-only: malformed state is never
+ * repaired by guessing and a collision never becomes first/last-match wins.
+ */
+export function validStableLocalAliasLifecycleEntries(entries, namespace) {
+  assertNamespace(namespace);
+  const participants = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const participant = {
+      entry,
+      accountId: typeof entry?.accountId === "string" && entry.accountId.trim()
+        ? entry.accountId
+        : null,
+      claimedAliases: new Set(),
+      accountAlias: null,
+      valid: false
+    };
+    for (const mapping of Array.isArray(entry?.publicIdentifierAliases?.mappings)
+      ? entry.publicIdentifierAliases.mappings
+      : []) {
+      for (const kind of IDENTIFIER_KINDS) {
+        if (isStableLocalAlias(namespace, kind, mapping?.alias)) {
+          participant.claimedAliases.add(mapping.alias);
+          break;
+        }
+      }
+    }
+    try {
+      const accountId = assertRawIdentifier(entry?.accountId);
+      const state = persistedAliasState(entry, namespace);
+      const accountMappings = state.mappings.filter((mapping) => mapping.kind === "account");
+      if (accountMappings.length !== 1 || accountMappings[0].raw !== accountId) {
+        throw new StableLocalAliasError(
+          "LOCAL_ALIAS_STATE_INVALID",
+          "The saved local source-reference map is invalid, so I stopped before exposing or resolving an adapter identifier."
+        );
+      }
+      participant.accountId = accountId;
+      participant.accountAlias = accountMappings[0].alias;
+      participant.valid = true;
+    } catch {
+      // A malformed participant is omitted. Other valid, non-colliding
+      // entries in the lifecycle remain independently usable.
+    }
+    participants.push(participant);
+  }
+
+  const participantsByIdentifier = new Map();
+  for (const participant of participants) {
+    if (participant.accountId) {
+      const identifierParticipants = participantsByIdentifier.get(participant.accountId) ?? [];
+      identifierParticipants.push(participant);
+      participantsByIdentifier.set(participant.accountId, identifierParticipants);
+    }
+    for (const alias of participant.claimedAliases) {
+      const identifierParticipants = participantsByIdentifier.get(alias) ?? [];
+      identifierParticipants.push(participant);
+      participantsByIdentifier.set(alias, identifierParticipants);
+    }
+  }
+
+  const invalid = new Set();
+  for (const collidingParticipants of participantsByIdentifier.values()) {
+    if (collidingParticipants.length > 1) {
+      collidingParticipants.forEach((participant) => invalid.add(participant));
+    }
+  }
+  return participants
+    .filter((participant) => participant.valid && !invalid.has(participant))
+    .map(({ entry, accountAlias }) => ({ entry, accountAlias }));
 }
 
 function newAlias(state, namespace, kind) {

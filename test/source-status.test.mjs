@@ -1826,6 +1826,445 @@ test("handoff-first restart durably normalizes recognized legacy Drive and iMess
   });
 });
 
+test("restart omits every malformed or colliding alias participant while independently sanitizing failure codes", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const localAlias = (namespace, kind, suffix) => (
+      `local-${namespace}-${kind}-00000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`
+    );
+    const aliasState = (namespace, mappings) => ({ version: 1, namespace, mappings });
+    const accountMapping = (namespace, accountId, suffix) => ({
+      kind: "account",
+      raw: accountId,
+      alias: localAlias(namespace, "account", suffix)
+    });
+    const driveEntry = ({ accountId, status, mappings, reviewId = null, audit = [] }) => ({
+      source: "drive",
+      accountId,
+      publicIdentifierAliases: aliasState("drive", mappings),
+      status,
+      authorization: { status: "not-started", readOnly: false, metadataOnly: false, attempts: 0 },
+      authorizedFolderIds: [],
+      reviewId,
+      normalizedMetadataById: {},
+      audit
+    });
+    const imessageEntry = ({ accountId, status, mappings, reviewId = null, audit = [] }) => ({
+      source: "imessage",
+      accountId,
+      publicIdentifierAliases: aliasState("imessage", mappings),
+      status,
+      mode: "snapshot",
+      connectionTruth: "beta",
+      localAccess: { status: "unavailable", attempts: 1 },
+      snapshot: { available: true, started: false, oneTime: true, live: false },
+      contactAndGroupPrivacyApplied: false,
+      sensitiveApprovals: {
+        attachments: { approved: false, approvedAt: null },
+        highRiskIdentifiers: { approved: false, approvedAt: null }
+      },
+      reviewId,
+      audit
+    });
+    const calendarEntry = ({ accountId, status, mappings, audit = [] }) => ({
+      source: "calendar",
+      accountId,
+      publicIdentifierAliases: aliasState("calendar", mappings),
+      status,
+      audit
+    });
+
+    const rawFailureCodes = [
+      "HOSTILE_DRIVE_FAILURE_CODE",
+      "HOSTILE_IMESSAGE_FAILURE_CODE",
+      "HOSTILE_IMESSAGE_ROOT_CODE",
+      "HOSTILE_DRIVE_MISSING_ACCOUNT_CODE",
+      "HOSTILE_IMESSAGE_MISSING_ACCOUNT_CODE"
+    ];
+    const duplicateDriveAlias = localAlias("drive", "account", 101);
+    const crossDomainDriveAlias = localAlias("drive", "account", 106);
+    const collidingIMessageReviewAlias = localAlias("imessage", "review", 201);
+    const collidingCalendarReferenceAlias = localAlias("calendar", "reference", 301);
+    const collidingCalendarGenerationAlias = localAlias("calendar", "generation", 302);
+    const state = await stateStore.load();
+    state.googleDriveLifecycle = {
+      version: 1,
+      entries: {
+        "drive:collision-a": driveEntry({
+          accountId: "drive-collision-a",
+          status: "authorization-denied",
+          mappings: [{ kind: "account", raw: "drive-collision-a", alias: duplicateDriveAlias }]
+        }),
+        "drive:collision-b": driveEntry({
+          accountId: "drive-collision-b",
+          status: "revoked",
+          mappings: [{ kind: "account", raw: "drive-collision-b", alias: duplicateDriveAlias }]
+        }),
+        "drive:malformed": driveEntry({
+          accountId: "drive-malformed",
+          status: "needs-attention",
+          reviewId: "drive-malformed-review",
+          mappings: [
+            accountMapping("drive", "drive-malformed", 102),
+            { kind: "review", raw: "drive-malformed-review", alias: "raw-review-alias-must-not-project" }
+          ],
+          audit: [{
+            type: "drive-metadata-review-unavailable",
+            reason: rawFailureCodes[0],
+            contentBodiesRead: false
+          }]
+        }),
+        "drive:malformed-collision-peer": driveEntry({
+          accountId: "drive-malformed-collision-peer",
+          status: "processed",
+          mappings: [accountMapping("drive", "drive-malformed-collision-peer", 102)]
+        }),
+        "drive:missing-account": driveEntry({
+          accountId: null,
+          status: "needs-attention",
+          mappings: [],
+          audit: [{
+            type: "drive-metadata-review-unavailable",
+            reason: rawFailureCodes[3],
+            contentBodiesRead: false
+          }]
+        }),
+        "drive:duplicate-source-a": driveEntry({
+          accountId: "drive-duplicate-source",
+          status: "awaiting-authorization",
+          mappings: [accountMapping("drive", "drive-duplicate-source", 104)]
+        }),
+        "drive:duplicate-source-b": driveEntry({
+          accountId: "drive-duplicate-source",
+          status: "revoked",
+          mappings: [accountMapping("drive", "drive-duplicate-source", 105)]
+        }),
+        "drive:cross-domain-source": driveEntry({
+          accountId: "drive-cross-domain-source",
+          status: "awaiting-authorization",
+          mappings: [{
+            kind: "account",
+            raw: "drive-cross-domain-source",
+            alias: crossDomainDriveAlias
+          }]
+        }),
+        "drive:cross-domain-alias": driveEntry({
+          accountId: crossDomainDriveAlias,
+          status: "revoked",
+          mappings: [accountMapping("drive", crossDomainDriveAlias, 107)]
+        }),
+        "drive:valid": driveEntry({
+          accountId: "drive-valid",
+          status: "awaiting-authorization",
+          mappings: [accountMapping("drive", "drive-valid", 103)]
+        })
+      },
+      audit: []
+    };
+    state.imessageBetaLifecycle = {
+      version: 1,
+      entries: {
+        "imessage:review-collision-a": imessageEntry({
+          accountId: "imessage-review-collision-a",
+          status: "snapshot-available",
+          reviewId: "imessage-review-a",
+          mappings: [
+            accountMapping("imessage", "imessage-review-collision-a", 202),
+            { kind: "review", raw: "imessage-review-a", alias: collidingIMessageReviewAlias }
+          ]
+        }),
+        "imessage:review-collision-b": imessageEntry({
+          accountId: "imessage-review-collision-b",
+          status: "processed",
+          reviewId: "imessage-review-b",
+          mappings: [
+            accountMapping("imessage", "imessage-review-collision-b", 203),
+            { kind: "review", raw: "imessage-review-b", alias: collidingIMessageReviewAlias }
+          ]
+        }),
+        "imessage:malformed": imessageEntry({
+          accountId: "imessage-malformed",
+          status: "snapshot-available",
+          mappings: [
+            accountMapping("imessage", "imessage-malformed", 204),
+            { kind: "generation", raw: "imessage-malformed-operation", alias: "raw-generation-alias-must-not-project" }
+          ],
+          audit: [{
+            type: "imessage-metadata-review-unavailable",
+            reason: rawFailureCodes[1],
+            contentBodiesRead: false
+          }]
+        }),
+        "imessage:missing-account": imessageEntry({
+          accountId: null,
+          status: "snapshot-available",
+          mappings: [],
+          audit: [{
+            type: "imessage-metadata-review-unavailable",
+            reason: rawFailureCodes[4],
+            contentBodiesRead: false
+          }]
+        }),
+        "imessage:valid": imessageEntry({
+          accountId: "imessage-valid",
+          status: "awaiting-macos-permission",
+          mappings: [accountMapping("imessage", "imessage-valid", 205)]
+        })
+      },
+      audit: [{
+        type: "imessage-snapshot-fallback-available",
+        reason: rawFailureCodes[2]
+      }]
+    };
+    state.googleCalendarLifecycle = {
+      version: 1,
+      entries: {
+        "calendar:reference-collision-a": calendarEntry({
+          accountId: "calendar-reference-collision-a",
+          status: "authorization-denied",
+          mappings: [
+            accountMapping("calendar", "calendar-reference-collision-a", 303),
+            { kind: "reference", raw: "calendar-reference-a", alias: collidingCalendarReferenceAlias }
+          ],
+          audit: [{ sourceRecordId: "calendar-reference-a" }]
+        }),
+        "calendar:reference-collision-b": calendarEntry({
+          accountId: "calendar-reference-collision-b",
+          status: "revoked",
+          mappings: [
+            accountMapping("calendar", "calendar-reference-collision-b", 304),
+            { kind: "reference", raw: "calendar-reference-b", alias: collidingCalendarReferenceAlias }
+          ],
+          audit: [{ sourceRecordId: "calendar-reference-b" }]
+        }),
+        "calendar:generation-collision-a": calendarEntry({
+          accountId: "calendar-generation-collision-a",
+          status: "connected",
+          mappings: [
+            accountMapping("calendar", "calendar-generation-collision-a", 305),
+            { kind: "generation", raw: "calendar-generation-a", alias: collidingCalendarGenerationAlias }
+          ],
+          audit: [{ operationId: "calendar-generation-a" }]
+        }),
+        "calendar:generation-collision-b": calendarEntry({
+          accountId: "calendar-generation-collision-b",
+          status: "skipped",
+          mappings: [
+            accountMapping("calendar", "calendar-generation-collision-b", 306),
+            { kind: "generation", raw: "calendar-generation-b", alias: collidingCalendarGenerationAlias }
+          ],
+          audit: [{ operationId: "calendar-generation-b" }]
+        }),
+        "calendar:malformed": calendarEntry({
+          accountId: "calendar-malformed",
+          status: "connected",
+          mappings: [
+            accountMapping("calendar", "calendar-malformed", 307),
+            { kind: "reference", raw: "calendar-malformed-reference", alias: "raw-calendar-reference" }
+          ]
+        }),
+        "calendar:valid": calendarEntry({
+          accountId: "calendar-valid",
+          status: "authorization-denied",
+          mappings: [accountMapping("calendar", "calendar-valid", 308)]
+        })
+      },
+      audit: []
+    };
+    await stateStore.save(state);
+
+    const restartedStore = new FileStateStore(stateStore.filePath);
+    let saveCalls = 0;
+    const countingStore = {
+      async load() {
+        return restartedStore.load();
+      },
+      async save(nextState) {
+        saveCalls += 1;
+        return restartedStore.save(nextState);
+      }
+    };
+    const firstHandoff = await getSourceStatusHandoff({ stateStore: countingStore });
+    assert.equal(saveCalls, 1, "failure sanitation and alias handling must use one loaded-root save");
+
+    const publicIds = firstHandoff.sourceStatusHandoff.sources.map((source) => source.source.id);
+    assert.equal(new Set(publicIds).size, publicIds.length, "no duplicate source id may be first/last-match resolved");
+    assert.equal(publicIds.includes(`drive:${duplicateDriveAlias}`), false);
+    assert.equal(publicIds.includes(`drive:${localAlias("drive", "account", 102)}`), false);
+    assert.equal(publicIds.includes(`drive:${localAlias("drive", "account", 104)}`), false);
+    assert.equal(publicIds.includes(`drive:${localAlias("drive", "account", 105)}`), false);
+    assert.equal(publicIds.includes(`drive:${crossDomainDriveAlias}`), false);
+    assert.equal(publicIds.includes(`drive:${localAlias("drive", "account", 107)}`), false);
+    assert.equal(publicIds.includes(`imessage:${localAlias("imessage", "account", 202)}`), false);
+    assert.equal(publicIds.includes(`imessage:${localAlias("imessage", "account", 203)}`), false);
+    assert.equal(publicIds.includes(`imessage:${localAlias("imessage", "account", 204)}`), false);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 303)}`), false);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 304)}`), false);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 305)}`), false);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 306)}`), false);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 307)}`), false);
+    assert.equal(publicIds.includes(`drive:${localAlias("drive", "account", 103)}`), true);
+    assert.equal(publicIds.includes(`imessage:${localAlias("imessage", "account", 205)}`), true);
+    assert.equal(publicIds.includes(`calendar:${localAlias("calendar", "account", 308)}`), true);
+
+    const persisted = await restartedStore.load();
+    assert.equal(
+      persisted.googleDriveLifecycle.entries["drive:malformed"].audit[0].reason,
+      "DRIVE_METADATA_REVIEW_FAILED"
+    );
+    assert.equal(
+      persisted.imessageBetaLifecycle.entries["imessage:malformed"].audit[0].reason,
+      "IMESSAGE_METADATA_REVIEW_FAILED"
+    );
+    assert.equal(
+      persisted.googleDriveLifecycle.entries["drive:missing-account"].audit[0].reason,
+      "DRIVE_METADATA_REVIEW_FAILED"
+    );
+    assert.equal(
+      persisted.imessageBetaLifecycle.entries["imessage:missing-account"].audit[0].reason,
+      "IMESSAGE_METADATA_REVIEW_FAILED"
+    );
+    assert.equal(persisted.imessageBetaLifecycle.audit[0].reason, "IMESSAGE_METADATA_REVIEW_FAILED");
+    for (const rawFailureCode of rawFailureCodes) {
+      assert.equal(JSON.stringify(persisted).includes(rawFailureCode), false);
+      assert.equal(JSON.stringify(firstHandoff).includes(rawFailureCode), false);
+    }
+
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-drive",
+      accountId: duplicateDriveAlias
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-drive",
+      accountId: localAlias("drive", "account", 102)
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-drive",
+      accountId: "drive-duplicate-source"
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-drive",
+      accountId: crossDomainDriveAlias
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "imessage-beta",
+      accountId: localAlias("imessage", "account", 202)
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-calendar",
+      accountId: localAlias("calendar", "account", 303)
+    }), null);
+    assert.equal(getPersistedAdapterSourceStatus({
+      state: persisted,
+      adapter: "google-calendar",
+      accountId: localAlias("calendar", "account", 308)
+    })?.source.id, `calendar:${localAlias("calendar", "account", 308)}`);
+
+    await assert.rejects(
+      getGoogleDriveConnectionStatus({ stateStore: restartedStore, accountId: duplicateDriveAlias }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      authorizeGoogleDriveReadOnly({
+        message: "Keep this colliding Drive reference denied",
+        stateStore: restartedStore,
+        accountId: duplicateDriveAlias,
+        authorizationApproved: false
+      }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      getGoogleDriveConnectionStatus({
+        stateStore: restartedStore,
+        accountId: localAlias("drive", "account", 102)
+      }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      getGoogleDriveConnectionStatus({
+        stateStore: restartedStore,
+        accountId: localAlias("drive", "account", 104)
+      }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      getGoogleDriveConnectionStatus({
+        stateStore: restartedStore,
+        accountId: crossDomainDriveAlias
+      }),
+      (error) => error?.code === "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      getIMessageBetaStatus({
+        stateStore: restartedStore,
+        accountId: localAlias("imessage", "account", 202)
+      }),
+      (error) => error?.code === "IMESSAGE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+    await assert.rejects(
+      attemptIMessageLocalAccess({
+        message: "Keep this colliding iMessage reference denied",
+        stateStore: restartedStore,
+        accountId: localAlias("imessage", "account", 202),
+        macOSPermissionApproved: false
+      }),
+      (error) => error?.code === "IMESSAGE_LOCAL_ACCOUNT_REFERENCE_REQUIRED"
+    );
+
+    const validDrive = await getGoogleDriveConnectionStatus({
+      stateStore: restartedStore,
+      accountId: localAlias("drive", "account", 103)
+    });
+    const validIMessage = await getIMessageBetaStatus({
+      stateStore: restartedStore,
+      accountId: localAlias("imessage", "account", 205)
+    });
+    assert.equal(validDrive.drive.account.context, localAlias("drive", "account", 103));
+    assert.equal(validIMessage.iMessageBeta.account.context, localAlias("imessage", "account", 205));
+
+    const secondRestart = new FileStateStore(stateStore.filePath);
+    let secondSaveCalls = 0;
+    const secondCountingStore = {
+      async load() {
+        return secondRestart.load();
+      },
+      async save(nextState) {
+        secondSaveCalls += 1;
+        return secondRestart.save(nextState);
+      }
+    };
+    const secondHandoff = await getSourceStatusHandoff({ stateStore: secondCountingStore });
+    assert.equal(secondSaveCalls, 0, "a completed one-save migration must remain stable after restart");
+    assert.deepEqual(
+      secondHandoff.sourceStatusHandoff.sources.map((source) => source.source.id),
+      publicIds
+    );
+
+    const publicEvidence = JSON.stringify({ firstHandoff, secondHandoff, validDrive, validIMessage });
+    for (const rawAccountId of [
+      "drive-collision-a",
+      "drive-collision-b",
+      "drive-malformed",
+      "drive-malformed-collision-peer",
+      "drive-duplicate-source",
+      "drive-cross-domain-source",
+      "imessage-review-collision-a",
+      "imessage-review-collision-b",
+      "imessage-malformed",
+      "calendar-reference-collision-a",
+      "calendar-generation-collision-a",
+      "calendar-malformed"
+    ]) {
+      assert.equal(publicEvidence.includes(rawAccountId), false);
+    }
+  });
+});
+
 test("unsupported sources are explained safely and the release gate ignores forged caller evidence", async () => {
   await withFixture(async ({ stateStore, adapter }) => {
     const unsupported = await explainUnsupportedSource({

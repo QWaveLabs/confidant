@@ -89,6 +89,18 @@ same persisted local-account alias format; this candidate exports the pure
 loaded-root migration helper needed for additive integration with the newer
 primary Calendar connector.
 
+Before any final handoff, specialized Drive/iMessage status, or guided reverse
+mapping is projected, the complete persisted alias map for every lifecycle
+participant is validated from one loaded root. Duplicate account aliases,
+duplicate private account/source ids, cross raw-account/public-alias claims,
+colliding review/reference/generation aliases, and partially malformed maps
+invalidate every affected participant, including an otherwise valid entry that
+collides with a malformed one. No
+first-match or last-write-wins resolution is permitted. Valid, non-colliding
+participants remain visible. The same lifecycle-wide validation covers the
+additive Calendar namespace helper; it does not replace or claim to contain the
+newer primary Calendar connector.
+
 Drive and iMessage adapter exceptions are classified into fixed internal
 failure reasons before any audit save or public projection. Arbitrary adapter
 `error.code` strings are neither stored nor returned. A handoff-first
@@ -100,7 +112,10 @@ same loaded root, performs one save, and only then projects status. The
 regression sweeps the entire persisted root and the public handoff and
 specialized status views to prove every hostile value is absent; the proof
 export repeats that restart path and publishes only the allowlisted internal
-enums. Malformed legacy entries are not guessed into validity and remain
+enums. Failure-code sanitation is independent of alias validity, so recognized
+Drive/iMessage entry failures and the root iMessage audit are rewritten to
+fixed enums on the same loaded root even when an alias map or account field is
+malformed. Malformed legacy entries are not guessed into validity and remain
 omitted from public projection.
 Metadata preflight recursively normalizes field names and rejects body-shaped
 keys before a grant, including singular `Attachment` and nested/case-variant
@@ -141,7 +156,7 @@ message body, email body, attachment, payload, and header variants before an
 untrusted value can be displayed or persisted; the regression matrix records
 zero source-body consumption and exposes zero rejected records.
 
-Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, the release-gate result, and `legacyFailureMigration` evidence showing a process restart before handoff, exactly one handoff migration save, non-colliding aliases, normalized root iMessage audit, fixed Drive/iMessage reasons, `rawAdapterFailureCodesPersisted: false`, and `rawAdapterFailureCodesProjected: false`.
+Run `npm run proof:qwa-149` to emit a JSON proof using a temporary local setup state and synthetic ids only. The output includes `bodyReads: 0`, `writeCalls: 0`, the imported snapshot label, the release-gate result, and `legacyFailureMigration` evidence showing a process restart before handoff with one load and exactly one save. Its `aliasIntegrity` evidence covers complete lifecycle-map validation, malformed-collision peer omission, cross raw-account/public-alias collision omission, duplicate source-id omission, contradictory-status prevention, fail-closed guided reverse mapping, valid-entry retention, the additive Calendar namespace, and a second restart with one load and zero saves. The proof also records normalized root iMessage audit, malformed-account entry sanitation, fixed Drive/iMessage reasons, `rawAdapterFailureCodesPersisted: false`, and `rawAdapterFailureCodesProjected: false`.
 
 ## Release gate
 
@@ -162,13 +177,13 @@ QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **29/29** focused checks passed.
+- `npm run test:qwa-149` — **30/30** focused checks passed.
 - `npm run test:qwa-145` — **17/17** Gmail compatibility checks passed.
 - `npm run test:qwa-139` — **12/12** shared permission checks passed.
 - `npm run test:qwa-142` — **9/9** Google Drive compatibility checks passed.
 - `npm run test:qwa-150` — **7/7** iMessage compatibility checks passed.
-- `npm test` — **97/97** repository checks passed in this isolated candidate.
-- `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, an unsatisfied live-connector gate, and restart-first legacy failure migration evidence with no raw adapter failure code persisted or projected.
+- `npm test` — **98/98** repository checks passed in this isolated candidate.
+- `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, an unsatisfied live-connector gate, one-load/one-save first migration, full lifecycle alias-integrity evidence, a one-load/zero-save second restart, and no raw adapter failure code persisted or projected.
 
 ## Boundaries and limitations
 

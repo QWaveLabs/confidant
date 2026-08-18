@@ -33,7 +33,8 @@ import {
   registerApprovedReferenceAliases,
   registerPermissionReviewAliases,
   registerStableAccountAlias,
-  stableAccountAlias
+  stableAccountAlias,
+  validStableLocalAliasLifecycleEntries
 } from "./stable-local-aliases.mjs";
 
 const STATE_KEY = "googleDriveLifecycle";
@@ -169,27 +170,22 @@ function assertEntry(state, accountId) {
 
 function resolveEntryFromPublicAccount(state, accountReference) {
   const entries = Object.values(lifecycle(state).entries).filter((entry) => entry && typeof entry === "object");
+  const validEntries = validStableLocalAliasLifecycleEntries(entries, ALIAS_NAMESPACE);
   if (accountReference === undefined || accountReference === null) {
-    if (entries.length === 1) return entries[0];
+    if (entries.length === 1 && validEntries.length === 1) return validEntries[0].entry;
     throw new GoogleDriveLifecycleError(
       "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED",
       "Choose the current local Drive account reference before continuing this guided step."
     );
   }
-  const match = entries.find((entry) => {
-    try {
-      return stableAccountAlias(entry, ALIAS_NAMESPACE) === accountReference;
-    } catch {
-      return false;
-    }
-  });
-  if (!match) {
+  const matches = validEntries.filter(({ accountAlias }) => accountAlias === accountReference);
+  if (matches.length !== 1) {
     throw new GoogleDriveLifecycleError(
       "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED",
       "That local Drive account reference is not current, so I kept source access denied."
     );
   }
-  return match;
+  return matches[0].entry;
 }
 
 function resolveGuidedDriveArguments(state, args, { review = false, scope = false } = {}) {
@@ -304,7 +300,14 @@ function driveAliasRecords(entry) {
 function migrateDriveAliasesInState(state) {
   let changed = false;
   for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
-    if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) continue;
+    if (!entry || typeof entry !== "object") continue;
+    try {
+      changed = sanitizePersistedDriveFailureReasons(entry) || changed;
+    } catch {
+      // Failure-code sanitation is independent from alias integrity. A
+      // malformed failure event remains private and cannot be projected.
+    }
+    if (typeof entry.accountId !== "string" || !entry.accountId) continue;
     try {
       const permission = getSourcePermissionStatusFromState({
         state,
@@ -315,8 +318,7 @@ function migrateDriveAliasesInState(state) {
         permissionReview: permission?.permissionReview,
         approvedRecords: driveAliasRecords(entry)
       });
-      const failureReasonsChanged = sanitizePersistedDriveFailureReasons(entry);
-      changed = aliasesChanged || failureReasonsChanged || changed;
+      changed = aliasesChanged || changed;
     } catch {
       // Resolution below translates a corrupt alias map to the connector's
       // fail-closed local-reference error without exposing the raw account.
