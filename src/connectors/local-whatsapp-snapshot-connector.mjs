@@ -198,6 +198,7 @@ export class LocalWhatsAppSnapshotConnector {
   #accountRef;
   #limits;
   #ready = null;
+  #pendingGrantBindings = new Map();
   #grantBindings = new Map();
   #revokedGrants = new Set();
   #fetchCache = new Map();
@@ -208,6 +209,7 @@ export class LocalWhatsAppSnapshotConnector {
     mediaFileReads: 0,
     rawMessageBodiesRead: 0,
     rawMediaBodiesRead: 0,
+    grantPreparationCalls: 0,
     grantRegistrationCalls: 0,
     grantRevocationCalls: 0,
     writeCalls: 0
@@ -242,10 +244,12 @@ export class LocalWhatsAppSnapshotConnector {
       value: async ({ grantId, snapshotBinding } = {}) => {
         this.#assertBinding(snapshotBinding);
         if (!SAFE_REF.test(grantId)) fail("SNAPSHOT_GRANT_INVALID", "The WhatsApp snapshot grant identifier is invalid.");
+        const pending = this.#pendingGrantBindings.has(grantId);
         return Object.freeze({
           grantId,
           active: this.#grantBindings.has(grantId),
-          revoked: this.#revokedGrants.has(grantId)
+          revoked: this.#revokedGrants.has(grantId),
+          ...(pending ? { pending: true } : {})
         });
       }
     });
@@ -257,6 +261,7 @@ export class LocalWhatsAppSnapshotConnector {
   get mediaFileReads() { return this.#metrics.mediaFileReads; }
   get rawMessageBodiesRead() { return this.#metrics.rawMessageBodiesRead; }
   get rawMediaBodiesRead() { return this.#metrics.rawMediaBodiesRead; }
+  get grantPreparationCalls() { return this.#metrics.grantPreparationCalls; }
   get grantRegistrationCalls() { return this.#metrics.grantRegistrationCalls; }
   get grantRevocationCalls() { return this.#metrics.grantRevocationCalls; }
   get writeCalls() { return this.#metrics.writeCalls; }
@@ -677,7 +682,7 @@ export class LocalWhatsAppSnapshotConnector {
     }
   }
 
-  async registerPermissionGrant({ grant, snapshotBinding, selection }) {
+  #grantBinding({ grant, snapshotBinding, selection }) {
     this.#assertBinding(snapshotBinding);
     const normalized = this.validateSelection(selection);
     if (!grant || grant.accountId !== this.#accountRef || grant.source !== "whatsapp" || grant.status !== "active") {
@@ -691,18 +696,39 @@ export class LocalWhatsAppSnapshotConnector {
       || JSON.stringify(grantedSensitiveCategories) !== JSON.stringify(normalized.sensitiveCategories)) {
       fail("SNAPSHOT_GRANT_SCOPE_MISMATCH", "The durable grant does not exactly match this immutable WhatsApp selection.");
     }
-    this.#metrics.grantRegistrationCalls += 1;
-    const existing = this.#grantBindings.get(grant.id);
-    const next = {
+    return {
       snapshotId: snapshotBinding.snapshotId,
       selectionDigest: normalized.selectionDigest,
       mediaInventoryBinding: normalized.mediaInventoryBinding
     };
-    if (existing && JSON.stringify(existing) !== JSON.stringify(next)) {
+  }
+
+  async preparePermissionGrant({ grant, snapshotBinding, selection }) {
+    const next = this.#grantBinding({ grant, snapshotBinding, selection });
+    this.#metrics.grantPreparationCalls += 1;
+    const active = this.#grantBindings.get(grant.id);
+    const pending = this.#pendingGrantBindings.get(grant.id);
+    if ((active && JSON.stringify(active) !== JSON.stringify(next))
+      || (pending && JSON.stringify(pending) !== JSON.stringify(next))) {
+      fail("SNAPSHOT_GRANT_CHANGED", "An existing WhatsApp snapshot grant cannot be widened or rebound.");
+    }
+    if (this.#revokedGrants.has(grant.id)) fail("SNAPSHOT_GRANT_REVOKED", "That WhatsApp snapshot grant was revoked and cannot be restored.");
+    if (!active) this.#pendingGrantBindings.set(grant.id, next);
+    return { prepared: true, idempotent: Boolean(active || pending), alreadyActive: Boolean(active) };
+  }
+
+  async registerPermissionGrant({ grant, snapshotBinding, selection }) {
+    const next = this.#grantBinding({ grant, snapshotBinding, selection });
+    this.#metrics.grantRegistrationCalls += 1;
+    const existing = this.#grantBindings.get(grant.id);
+    const pending = this.#pendingGrantBindings.get(grant.id);
+    if ((existing && JSON.stringify(existing) !== JSON.stringify(next))
+      || (pending && JSON.stringify(pending) !== JSON.stringify(next))) {
       fail("SNAPSHOT_GRANT_CHANGED", "An existing WhatsApp snapshot grant cannot be widened or rebound.");
     }
     if (this.#revokedGrants.has(grant.id)) fail("SNAPSHOT_GRANT_REVOKED", "That WhatsApp snapshot grant was revoked and cannot be restored.");
     this.#grantBindings.set(grant.id, next);
+    this.#pendingGrantBindings.delete(grant.id);
     return { registered: true, idempotent: Boolean(existing) };
   }
 
@@ -712,6 +738,7 @@ export class LocalWhatsAppSnapshotConnector {
     if (!this.#revokedGrants.has(grantId)) {
       this.#metrics.grantRevocationCalls += 1;
       this.#revokedGrants.add(grantId);
+      this.#pendingGrantBindings.delete(grantId);
       this.#grantBindings.delete(grantId);
     }
     return { revoked: true };
@@ -1025,6 +1052,7 @@ export class LocalWhatsAppSnapshotConnector {
 
   cleanupPrivateMemory() {
     this.#ready = null;
+    this.#pendingGrantBindings.clear();
     this.#grantBindings.clear();
     this.#revokedGrants.clear();
     this.#fetchCache.clear();

@@ -189,6 +189,21 @@ Callers may only lower these limits.
   retry resumes the same generation instead of adopting an unrelated review.
 - Review and grant identifiers cannot be reused across generations, and every
   public mutation requires the current numeric generation.
+- Before adapter access can become body-readable, the lifecycle creates one
+  exact grant identifier and durably records and reads back a pending activation
+  journal bound to generation, review, snapshot, selection, and media inventory.
+  Adapter preparation is separately read back as pending and non-readable. The
+  generic active grant and the outer activation authorization must then each be
+  durable and read back exactly before adapter activation. There is no durable
+  save after activation, so the former active-before-save orphan seam no longer
+  exists.
+- A retry or supported process restart reconciles the exact pending identifier;
+  it never invokes the supplied grant-ID factory again. Persistence, readback,
+  scope reconciliation, preparation, and activation-readback failures all fail
+  closed. Public fetch, deny, cancel, restart, resume, cleanup, and revoke remain
+  blocked while activation is pending; after exact retry activates the one
+  durable identifier, public revoke uses the existing exact durable revoke
+  intent and private adapter readback before it reports `revoked`.
 - The connector creates one bounded opaque work plan: every selected segment
   in deterministic order, followed by media units only when media was
   explicitly approved. No media unit can open until all segment receipts are
@@ -252,11 +267,14 @@ Final verified commands and exact results:
 
 | Command | Result |
 | --- | ---: |
-| `npm run test:qwa-147` | 62/62 passed |
+| `npm run test:qwa-147` | 63/63 passed |
 | `npm run test:qwa-139` | 10/10 passed |
 | `npm run test:qwa-142` | 8/8 passed |
 | `npm run test:qwa-150` | 6/6 passed |
-| `npm test` | 109/109 passed |
+| `npm test` | 110/110 passed |
+| `node --check` over source/test/test-support `*.mjs` | 21/21 passed; no `test-support` directory exists |
+| process-leak check after tests | 0 matching Node/npm test processes |
+| `git diff --check` | passed |
 
 The focused suite covers zero-I/O construction, manifest-only lazy preflight,
 raw-value scans of public and persisted state, exact membership/sensitivity,
@@ -270,10 +288,15 @@ pre-adapter revoke-intent save failure, process-loss revoke retry without grant
 restore, manifest media-inventory substitution/extra/missing attacks with zero
 media opens, multi-segment late-failure and process-restart zero-reread proofs,
 ordered completion receipts, duplicate segment membership, media-excluded
-zero-open behavior, cleanup/restart truth, Spanish behavior, and Business
-forgery rejection. Public and durable-state scans include raw account, person,
-chat, segment, message, media, label, path, manifest-generation, and digest
-values.
+zero-open behavior, cleanup/restart truth, Spanish behavior, Business forgery
+rejection, and the former post-activation save seam. That regression leaves the
+first exact candidate durably pending and non-readable, rejects a direct fetch
+without changing record/body-read counters, restarts with a fresh connector,
+proves a deliberately different retry factory is never called, activates only
+the original exact identifier, and publicly revokes it while the unused second
+candidate remains inactive. Public and durable-state scans include raw account,
+person, chat, segment, message, media, label, path, manifest-generation, and
+digest values.
 
 ## Honest release limitations
 

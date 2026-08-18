@@ -201,6 +201,7 @@ function newEntry(accountId, now, generation = 1, earlierAudit = []) {
     reviewId: null,
     selection: null,
     grantId: null,
+    grantActivation: null,
     approvedRecords: null,
     fetch: {
       status: "not-started",
@@ -251,8 +252,39 @@ function assertNoRevocationPending(entry) {
   }
 }
 
+function isGrantActivationPending(entry) {
+  return entry.grantActivation?.status === "pending";
+}
+
+function assertNoGrantActivationPending(entry) {
+  if (isGrantActivationPending(entry)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_PENDING", "The exact local grant has a durable activation pending. Retry that same grant before any content read or other lifecycle action.");
+  }
+}
+
 function snapshotBindingDigest(entry) {
   return `wa-snapshot-binding-${hash(JSON.stringify(entry.snapshotBinding)).slice(0, 24)}`;
+}
+
+function grantActivationIntentCore(entry, grantId = entry.grantId) {
+  return {
+    protocol: "qwave.whatsapp-snapshot-grant-activation/v1",
+    generation: entry.generation,
+    reviewId: entry.reviewId,
+    grantId,
+    snapshotBinding: snapshotBindingDigest(entry),
+    selectionBinding: entry.selection?.selectionDigest ?? null,
+    mediaInventoryBinding: entry.selection?.mediaInventoryBinding ?? null
+  };
+}
+
+function exactGrantActivationIntentMatches(entry, intent = entry.grantActivation, allowedStatuses = ["pending", "activation-authorized"]) {
+  if (!intent || !allowedStatuses.includes(intent.status)) return false;
+  const expected = grantActivationIntentCore(entry, intent.grantId);
+  return Object.entries(expected).every(([key, value]) => intent[key] === value)
+    && intent.grantId === entry.grantId
+    && typeof intent.operationId === "string" && /^wa-grant-activation-[a-f0-9]{24}$/.test(intent.operationId)
+    && Number.isSafeInteger(intent.attempts) && intent.attempts >= 1;
 }
 
 function revocationIntentCore(entry) {
@@ -573,19 +605,40 @@ async function ensureConnectorBinding(connector, entry) {
   return binding;
 }
 
-function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts = [] } = {}) {
+function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts = [], registrationMode = "activate" } = {}) {
   const selection = clone(entry.selection);
   const snapshotBinding = clone(entry.snapshotBinding);
   const revocation = clone(entry.revocation);
+  const grantActivation = clone(entry.grantActivation);
   return {
     discoverMetadata: (request) => connector.discoverMetadata(request),
     registerPermissionGrant: async ({ grant }) => {
       if (revocation?.status === "pending") {
         throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "A pending WhatsApp revocation cannot restore or register source access.");
       }
+      if (!exactGrantActivationIntentMatches(entry, grantActivation)
+        || grantActivation.grantId !== grant.id) {
+        throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The adapter grant was blocked because its durable exact activation intent was missing or changed.");
+      }
+      if (registrationMode === "prepare") {
+        if (grantActivation.status !== "pending") {
+          throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "Only a pending exact activation intent can prepare local source access.");
+        }
+        const result = await connector.preparePermissionGrant({ grant, snapshotBinding, selection });
+        const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
+        if (readback?.grantId !== grant.id || readback.active !== false
+          || readback.revoked !== false || readback.pending !== true) {
+          throw new WhatsAppSnapshotError("WHATSAPP_GRANT_PREPARATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed pending and non-readable, so activation remains denied.");
+        }
+        return result;
+      }
+      if (registrationMode !== "activate" || grantActivation.status !== "activation-authorized") {
+        throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "Local source access cannot activate before exact durable authorization is confirmed.");
+      }
       const result = await connector.registerPermissionGrant({ grant, snapshotBinding, selection });
       const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
-      if (readback?.grantId !== grant.id || readback.active !== true || readback.revoked !== false) {
+      if (readback?.grantId !== grant.id || readback.active !== true
+        || readback.revoked !== false || readback.pending === true) {
         throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed active, so content access remains denied.");
       }
       return result;
@@ -605,6 +658,9 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
       if (revocation?.status === "pending") {
         throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "A pending WhatsApp revocation blocks every content read.");
       }
+      if (grantActivation?.status === "pending") {
+        throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_PENDING", "A pending WhatsApp grant activation blocks every content read.");
+      }
       return connector.fetchApprovedContent({
         source,
         accountId,
@@ -616,6 +672,81 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
       });
     }
   };
+}
+
+function exactGrantScopeMatchesSelection(grantScope, exactScope) {
+  if (!grantScope || !exactScope) return false;
+  const exactArray = (left, right) => JSON.stringify([...(left ?? [])].sort()) === JSON.stringify([...(right ?? [])].sort());
+  return grantScope.accountId === exactScope.accountId
+    && exactArray(grantScope.conversations, exactScope.conversations)
+    && exactArray(grantScope.people?.allowed, exactScope.people?.allowed)
+    && exactArray(grantScope.sensitiveGroups?.included, exactScope.sensitiveGroups?.included)
+    && JSON.stringify(grantScope.dateRange) === JSON.stringify(exactScope.dateRange)
+    && JSON.stringify(grantScope.exclusions?.dateRanges ?? []) === JSON.stringify(exactScope.exclusions?.dateRanges ?? [])
+    && grantScope.acknowledgements?.modelProcessing === true
+    && grantScope.acknowledgements?.untrustedSourceMaterial === true;
+}
+
+function exactActivePermissionGrant(state, entry, exactScope) {
+  const permission = sourcePermissionEntry(state, entry.accountId);
+  const active = (permission?.grants ?? []).filter((grant) => grant.status === "active");
+  if (permission?.review?.id !== entry.reviewId || active.length !== 1) {
+    throw new WhatsAppSnapshotError("WHATSAPP_PERMISSION_REVIEW_MISMATCH", "The exact durable WhatsApp grant could not be reconciled safely.");
+  }
+  const grant = active[0];
+  if (grant.id !== entry.grantId || grant.reviewId !== entry.reviewId
+    || grant.accountId !== entry.accountId || grant.source !== SOURCE
+    || !exactGrantScopeMatchesSelection(grant.scope, exactScope)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_RECONCILIATION_MISMATCH", "The durable grant does not match the exact saved WhatsApp review, snapshot, and selection.");
+  }
+  return clone(grant);
+}
+
+async function prepareExactConnectorGrant(connector, entry, grant) {
+  if (!exactGrantActivationIntentMatches(entry, entry.grantActivation, ["pending"])) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact durable pending activation intent could not be confirmed.");
+  }
+  const result = await connector.preparePermissionGrant({
+    grant,
+    snapshotBinding: clone(entry.snapshotBinding),
+    selection: clone(entry.selection)
+  });
+  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
+  if (readback?.grantId !== grant.id || readback.active !== false
+    || readback.revoked !== false || readback.pending !== true) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_PREPARATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed pending and non-readable, so activation remains denied.");
+  }
+  return result;
+}
+
+async function activateExactConnectorGrant(connector, entry, grant) {
+  if (!exactGrantActivationIntentMatches(entry, entry.grantActivation, ["activation-authorized"])) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact durable activation authorization could not be confirmed.");
+  }
+  const result = await connector.registerPermissionGrant({
+    grant,
+    snapshotBinding: clone(entry.snapshotBinding),
+    selection: clone(entry.selection)
+  });
+  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding: clone(entry.snapshotBinding) });
+  if (readback?.grantId !== grant.id || readback.active !== true
+    || readback.revoked !== false || readback.pending === true) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed active, so content access remains denied.");
+  }
+  return result;
+}
+
+async function ensureExactConnectorGrantActive(connector, entry, grant) {
+  const snapshotBinding = clone(entry.snapshotBinding);
+  const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
+  if (readback?.grantId !== grant.id || readback.revoked === true) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant could not be reconciled as active, so content access remains denied.");
+  }
+  if (readback.active === true && readback.pending !== true) return { registered: true, idempotent: true };
+  if (readback.active !== false) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant readback was ambiguous, so content access remains denied.");
+  }
+  return activateExactConnectorGrant(connector, entry, grant);
 }
 
 function metadataMatchesPermissionReview(metadata, permissionReview) {
@@ -660,6 +791,11 @@ function reconcileEntryFromPermissionState(state, entry, now) {
   } else if (isRevocationPending(entry)) {
     // A durable revoke intent is a one-way gate. Active grant and fetch
     // receipts cannot restore or advance this lifecycle while it is pending.
+    return changed;
+  } else if (isGrantActivationPending(entry)) {
+    // A generic grant may already be durable while the exact connector grant
+    // is still deliberately non-readable. Only the explicit grant retry may
+    // reconcile and activate that exact journaled identifier.
     return changed;
   } else if (permission.status === "denied" && !["denied", "cancelled"].includes(entry.status)) {
     entry.status = "denied";
@@ -879,6 +1015,7 @@ async function selectScopeUnlocked({ message, stateStore, connector, accountId =
   const entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
   assertNoRevocationPending(entry);
+  assertNoGrantActivationPending(entry);
   if (entry.status !== "awaiting-selection" || entry.reviewId !== reviewId) {
     throw new WhatsAppSnapshotError("WHATSAPP_SELECTION_NOT_READY", "Complete the current manifest review before selecting snapshot content.");
   }
@@ -910,6 +1047,7 @@ export async function selectWhatsAppSnapshotMedia({ message, stateStore, account
     const entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
     assertNoRevocationPending(entry);
+    assertNoGrantActivationPending(entry);
     if (entry.reviewId !== reviewId || entry.status !== "awaiting-selection") throw new WhatsAppSnapshotError("WHATSAPP_SELECTION_NOT_READY", "Complete the current manifest review first.");
     return {
       whatsAppSnapshot: publicView(entry, languageFor(state, language)),
@@ -959,46 +1097,132 @@ async function grantUnlocked({ message, stateStore, connector, accountId = DEFAU
   assertNoRevocationPending(entry);
   if (entry.status === "ready-to-process" || entry.status === "processed") {
     const permission = await currentPermission(stateStore, accountId, language);
+    if (!permission?.permissionReview || !entry.selection || !entry.grantId
+      || !exactGrantActivationIntentMatches(entry, entry.grantActivation, ["activation-authorized"])) {
+      throw new WhatsAppSnapshotError("WHATSAPP_GRANT_RECONCILIATION_MISMATCH", "The exact durable WhatsApp grant authorization could not be reconciled safely.");
+    }
+    await ensureConnectorBinding(connector, entry);
+    const exactScope = scopeForSelection(permission.permissionReview, entry.selection);
+    const activeGrant = exactActivePermissionGrant(state, entry, exactScope);
+    await ensureExactConnectorGrantActive(connector, entry, activeGrant);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview) };
   }
   if (entry.status !== "awaiting-content-grant" || entry.reviewId !== reviewId || !entry.selection) {
     throw new WhatsAppSnapshotError("WHATSAPP_EXPLICIT_SELECTION_REQUIRED", "Choose chats, Allowed people, dates, sensitivity, and media before granting access.");
   }
   await ensureConnectorBinding(connector, entry);
-  const permission = await currentPermission(stateStore, accountId, language);
-  if (!permission?.permissionReview || permission.permissionReview.status !== "awaiting-grant") {
+  let permission = await currentPermission(stateStore, accountId, language);
+  if (!permission?.permissionReview || !["awaiting-grant", "granted"].includes(permission.permissionReview.status)) {
     throw new WhatsAppSnapshotError("WHATSAPP_PERMISSION_REVIEW_MISMATCH", "The current permission review is not ready for this grant.");
   }
   const exactScope = scopeForSelection(permission.permissionReview, entry.selection);
   if (scope !== undefined && JSON.stringify(scope) !== JSON.stringify(exactScope)) {
     throw new WhatsAppSnapshotError("WHATSAPP_SCOPE_REBIND_REJECTED", "The grant must match the exact saved WhatsApp selection; start a new review to change it.");
   }
-  const seenGrantIds = new Set([
-    ...entry.audit.map((event) => event.grantId).filter(Boolean),
-    ...(sourcePermissionEntry(state, accountId)?.grants ?? []).map((grant) => grant.id).filter(Boolean)
-  ]);
-  const granted = await grantSpecializedWhatsAppPermission({
-    message,
-    stateStore,
-    connector: permissionProxy(connector, entry),
-    source: SOURCE,
-    accountId,
+
+  const attemptAt = isoNow(clock);
+  if (entry.grantActivation) {
+    if (!exactGrantActivationIntentMatches(entry, entry.grantActivation, ["pending"])) {
+      throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The saved grant activation no longer matches this exact generation, review, snapshot, and selection.");
+    }
+    entry.grantActivation = {
+      ...entry.grantActivation,
+      attempts: entry.grantActivation.attempts + 1,
+      lastAttemptAt: attemptAt,
+      failure: entry.grantActivation.failure ?? null
+    };
+  } else {
+    const seenGrantIds = new Set([
+      ...entry.audit.map((event) => event.grantId).filter(Boolean),
+      ...(sourcePermissionEntry(state, accountId)?.grants ?? []).map((grant) => grant.id).filter(Boolean)
+    ]);
+    const exactGrantId = guardedIdentifierFactory({ factory: grantIdFactory, prefix: "wa-grant", seen: seenGrantIds, field: "grant" })();
+    entry.grantId = exactGrantId;
+    const intentCore = grantActivationIntentCore(entry, exactGrantId);
+    entry.grantActivation = {
+      ...intentCore,
+      status: "pending",
+      operationId: `wa-grant-activation-${hash(JSON.stringify(intentCore)).slice(0, 24)}`,
+      attempts: 1,
+      startedAt: attemptAt,
+      lastAttemptAt: attemptAt,
+      failure: null
+    };
+  }
+  entry.audit.push({
+    type: "whatsapp-grant-activation-pending",
+    at: attemptAt,
+    operationId: entry.grantActivation.operationId,
     reviewId,
-    scope: exactScope,
-    language,
-    clock,
-    grantIdFactory: guardedIdentifierFactory({ factory: grantIdFactory, prefix: "wa-grant", seen: seenGrantIds, field: "grant" })
+    grantId: entry.grantId,
+    attempt: entry.grantActivation.attempts,
+    generation,
+    bodyReadable: false
   });
+  const expectedIntent = clone(entry.grantActivation);
+  // This is the durable pre-activation boundary. The exact identifier and all
+  // immutable review/selection bindings must round-trip before the adapter may
+  // even prepare a deliberately non-readable grant.
+  await stateStore.save(state);
   state = await loadState(stateStore);
   entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
-  if (entry.reviewId !== reviewId) throw new WhatsAppSnapshotError("STALE_WHATSAPP_GENERATION", "A newer snapshot review replaced this grant.");
+  if (entry.reviewId !== reviewId || !exactGrantActivationIntentMatches(entry, entry.grantActivation, ["pending"])
+    || JSON.stringify(entry.grantActivation) !== JSON.stringify(expectedIntent)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_UNCONFIRMED", "The exact pending grant could not be read back durably, so the adapter was not invoked.");
+  }
+
+  const permissionWasAwaiting = permission.permissionReview.status === "awaiting-grant";
+  if (permissionWasAwaiting) {
+    await grantSpecializedWhatsAppPermission({
+      message,
+      stateStore,
+      connector: permissionProxy(connector, entry, { registrationMode: "prepare" }),
+      source: SOURCE,
+      accountId,
+      reviewId,
+      scope: exactScope,
+      language,
+      clock,
+      grantIdFactory: () => entry.grantId
+    });
+  }
+
+  state = await loadState(stateStore);
+  entry = assertEntry(state, accountId);
+  assertGeneration(entry, generation);
+  if (entry.reviewId !== reviewId || !exactGrantActivationIntentMatches(entry, entry.grantActivation, ["pending"])) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact pending grant changed while durable permission was being recorded.");
+  }
+  const activeGrant = exactActivePermissionGrant(state, entry, exactScope);
+  if (!permissionWasAwaiting) await prepareExactConnectorGrant(connector, entry, activeGrant);
+
+  const authorizedAt = isoNow(clock);
   entry.status = "ready-to-process";
-  entry.grantId = granted.permissionReview.activeGrant?.grantId ?? null;
+  entry.grantActivation = {
+    ...entry.grantActivation,
+    status: "activation-authorized",
+    authorizedAt,
+    failure: null
+  };
   entry.failure = null;
-  entry.audit.push({ type: "whatsapp-content-granted", at: isoNow(clock), reviewId, grantId: entry.grantId, generation });
+  entry.audit.push({ type: "whatsapp-content-granted", at: authorizedAt, reviewId, grantId: entry.grantId, generation });
+  const expectedAuthorization = clone(entry.grantActivation);
+  // Activation follows this save and exact readback. No durable mutation is
+  // attempted after activation, so a save failure cannot orphan adapter access.
   await stateStore.save(state);
-  return { whatsAppSnapshot: publicView(entry, languageFor(state, language), granted.permissionReview) };
+  state = await loadState(stateStore);
+  entry = assertEntry(state, accountId);
+  assertGeneration(entry, generation);
+  if (entry.status !== "ready-to-process"
+    || !exactGrantActivationIntentMatches(entry, entry.grantActivation, ["activation-authorized"])
+    || JSON.stringify(entry.grantActivation) !== JSON.stringify(expectedAuthorization)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_AUTHORIZATION_UNCONFIRMED", "The exact durable grant authorization could not be read back, so local source access was not activated.");
+  }
+  const authorizedGrant = exactActivePermissionGrant(state, entry, exactScope);
+  await ensureExactConnectorGrantActive(connector, entry, authorizedGrant);
+  permission = await currentPermission(stateStore, accountId, language);
+  return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission.permissionReview) };
 }
 
 export async function grantWhatsAppSnapshotContent(args) {
@@ -1012,6 +1236,7 @@ async function fetchUnlocked({ message, stateStore, connector, accountId = DEFAU
   assertGeneration(entry, generation);
   if (reconcileEntryFromPermissionState(state, entry, isoNow(clock))) await stateStore.save(state);
   assertNoRevocationPending(entry);
+  assertNoGrantActivationPending(entry);
   if (entry.status === "processed" && Array.isArray(entry.approvedRecords)) {
     const permission = await currentPermission(stateStore, accountId, language);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview), approvedRecords: clone(entry.approvedRecords), idempotentReplay: true };
@@ -1050,6 +1275,7 @@ async function fetchUnlocked({ message, stateStore, connector, accountId = DEFAU
     entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
     assertNoRevocationPending(entry);
+    assertNoGrantActivationPending(entry);
     if (entry.status === "processed") {
       const permission = await currentPermission(stateStore, accountId, language);
       return {
@@ -1142,6 +1368,7 @@ async function resumeFetchUnlocked({ message, stateStore, accountId = DEFAULT_WH
   const entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
   assertNoRevocationPending(entry);
+  assertNoGrantActivationPending(entry);
   if (entry.status !== "fetch-interrupted" || entry.reviewId !== reviewId) throw new WhatsAppSnapshotError("WHATSAPP_FETCH_RETRY_NOT_READY", "There is no interrupted current snapshot read to retry.");
   if (confirmRetry !== true) return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), explicitRetryRequired: true };
   entry.status = "ready-to-process";
@@ -1167,6 +1394,7 @@ async function revokeUnlocked({ message, stateStore, connector, accountId = DEFA
     const permission = await currentPermission(stateStore, accountId, language);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview), idempotentReplay: true };
   }
+  assertNoGrantActivationPending(entry);
   if (!entry.grantId || entry.reviewId !== reviewId) throw new WhatsAppSnapshotError("WHATSAPP_ACTIVE_GRANT_NOT_FOUND", "There is no active current WhatsApp snapshot grant to revoke.");
   await ensureConnectorBinding(connector, entry);
   const intentCore = revocationIntentCore(entry);
@@ -1270,6 +1498,7 @@ async function denyUnlocked({ message, stateStore, accountId = DEFAULT_WHATSAPP_
   let entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
   assertNoRevocationPending(entry);
+  assertNoGrantActivationPending(entry);
   if (!["awaiting-selection", "awaiting-content-grant"].includes(entry.status) || entry.reviewId !== reviewId) {
     if (entry.status === "denied") return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), idempotentReplay: true };
     throw new WhatsAppSnapshotError("WHATSAPP_DENIAL_NOT_READY", "Only the current ungranted snapshot review can be denied.");
@@ -1297,6 +1526,7 @@ async function cancelUnlocked({ message, stateStore, connector, accountId = DEFA
   if (isRevocationPending(entry)) {
     throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "Only retrying the pending exact revocation is allowed before this review can be cancelled.");
   }
+  assertNoGrantActivationPending(entry);
   if (entry.status === "cancelled") return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), idempotentReplay: true };
   if (["ready-to-process", "processed", "fetch-interrupted", "revoke-unconfirmed"].includes(entry.status)) {
     if (!connector) throw new WhatsAppSnapshotError("WHATSAPP_REVOKE_REQUIRED", "Cancelling an active snapshot first requires its local grant to be revoked.");
@@ -1325,6 +1555,7 @@ async function restartUnlocked({ message, stateStore, accountId = DEFAULT_WHATSA
   const old = assertEntry(state, accountId);
   assertGeneration(old, generation);
   assertNoRevocationPending(old);
+  assertNoGrantActivationPending(old);
   if (!["denied", "cancelled", "revoked", "snapshot-review-failed"].includes(old.status)) {
     throw new WhatsAppSnapshotError("WHATSAPP_RESTART_NOT_READY", "Finish, deny, cancel, or revoke the current snapshot review before starting a new generation.");
   }
@@ -1348,6 +1579,7 @@ export async function cleanupWhatsAppSnapshotPrivateMemory({ message, stateStore
     const entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
     assertNoRevocationPending(entry);
+    assertNoGrantActivationPending(entry);
     const result = connector.cleanupPrivateMemory();
     entry.audit.push({ type: "whatsapp-private-memory-cleared", at: isoNow(clock), sourceFilesDeleted: false, stagingFilesCreated: false });
     await stateStore.save(state);

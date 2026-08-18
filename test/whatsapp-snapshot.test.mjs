@@ -1038,9 +1038,9 @@ test("same-context public re-entry is blocked so descendant callbacks cannot res
       people: [{ id: "connector-reentry-person", label: "Person", accessLevel: "allowed" }],
       items: [{ id: "connector-reentry-thread", kind: "conversation", conversation: "connector-reentry-thread", category: "work", participantIds: ["connector-reentry-person"], label: "Thread" }]
     });
-    const realRegister = connector.registerPermissionGrant.bind(connector);
+    const realPrepare = connector.preparePermissionGrant.bind(connector);
     let blockedWriter;
-    connector.registerPermissionGrant = async (request) => {
+    connector.preparePermissionGrant = async (request) => {
       try {
         await beginSourcePermissionReview({
           message: "A hooked connector tries a public cross-source write",
@@ -1054,7 +1054,7 @@ test("same-context public re-entry is blocked so descendant callbacks cannot res
         blockedWriter = error;
         throw error;
       }
-      return realRegister(request);
+      return realPrepare(request);
     };
     await assert.rejects(() => grantWhatsAppSnapshotContent({
       message: "Grant while the connector callback re-enters",
@@ -1510,7 +1510,10 @@ test("every durable save seam remains fail-closed and resumable without automati
       const grantFailure = new FailingStore(new FileStateStore(statePath));
       grantFailure.failOn.add(2);
       await assert.rejects(() => grantWhatsAppSnapshotContent({ message: "Grant", stateStore: grantFailure, connector, accountId, generation: 1, reviewId: "reconcile-review", clock, grantIdFactory: () => "reconcile-grant" }), /synthetic durable save failure/);
-      const reconciledGrant = await getWhatsAppSnapshotStatus({ stateStore, accountId, clock });
+      const pendingGrant = await getWhatsAppSnapshotStatus({ stateStore, accountId, clock });
+      assert.equal(pendingGrant.whatsAppSnapshot.status, "awaiting-content-grant");
+      assert.equal(connector.recordFileReads, 0);
+      const reconciledGrant = await grantWhatsAppSnapshotContent({ message: "Retry the exact pending grant", stateStore, connector, accountId, generation: 1, reviewId: "reconcile-review", clock, grantIdFactory: () => "must-not-replace-reconcile-grant" });
       assert.equal(reconciledGrant.whatsAppSnapshot.status, "ready-to-process");
 
       const revokeFailure = new FailingStore(new FileStateStore(statePath));
@@ -1618,6 +1621,142 @@ test("every durable save seam remains fail-closed and resumable without automati
       assert.equal((await getWhatsAppSnapshotStatus({ stateStore, accountId, clock })).whatsAppSnapshot.status, "fetch-interrupted");
       assert.equal((await resumeWhatsAppSnapshotFetch({ message: "Retry again", stateStore, accountId, generation: 1, reviewId: "resume-save-review", confirmRetry: true, clock })).whatsAppSnapshot.status, "ready-to-process");
     });
+  });
+});
+
+test("a failed former post-activation save seam durably reuses one non-readable grant across restart, retry, and revoke", async () => {
+  await withFixture(async ({ stateStore, connector, connectorFactory, statePath }) => {
+    const reviewId = "orphan-grant-regression-review";
+    const firstCandidateId = "orphan-grant-first-candidate";
+    const differentRetryCandidateId = "orphan-grant-different-retry-candidate";
+    const reviewed = await review({ stateStore, connector, reviewId });
+    const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+    await selectWhatsAppSnapshotScope({
+      message: "Select before the former orphan seam",
+      stateStore,
+      connector,
+      accountId,
+      generation: 1,
+      reviewId,
+      chatRefs: [ids.allowedChat],
+      personRefs: [ids.allowedPerson],
+      from: "2026-08-10T00:00:00.000Z",
+      to: "2026-08-13T23:59:59.999Z",
+      includeMedia: false,
+      sensitiveCategories: [],
+      clock
+    });
+
+    const formerPostActivationSaveFailure = new FailingStore(new FileStateStore(statePath));
+    formerPostActivationSaveFailure.failOn.add(2);
+    await assert.rejects(() => grantWhatsAppSnapshotContent({
+      message: "Grant through the former post-activation save seam",
+      stateStore: formerPostActivationSaveFailure,
+      connector,
+      accountId,
+      generation: 1,
+      reviewId,
+      clock,
+      grantIdFactory: () => firstCandidateId
+    }), /synthetic durable save failure/);
+
+    const crashState = await new FileStateStore(statePath).load();
+    const crashEntry = crashState.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`];
+    assert.equal(crashEntry.status, "awaiting-content-grant");
+    assert.equal(crashEntry.grantId, firstCandidateId);
+    assert.equal(crashEntry.grantActivation.status, "pending");
+    assert.equal(crashEntry.grantActivation.grantId, firstCandidateId);
+    assert.equal(crashEntry.grantActivation.reviewId, reviewId);
+    assert.equal(crashEntry.grantActivation.selectionBinding, crashEntry.selection.selectionDigest);
+    assert.equal(crashEntry.grantActivation.mediaInventoryBinding, crashEntry.selection.mediaInventoryBinding);
+    assert.equal(connector.grantPreparationCalls, 1);
+    assert.equal(connector.grantRegistrationCalls, 0, "the former active-before-save seam is now preparation-only");
+
+    const snapshotBinding = structuredClone(crashEntry.snapshotBinding);
+    const selection = structuredClone(crashEntry.selection);
+    const plan = connector.createApprovedFetchPlan({ snapshotBinding, selection });
+    const directFetch = (candidateConnector, candidateId) => candidateConnector.fetchApprovedContent({
+      source: "whatsapp",
+      accountId,
+      grant: { id: candidateId },
+      snapshotBinding,
+      selection,
+      fetchUnit: { planBinding: plan.planBinding, index: 0, unit: plan.units[0] },
+      completedReceipts: []
+    });
+    const beforeRejectedFetch = { recordFileReads: connector.recordFileReads, rawMessageBodiesRead: connector.rawMessageBodiesRead };
+    await assert.rejects(() => directFetch(connector, firstCandidateId), /exact durable WhatsApp grant must be registered/i);
+    assert.equal(connector.recordFileReads, beforeRejectedFetch.recordFileReads);
+    assert.equal(connector.rawMessageBodiesRead, beforeRejectedFetch.rawMessageBodiesRead);
+    assert.deepEqual(await connector.readPermissionGrantStatus({ grantId: firstCandidateId, snapshotBinding }), {
+      grantId: firstCandidateId,
+      active: false,
+      revoked: false,
+      pending: true
+    });
+
+    const restartedConnector = connectorFactory();
+    const restartedStateStore = new FileStateStore(statePath);
+    let retryFactoryCalls = 0;
+    const resumed = await grantWhatsAppSnapshotContent({
+      message: "Resume the exact durable pending grant after process restart",
+      stateStore: restartedStateStore,
+      connector: restartedConnector,
+      accountId,
+      generation: 1,
+      reviewId,
+      clock,
+      grantIdFactory: () => {
+        retryFactoryCalls += 1;
+        return differentRetryCandidateId;
+      }
+    });
+    assert.equal(resumed.whatsAppSnapshot.status, "ready-to-process");
+    assert.equal(retryFactoryCalls, 0, "retry must reconcile the durable exact ID before any factory can produce a second ID");
+    assert.deepEqual(await restartedConnector.readPermissionGrantStatus({ grantId: firstCandidateId, snapshotBinding }), {
+      grantId: firstCandidateId,
+      active: true,
+      revoked: false
+    });
+    assert.deepEqual(await restartedConnector.readPermissionGrantStatus({ grantId: differentRetryCandidateId, snapshotBinding }), {
+      grantId: differentRetryCandidateId,
+      active: false,
+      revoked: false
+    });
+
+    const revoked = await revokeWhatsAppSnapshotContent({
+      message: "Publicly revoke every activation for this exact snapshot selection",
+      stateStore: restartedStateStore,
+      connector: restartedConnector,
+      accountId,
+      generation: 1,
+      reviewId,
+      clock
+    });
+    assert.equal(revoked.whatsAppSnapshot.status, "revoked");
+    assert.deepEqual(await restartedConnector.readPermissionGrantStatus({ grantId: firstCandidateId, snapshotBinding }), {
+      grantId: firstCandidateId,
+      active: false,
+      revoked: true
+    });
+    assert.deepEqual(await restartedConnector.readPermissionGrantStatus({ grantId: differentRetryCandidateId, snapshotBinding }), {
+      grantId: differentRetryCandidateId,
+      active: false,
+      revoked: false
+    });
+    const oldProcessFirst = await connector.readPermissionGrantStatus({ grantId: firstCandidateId, snapshotBinding });
+    assert.equal(oldProcessFirst.active, false, "the crash-left first-process candidate was never activated");
+    assert.equal(oldProcessFirst.pending, true);
+    assert.equal(connector.grantRegistrationCalls, 0);
+    assert.equal(restartedConnector.grantRegistrationCalls, 1);
+
+    const oldProcessBeforeFinalReject = { recordFileReads: connector.recordFileReads, rawMessageBodiesRead: connector.rawMessageBodiesRead };
+    await assert.rejects(() => directFetch(connector, firstCandidateId), /exact durable WhatsApp grant must be registered/i);
+    await assert.rejects(() => directFetch(connector, differentRetryCandidateId), /exact durable WhatsApp grant must be registered/i);
+    assert.equal(connector.recordFileReads, oldProcessBeforeFinalReject.recordFileReads);
+    assert.equal(connector.rawMessageBodiesRead, oldProcessBeforeFinalReject.rawMessageBodiesRead);
+    assert.equal(restartedConnector.recordFileReads, 0);
+    assert.equal(restartedConnector.rawMessageBodiesRead, 0);
   });
 });
 
