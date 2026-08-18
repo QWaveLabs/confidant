@@ -109,8 +109,12 @@ become a competing authority.
   completion receipt, and needs-attention result also performs an exact-lease
   read immediately before it changes lifecycle truth. If that generation is
   readable, the stale cleanup evidence is ignored and the batch stays staged
-  and resumable. A valid lifecycle generation
-  whose startup cleanup encounters a
+  and resumable. A transient I/O error during that final read aborts
+  reconciliation and leaves durable lifecycle truth unchanged; it is never
+  converted into absence. A generation restored during the final read likewise
+  stays nonterminal, and a later exact cleanup consumes only the receipt for a
+  deletion it actually verifies. A valid lifecycle generation whose startup
+  cleanup encounters a
   hard link, unexplained absence, identity uncertainty, tombstone/lease
   mismatch, or other unverified deletion outcome persists needs-attention with
   the exact bounded reason code. Public cleanup and status project that state
@@ -128,17 +132,28 @@ become a competing authority.
   is absent from `expiredBatchIds` and is never projected as expired or
   available. Only the exact tracked generation whose filename tag equals the
   tag derived from its persisted lease, and whose durable cleanup reason is
-  exactly `expired`, can enter expired lifecycle and public status. Public
+  exactly `expired`, can enter terminal `expired-deleted` truth. An expired
+  generation without exact cleanup authority remains explicitly
+  `expired-pending-deletion`. Public
   restart regressions cover tracked missing-lease cleanup, tracked
   malformed-lease cleanup, and hardlink-with-missing-lease needs-attention and
   recovery, alongside the single-link orphan, tracked-invalid, and legitimate
   exact-generation expiry controls.
-- The public staging-adapter boundary remains compatible with its original
-  exact-lease cleanup result: an exact persisted lease ID can reconcile without
-  a generation tag. If an adapter supplies a tag, it must match the lease-derived
+- Deletion truth is authority-bound to the exact `LocalTemporaryStaging`
+  instance created by this module. Its captured internal implementation—not a
+  public method lookup—performs cleanup and receipt acknowledgement. Wrappers,
+  proxies, subclasses, and protocol-shaped custom adapters cannot invoke or
+  fabricate authoritative deletion: their callbacks remain uncalled, the
+  lifecycle stays cleanup-pending with `rawSourceBodiesRetained: true`, and the
+  public result directs the customer to retry with the exact local engine. A
+  later exact-engine retry can safely reconcile the same durable generation.
+  Within that authority-captured engine, the original exact-lease cleanup
+  result remains compatible: an exact persisted lease ID can reconcile without
+  a generation tag. If a result supplies a tag, it must match the lease-derived
   tag; a missing lease can reconcile only through that exact generation tag.
   Batch ID alone never changes lifecycle truth.
-- Successful compilation deletes the protected batch. Deletion first persists
+- With the exact local engine, successful compilation deletes the protected
+  batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
   `lstat`, then opened without following links and checked with `fstat`; exact
   device/inode identity and `nlink === 1` are required before processing and
@@ -193,6 +208,12 @@ become a competing authority.
   does not claim that every specialized lifecycle writer is covered: QWA-149
   must wrap those writers before whole-lifecycle race protection can be
   claimed.
+- All direct operations on the exact local staging engine—including
+  initialization, stage, read, delete, expiry cleanup, and cleanup
+  acknowledgement—also serialize through one normalized-root, in-process
+  queue. Lexical aliases cannot initialize or mutate the same root
+  concurrently, and a failed predecessor releases the queue without poisoning
+  the next operation. This does not claim cross-process serialization.
 - Exact-boundary expiry, restart cleanup, permission broadening, revocation
   before ordinary and untracked recovery, retention-service failure, and
   creator-process exit all have focused failure-path coverage.
@@ -208,9 +229,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **53/53 passed**.
+- QWA-146 focused suite: **56/56 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **101/101 passed**.
+- Full repository suite: **104/104 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
