@@ -94,6 +94,15 @@ become a competing authority.
   tombstone and no completion receipt. A stale worker that finds both old
   generation paths already absent exits ownership without fabricating evidence
   and cannot affect a later same-ID generation.
+- A valid lifecycle generation whose startup cleanup encounters a hard link,
+  unexplained absence, identity uncertainty, tombstone/lease mismatch, or other
+  unverified deletion outcome now persists needs-attention only on the exact
+  matching `{batchId, leaseId}` generation, together with the exact bounded
+  reason code. Public cleanup and status project that state without reporting
+  the generation expired, removed, or available for up to 24 hours. A later
+  cleanup clears it only after deletion or absence is verified for that same
+  generation. Focused restart regressions cover both hard-link residue and a
+  newly absent data path, including exact-generation recovery clearing.
 - Startup orphan and malformed-generation cleanup uses the same link-aware
   `lstat`/no-follow `open`/`fstat` identity checks and requires both verified
   zero-link data and path absence before reporting a removal. A hardlinked
@@ -170,9 +179,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **45/45 passed**.
+- QWA-146 focused suite: **47/47 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **93/93 passed**.
+- Full repository suite: **95/95 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
@@ -203,8 +212,11 @@ retry until absence is verified. A running worker records content-free,
 generation-bound cleanup evidence and will not delete a newer generation that
 reuses the same batch ID.
 
-If staged bytes are moved away or retained through another filesystem hard
-link outside the private staging entry, this adapter cannot prove or erase
-that external residue. It keeps the generation in a truthful needs-attention
-state, preserves retry coverage, and requires local operator review instead of
-claiming the 24-hour cleanup completed.
+If staged bytes are moved away, become unexpectedly absent without matching
+generation-bound evidence, fail an identity check, or are retained through
+another filesystem hard link outside the private staging entry, this adapter
+cannot prove or erase that external residue. It keeps the exact generation in
+a truthful needs-attention state, preserves retry coverage, and requires local
+operator review instead of claiming the 24-hour cleanup completed. Attention
+clears only after a later cleanup verifies deletion or absence for that same
+generation.

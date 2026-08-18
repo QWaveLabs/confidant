@@ -182,7 +182,7 @@ function wording(language) {
     return {
       ready: "Las notas canónicas se compilaron solo a partir de referencias normalizadas aprobadas. No se conservó ningún lote de fuente después de la compilación.",
       compiledCleanupPending: "Las notas canónicas ya están guardadas. La eliminación confirmada del lote privado sigue pendiente; di que continúe para volver a intentar solo la limpieza.",
-      cleanupNeedsAttention: "La limpieza encontró otro enlace del sistema de archivos a este lote privado. No se informó como eliminado: quita el enlace adicional de forma segura o solicita una revisión local y luego di que continúe.",
+      cleanupNeedsAttention: "La limpieza no pudo verificar la eliminación de este lote privado porque otro enlace del sistema de archivos o una discrepancia de identidad/evidencia podría conservarlo. No se informó como eliminado: solicita una revisión local segura y luego di que continúe.",
       discardedCleanupPending: "El permiso aprobado ya no es válido. El lote privado sigue pendiente de eliminación confirmada; di que continúe para volver a intentar solo la limpieza.",
       discarded: "El lote temporal se descartó porque su permiso aprobado ya no era válido.",
       interrupted: "La compilación se interrumpió antes de producir notas. El lote temporal protegido sigue disponible para reanudarlo durante un máximo de 24 horas.",
@@ -217,7 +217,7 @@ function wording(language) {
   return {
     ready: "Canonical notes were compiled only from approved normalized references. No source batch was retained after compilation.",
     compiledCleanupPending: "Canonical notes are already saved. Confirmed deletion of the private batch is still pending; say continue to retry cleanup only.",
-    cleanupNeedsAttention: "Cleanup found another filesystem link to this private batch. It was not reported deleted: safely remove the additional link or request local review, then say continue.",
+    cleanupNeedsAttention: "Cleanup could not verify deletion of this private batch because another filesystem link or an identity/evidence mismatch may retain it. It was not reported deleted: request safe local review, then say continue.",
     discardedCleanupPending: "The approved permission is no longer valid. The private batch still awaits confirmed deletion; say continue to retry cleanup only.",
     discarded: "The temporary batch was discarded because its approved permission was no longer valid.",
     interrupted: "Compilation stopped before notes were produced. The protected temporary batch remains available to resume for no more than 24 hours.",
@@ -787,12 +787,14 @@ export class LocalTemporaryStaging {
     maxRecords = MAX_BATCH_RECORDS,
     maxBytes = MAX_STAGING_BYTES,
     retentionService = new DetachedLocalRetentionService(),
-    fileSystem = {}
+    fileSystem = {},
+    clock = null
   } = {}) {
     this.root = assertDedicatedStagingRoot(root);
     this.maxRecords = maxRecords;
     this.maxBytes = maxBytes;
     this.fileSystem = { ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem };
+    this.clock = clock;
     if (!retentionService || typeof retentionService.arm !== "function" || typeof retentionService.disarm !== "function") {
       throw new TypeError("A private retentionService with arm() and disarm() is required for temporary staging.");
     }
@@ -873,7 +875,7 @@ export class LocalTemporaryStaging {
     this.realRoot = rootReal;
     // The expiry is durable in each staged file. Re-check it whenever this
     // adapter starts so a restart does not depend on an old in-memory timer.
-    const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow());
+    const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow(this.clock));
     this.startupRemovedBatches.push(...startupCleanup.removedBatches);
     this.startupCleanupNeedsAttentionBatches.push(...startupCleanup.cleanupNeedsAttentionBatches);
     return rootReal;
@@ -913,23 +915,25 @@ export class LocalTemporaryStaging {
 
   #timerKey(batchId, leaseId) { return `${batchId}\u0000${leaseId}`; }
 
+  #nowMs() { return Date.parse(isoNow(this.clock)); }
+
   #scheduleExpiry(batchId, leaseId, expiresAt) {
     const timerKey = this.#timerKey(batchId, leaseId);
     const existing = this.expiryTimers.get(timerKey);
     if (existing) clearTimeout(existing);
-    const delay = Math.max(0, Date.parse(expiresAt) - Date.now());
+    const delay = Math.max(0, Date.parse(expiresAt) - this.#nowMs());
     const timer = setTimeout(async () => {
       this.expiryTimers.delete(timerKey);
       try {
         const staged = await this.read({ batchId, leaseId });
-        if (Date.parse(staged.expiresAt) <= Date.now() && await this.delete({ batchId, leaseId })) {
+        if (Date.parse(staged.expiresAt) <= this.#nowMs() && await this.delete({ batchId, leaseId })) {
           this.startupRemovedBatches.push({ batchId, leaseId, reason: "expired" });
         }
       } catch (error) {
         if (error instanceof KnowledgeCompilationError && error.code === "STAGING_BATCH_MISSING") return;
         // Keep retrying on a running host. A refusal to unlink must never
         // silently disarm the only local cleanup coverage.
-        this.#scheduleExpiry(batchId, leaseId, new Date(Date.now() + 250).toISOString());
+        this.#scheduleExpiry(batchId, leaseId, new Date(this.#nowMs() + 250).toISOString());
       }
     }, delay);
     timer.unref?.();
@@ -1647,7 +1651,15 @@ export class LocalTemporaryStaging {
             leaseId: manifest.leaseId,
             reason: invalidData ? "invalid-generation" : expiresAt <= current ? "expired" : "verified-early-absence"
           });
-        } catch {
+        } catch (error) {
+          const reason = unverifiedCleanupFailureReason(error);
+          if (reason) {
+            cleanupNeedsAttentionBatches.push({
+              batchId: descriptor.batchId,
+              leaseId: manifest.leaseId,
+              reason
+            });
+          }
           // A hard link, identity change, or unexplained ready-file absence
           // cannot become a false cleanup receipt. Restore both in-process and
           // detached retry coverage for this exact durable generation.
@@ -1666,7 +1678,15 @@ export class LocalTemporaryStaging {
           const removal = { batchId: descriptor.batchId, leaseId: manifest.leaseId, reason: "retention-unavailable" };
           this.retentionCoverageUnavailableBatches.push(removal);
           removedBatches.push(removal);
-        } catch {
+        } catch (error) {
+          const reason = unverifiedCleanupFailureReason(error);
+          if (reason) {
+            cleanupNeedsAttentionBatches.push({
+              batchId: descriptor.batchId,
+              leaseId: manifest.leaseId,
+              reason
+            });
+          }
           // The durable generation marker remains, so a later owner-only
           // cleanup attempt can retry without exposing any content.
         }
@@ -2433,7 +2453,17 @@ function cleanupNeedsLocalAttention(error) {
   ].includes(error.code);
 }
 
+function unverifiedCleanupFailureReason(error) {
+  // Exact verified absence can be reconciled from the generation-bound
+  // tombstone even when the optional receipt write was interrupted.
+  if (error instanceof KnowledgeCompilationError && error.code === "STAGING_DELETE_RECEIPT_PENDING") return null;
+  return error instanceof KnowledgeCompilationError && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code)
+    ? error.code
+    : "STAGING_DELETE_FAILED";
+}
+
 function stagingAfterCleanupSuccess(staging, status, deletedAt) {
+  if (!staging) return null;
   const { cleanupNeedsAttention: _cleanupNeedsAttention, ...withoutAttention } = staging;
   return { ...withoutAttention, status, deletedAt };
 }
@@ -2556,20 +2586,25 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
   const unavailable = new Set((cleaned.retentionCoverageUnavailableBatches ?? [])
     .map((entry) => `${entry.batchId}\u0000${entry.leaseId ?? ""}`));
   const acknowledgements = [];
+  const verifiedCleanupKeys = new Set();
   let changed = false;
   for (const removal of removals) {
     const { batchId, leaseId } = removal;
     const entry = lifecycle.batches[batchId];
-    if (entry && leaseId && entry.staging?.leaseId !== leaseId) continue;
+    // Untracked or stale generations can be reported for local attention, but
+    // they can never alter or clear a persisted lifecycle generation sharing
+    // the same public batch ID.
+    if (entry && (!leaseId || entry.staging?.leaseId !== leaseId)) continue;
+    if (entry && leaseId) verifiedCleanupKeys.add(`${batchId}\u0000${leaseId}`);
     if (unavailable.has(`${batchId}\u0000${leaseId ?? ""}`) && entry?.status === "staged") {
       entry.status = "discarded";
-      entry.staging = entry.staging ? { ...entry.staging, status: "discarded-retention-unavailable", deletedAt: now } : null;
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "discarded-retention-unavailable", now);
       entry.audit.push({ type: "temporary-batch-discarded", at: now, reason: "RETENTION_SERVICE_UNAVAILABLE" });
       lifecycle.audit.push({ type: "temporary-batch-discarded", at: now, batchId, reason: "RETENTION_SERVICE_UNAVAILABLE" });
       changed = true;
     } else if (entry?.status === "staged" && leaseId) {
       entry.status = "expired";
-      entry.staging = entry.staging ? { ...entry.staging, status: "expired-deleted", deletedAt: now } : null;
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "expired-deleted", now);
       entry.audit.push({ type: "temporary-staging-expired", at: now });
       lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId });
       changed = true;
@@ -2577,13 +2612,16 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
       // The compiled projection was already durable before the retention
       // service removed its input. Preserve that result and accurately record
       // cleanup rather than misclassifying it as an expired compilation.
-      entry.staging = { ...entry.staging, status: "deleted-after-compilation", deletedAt: now };
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "deleted-after-compilation", now);
       entry.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, by: "retention-service" });
       lifecycle.audit.push({ type: "temporary-staging-deleted-after-result-persistence", at: now, batchId, by: "retention-service" });
       changed = true;
     } else if (entry?.status === "discarded" && entry.staging?.status === "discarded-pending-deletion") {
-      entry.staging = { ...entry.staging, status: "discarded", deletedAt: now };
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "discarded", now);
       entry.audit.push({ type: "temporary-discarded-staging-deleted", at: now, by: "retention-service" });
+      changed = true;
+    } else if (entry?.staging?.cleanupNeedsAttention && leaseId) {
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, entry.staging.status, entry.staging.deletedAt ?? now);
       changed = true;
     } else if (!entry && unavailable.has(`${batchId}\u0000${leaseId ?? ""}`)) {
       lifecycle.batches[batchId] = discardedBatchEntry({
@@ -2611,6 +2649,7 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     // generation. A stale or forged generation can remain inert for owner
     // inspection, but it cannot change public deletion truth.
     if (entry?.staging?.leaseId !== leaseId) continue;
+    verifiedCleanupKeys.add(`${batchId}\u0000${leaseId}`);
     const by = completion.source === "receipt" ? "retention-worker" : "durable-retention-tombstone";
     // A tombstone records when deletion began, not when absence became known.
     // When its exact generation paths are now verified absent, record this
@@ -2618,27 +2657,58 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     // a deletion receipt.
     const confirmedDeletedAt = completion.deletedAt ?? now;
     if (entry.status === "compiled" && entry.staging.status === "result-persisted-pending-deletion") {
-      entry.staging = { ...entry.staging, status: "deleted-after-compilation", deletedAt: confirmedDeletedAt };
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "deleted-after-compilation", confirmedDeletedAt);
       entry.audit.push({ type: "temporary-staging-deletion-receipt-consumed", at: now, by });
       lifecycle.audit.push({ type: "temporary-staging-deletion-receipt-consumed", at: now, batchId, by });
       changed = true;
     } else if (entry.status === "discarded" && entry.staging.status === "discarded-pending-deletion") {
-      entry.staging = { ...entry.staging, status: "discarded", deletedAt: confirmedDeletedAt };
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "discarded", confirmedDeletedAt);
       entry.audit.push({ type: "temporary-discarded-staging-deletion-receipt-consumed", at: now, by });
       changed = true;
     } else if (entry.status === "staged") {
       entry.status = "expired";
-      entry.staging = { ...entry.staging, status: "expired-deleted", deletedAt: confirmedDeletedAt };
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, "expired-deleted", confirmedDeletedAt);
       entry.audit.push({ type: "temporary-staging-expired", at: now, by });
       lifecycle.audit.push({ type: "temporary-staging-expired", at: now, batchId, by });
+      changed = true;
+    } else if (entry.staging.cleanupNeedsAttention) {
+      entry.staging = stagingAfterCleanupSuccess(entry.staging, entry.staging.status, entry.staging.deletedAt ?? confirmedDeletedAt);
       changed = true;
     }
     acknowledgements.push({ batchId, leaseId });
   }
+
+  const cleanupNeedsAttentionBatches = cleaned.cleanupNeedsAttentionBatches ?? [];
+  for (const attention of cleanupNeedsAttentionBatches) {
+    const { batchId, leaseId, reason } = attention;
+    const entry = lifecycle.batches[batchId];
+    if (!leaseId || entry?.staging?.leaseId !== leaseId) continue;
+    if (verifiedCleanupKeys.has(`${batchId}\u0000${leaseId}`)) continue;
+    const desiredStatus = entry.status === "staged" ? "cleanup-needs-attention" : entry.staging.status;
+    if (entry.staging.cleanupNeedsAttention !== reason || entry.staging.status !== desiredStatus) {
+      entry.staging = {
+        ...entry.staging,
+        status: desiredStatus,
+        deletedAt: null,
+        cleanupNeedsAttention: reason
+      };
+      changed = true;
+    }
+    const alreadyAudited = entry.audit.some((event) => (
+      event.type === "temporary-staging-cleanup-needs-attention"
+      && event.leaseId === leaseId
+      && event.reason === reason
+    ));
+    if (!alreadyAudited) {
+      entry.audit.push({ type: "temporary-staging-cleanup-needs-attention", at: now, leaseId, reason });
+      lifecycle.audit.push({ type: "temporary-staging-cleanup-needs-attention", at: now, batchId, leaseId, reason });
+      changed = true;
+    }
+  }
   return {
     changed,
     acknowledgements,
-    cleanupNeedsAttentionBatches: cleaned.cleanupNeedsAttentionBatches ?? []
+    cleanupNeedsAttentionBatches
   };
 }
 
