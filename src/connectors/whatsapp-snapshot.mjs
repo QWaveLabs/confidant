@@ -28,6 +28,8 @@ const SOURCE = "whatsapp";
 const SOURCE_PERMISSION_KEY_PREFIX = `${SOURCE}:`;
 const MAX_CAPTURE_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const DEFAULT_OFFICIAL_BUSINESS_ACCOUNT_REF = "wa-account-business-1";
+const LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY = Object.freeze({});
+const LOCAL_WHATSAPP_SNAPSHOT_REGISTRATIONS = new Map();
 export const OFFICIAL_WHATSAPP_BUSINESS_VERIFICATION_PROTOCOL = "qwave.shared-connector-verification/v1";
 
 export class WhatsAppSnapshotError extends Error {
@@ -36,6 +38,17 @@ export class WhatsAppSnapshotError extends Error {
     this.name = "WhatsAppSnapshotError";
     this.code = code;
     this.customerMessage = customerMessage;
+  }
+}
+
+// Imported only by the local connector module. The capability itself remains
+// module-private, so public connector calls cannot forge lifecycle authority.
+export function assertLocalWhatsAppSnapshotLifecycleCapability(candidate) {
+  if (candidate !== LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY) {
+    throw new WhatsAppSnapshotError(
+      "WHATSAPP_LIFECYCLE_CAPABILITY_REQUIRED",
+      "Local WhatsApp snapshot grants can only be activated, revoked, or read through the durable permission lifecycle."
+    );
   }
 }
 
@@ -592,6 +605,60 @@ function sourcePermissionEntry(state, accountId) {
   return state.sourcePermissionLifecycle?.entries?.[permissionEntryKey(accountId)] ?? null;
 }
 
+function localConnectorRegistrationKey(entry, grantId = entry.grantId) {
+  return `${entry.accountId}:${entry.reviewId}:${grantId}:${snapshotBindingDigest(entry)}`;
+}
+
+function localConnectorRegistration(entry, grantId = entry.grantId) {
+  const key = localConnectorRegistrationKey(entry, grantId);
+  let registration = LOCAL_WHATSAPP_SNAPSHOT_REGISTRATIONS.get(key);
+  if (!registration) {
+    registration = { connectors: new Set(), authoritative: null };
+    LOCAL_WHATSAPP_SNAPSHOT_REGISTRATIONS.set(key, registration);
+  }
+  return { key, registration };
+}
+
+function trackLocalConnector(connector, entry, grantId = entry.grantId) {
+  const tracked = localConnectorRegistration(entry, grantId);
+  tracked.registration.connectors.add(connector);
+  return tracked;
+}
+
+async function revokeTrackedConnector(connector, entry, grantId) {
+  const snapshotBinding = clone(entry.snapshotBinding);
+  await connector.revokePermissionGrant({
+    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
+    grantId,
+    snapshotBinding
+  });
+  const readback = await connector.readPermissionGrantStatus({ grantId, snapshotBinding });
+  if (readback?.grantId !== grantId || readback.active !== false
+    || readback.pending === true || readback.revoked !== true) {
+    throw new WhatsAppSnapshotError(
+      "WHATSAPP_REVOCATION_UNCONFIRMED",
+      "A possibly active local WhatsApp registration was not confirmed inactive, so revocation remains pending."
+    );
+  }
+  return readback;
+}
+
+async function revokeEveryTrackedConnector(connector, entry, grantId) {
+  const { key, registration } = trackLocalConnector(connector, entry, grantId);
+  const failures = [];
+  for (const candidate of registration.connectors) {
+    try {
+      await revokeTrackedConnector(candidate, entry, grantId);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw failures[0];
+  registration.authoritative = null;
+  LOCAL_WHATSAPP_SNAPSHOT_REGISTRATIONS.delete(key);
+  return { revoked: true, registrationsConfirmedInactive: registration.connectors.size };
+}
+
 async function ensureConnectorBinding(connector, entry) {
   assertConnector(connector);
   await connector.discoverMetadata({ source: SOURCE });
@@ -624,35 +691,18 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
         if (grantActivation.status !== "pending") {
           throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "Only a pending exact activation intent can prepare local source access.");
         }
-        const result = await connector.preparePermissionGrant({ grant, snapshotBinding, selection });
-        const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
-        if (readback?.grantId !== grant.id || readback.active !== false
-          || readback.revoked !== false || readback.pending !== true) {
-          throw new WhatsAppSnapshotError("WHATSAPP_GRANT_PREPARATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed pending and non-readable, so activation remains denied.");
-        }
-        return result;
+        return prepareExactConnectorGrant(connector, entry, grant);
       }
       if (registrationMode !== "activate" || grantActivation.status !== "activation-authorized") {
         throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "Local source access cannot activate before exact durable authorization is confirmed.");
       }
-      const result = await connector.registerPermissionGrant({ grant, snapshotBinding, selection });
-      const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
-      if (readback?.grantId !== grant.id || readback.active !== true
-        || readback.revoked !== false || readback.pending === true) {
-        throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed active, so content access remains denied.");
-      }
-      return result;
+      return activateExactConnectorGrant(connector, entry, grant);
     },
     revokePermissionGrant: async ({ grantId }) => {
       if (!exactRevocationIntentMatches(entry, revocation) || revocation.grantId !== grantId) {
         throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_INTENT_MISMATCH", "The adapter revoke was blocked because its durable exact intent was missing or changed.");
       }
-      const result = await connector.revokePermissionGrant({ grantId, snapshotBinding });
-      const readback = await connector.readPermissionGrantStatus({ grantId, snapshotBinding });
-      if (readback?.grantId !== grantId || readback.active !== false || readback.revoked !== true) {
-        throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_UNCONFIRMED", "The exact local WhatsApp grant still appears active, so I did not confirm revocation.");
-      }
-      return result;
+      return revokeEveryTrackedConnector(connector, entry, grantId);
     },
     fetchApprovedContent: ({ source, accountId, grant }) => {
       if (revocation?.status === "pending") {
@@ -662,6 +712,7 @@ function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts
         throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_PENDING", "A pending WhatsApp grant activation blocks every content read.");
       }
       return connector.fetchApprovedContent({
+        lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
         source,
         accountId,
         grant,
@@ -706,7 +757,9 @@ async function prepareExactConnectorGrant(connector, entry, grant) {
   if (!exactGrantActivationIntentMatches(entry, entry.grantActivation, ["pending"])) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact durable pending activation intent could not be confirmed.");
   }
+  trackLocalConnector(connector, entry, grant.id);
   const result = await connector.preparePermissionGrant({
+    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
     grant,
     snapshotBinding: clone(entry.snapshotBinding),
     selection: clone(entry.selection)
@@ -723,7 +776,14 @@ async function activateExactConnectorGrant(connector, entry, grant) {
   if (!exactGrantActivationIntentMatches(entry, entry.grantActivation, ["activation-authorized"])) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_INTENT_MISMATCH", "The exact durable activation authorization could not be confirmed.");
   }
+  const { registration } = trackLocalConnector(connector, entry, grant.id);
+  const current = registration.authoritative;
+  if (current && current !== connector) {
+    await revokeTrackedConnector(current, entry, grant.id);
+    registration.authoritative = null;
+  }
   const result = await connector.registerPermissionGrant({
+    lifecycleCapability: LOCAL_WHATSAPP_SNAPSHOT_LIFECYCLE_CAPABILITY,
     grant,
     snapshotBinding: clone(entry.snapshotBinding),
     selection: clone(entry.selection)
@@ -733,6 +793,7 @@ async function activateExactConnectorGrant(connector, entry, grant) {
     || readback.revoked !== false || readback.pending === true) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant was not confirmed active, so content access remains denied.");
   }
+  registration.authoritative = connector;
   return result;
 }
 
@@ -742,7 +803,14 @@ async function ensureExactConnectorGrantActive(connector, entry, grant) {
   if (readback?.grantId !== grant.id || readback.revoked === true) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant could not be reconciled as active, so content access remains denied.");
   }
-  if (readback.active === true && readback.pending !== true) return { registered: true, idempotent: true };
+  if (readback.active === true && readback.pending !== true) {
+    const { registration } = trackLocalConnector(connector, entry, grant.id);
+    if (registration.authoritative && registration.authoritative !== connector) {
+      throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVE_ELSEWHERE", "That durable WhatsApp grant is already authoritative in another local connector instance.");
+    }
+    registration.authoritative = connector;
+    return { registered: true, idempotent: true };
+  }
   if (readback.active !== false) {
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_ACTIVATION_UNCONFIRMED", "The exact local WhatsApp grant readback was ambiguous, so content access remains denied.");
   }

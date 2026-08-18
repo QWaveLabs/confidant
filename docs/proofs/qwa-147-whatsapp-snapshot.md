@@ -197,6 +197,10 @@ Callers may only lower these limits.
   durable and read back exactly before adapter activation. There is no durable
   save after activation, so the former active-before-save orphan seam no longer
   exists.
+- The exported local connector cannot prepare, activate, revoke, or read a
+  grant without the lifecycle's module-private capability. A caller-fabricated
+  `active` grant therefore cannot register itself or open a segment/media body,
+  even when the caller imports and invokes the connector class directly.
 - A retry or supported process restart reconciles the exact pending identifier;
   it never invokes the supplied grant-ID factory again. Persistence, readback,
   scope reconciliation, preparation, and activation-readback failures all fail
@@ -204,6 +208,13 @@ Callers may only lower these limits.
   blocked while activation is pending; after exact retry activates the one
   durable identifier, public revoke uses the existing exact durable revoke
   intent and private adapter readback before it reports `revoked`.
+- Within the documented process-local boundary, every connector registration
+  for an exact account/review/grant/snapshot binding is tracked together. Replay
+  first revokes and reads back the prior authoritative registration as inactive,
+  then activates the same durable identifier in the replacement connector.
+  Public revoke invokes and reads back every possibly active tracked
+  registration; any failure leaves the public lifecycle nonterminal,
+  revocation-pending/unconfirmed, and content reads denied.
 - The connector creates one bounded opaque work plan: every selected segment
   in deterministic order, followed by media units only when media was
   explicitly approved. No media unit can open until all segment receipts are
@@ -267,11 +278,11 @@ Final verified commands and exact results:
 
 | Command | Result |
 | --- | ---: |
-| `npm run test:qwa-147` | 63/63 passed |
+| `npm run test:qwa-147` | 65/65 passed |
 | `npm run test:qwa-139` | 10/10 passed |
 | `npm run test:qwa-142` | 8/8 passed |
 | `npm run test:qwa-150` | 6/6 passed |
-| `npm test` | 110/110 passed |
+| `npm test` | 112/112 passed |
 | `node --check` over source/test/test-support `*.mjs` | 21/21 passed; no `test-support` directory exists |
 | process-leak check after tests | 0 matching Node/npm test processes |
 | `git diff --check` | passed |
@@ -297,6 +308,15 @@ the original exact identifier, and publicly revokes it while the unused second
 candidate remains inactive. Public and durable-state scans include raw account,
 person, chat, segment, message, media, label, path, manifest-generation, and
 digest values.
+
+The suite also imports the exported local connector directly and proves that a
+caller-fabricated active grant causes zero registration, record, message-body,
+media-file, and media-body reads. A two-instance replay regression proves that
+the original registration is revoked before the replacement becomes
+authoritative, that a retry factory proposing another ID is never called, and
+that public revoke confirms both registrations inactive before reporting the
+durable grant revoked. A post-revoke fetch remains denied with every body-read
+counter unchanged.
 
 ## Honest release limitations
 

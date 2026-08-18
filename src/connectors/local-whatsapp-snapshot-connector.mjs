@@ -14,6 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 import { SENSITIVE_CATEGORIES } from "../permissions/setup-source-permissions.mjs";
+import { assertLocalWhatsAppSnapshotLifecycleCapability } from "./whatsapp-snapshot.mjs";
 
 export const WHATSAPP_SNAPSHOT_BUNDLE_FORMAT = "qwave.whatsapp-snapshot-bundle/v1";
 export const WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL = "qwave.local-whatsapp-snapshot/v1";
@@ -703,7 +704,8 @@ export class LocalWhatsAppSnapshotConnector {
     };
   }
 
-  async preparePermissionGrant({ grant, snapshotBinding, selection }) {
+  async preparePermissionGrant({ lifecycleCapability, grant, snapshotBinding, selection }) {
+    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
     const next = this.#grantBinding({ grant, snapshotBinding, selection });
     this.#metrics.grantPreparationCalls += 1;
     const active = this.#grantBindings.get(grant.id);
@@ -717,7 +719,8 @@ export class LocalWhatsAppSnapshotConnector {
     return { prepared: true, idempotent: Boolean(active || pending), alreadyActive: Boolean(active) };
   }
 
-  async registerPermissionGrant({ grant, snapshotBinding, selection }) {
+  async registerPermissionGrant({ lifecycleCapability, grant, snapshotBinding, selection }) {
+    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
     const next = this.#grantBinding({ grant, snapshotBinding, selection });
     this.#metrics.grantRegistrationCalls += 1;
     const existing = this.#grantBindings.get(grant.id);
@@ -732,7 +735,8 @@ export class LocalWhatsAppSnapshotConnector {
     return { registered: true, idempotent: Boolean(existing) };
   }
 
-  async revokePermissionGrant({ grantId, snapshotBinding }) {
+  async revokePermissionGrant({ lifecycleCapability, grantId, snapshotBinding }) {
+    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
     this.#assertBinding(snapshotBinding);
     if (!SAFE_REF.test(grantId)) fail("SNAPSHOT_GRANT_INVALID", "The WhatsApp snapshot grant identifier is invalid.");
     if (!this.#revokedGrants.has(grantId)) {
@@ -907,7 +911,8 @@ export class LocalWhatsAppSnapshotConnector {
     return unit;
   }
 
-  async fetchApprovedContent({ source, accountId, grant, snapshotBinding, selection, fetchUnit, completedReceipts = [] }) {
+  async fetchApprovedContent({ lifecycleCapability, source, accountId, grant, snapshotBinding, selection, fetchUnit, completedReceipts = [] }) {
+    assertLocalWhatsAppSnapshotLifecycleCapability(lifecycleCapability);
     if (source !== "whatsapp" || accountId !== this.#accountRef) fail("SNAPSHOT_CONNECTOR_SUBSTITUTION", "The approved fetch does not match this WhatsApp snapshot account.");
     this.#assertBinding(snapshotBinding);
     const normalized = this.validateSelection(selection);
