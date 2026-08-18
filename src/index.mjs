@@ -35,7 +35,8 @@ export {
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
   grantSourcePermission,
-  revokeSourcePermission
+  revokeSourcePermission,
+  withSourcePermissionStateLock
 } from "./permissions/setup-source-permissions.mjs";
 
 export { SimulatedReadOnlyConnector } from "./permissions/simulated-connector.mjs";
@@ -75,17 +76,33 @@ export {
 
 export {
   OFFICIAL_WHATSAPP_BUSINESS_VERIFICATION_PROTOCOL,
+  WHATSAPP_LOCAL_SNAPSHOT_CONTRACT,
   WhatsAppSnapshotError,
   beginWhatsAppPersonalSnapshot,
   beginWhatsAppSnapshotImport,
+  cancelWhatsAppSnapshotReview,
+  cleanupWhatsAppSnapshotPrivateMemory,
   confirmWhatsAppPersonalExport,
+  denyWhatsAppSnapshotContent,
   fetchApprovedWhatsAppSnapshotContent,
   getWhatsAppOfficialBusinessStatus,
   getWhatsAppSnapshotStatus,
   grantWhatsAppSnapshotContent,
+  restartWhatsAppSnapshotReview,
+  resumeWhatsAppSnapshotFetch,
   revokeWhatsAppSnapshotContent,
   selectWhatsAppSnapshotMedia,
+  selectWhatsAppSnapshotScope,
   verifyWhatsAppOfficialBusinessConnection
 } from "./connectors/whatsapp-snapshot.mjs";
 
 export { SimulatedWhatsAppSnapshotConnector } from "./connectors/simulated-whatsapp-snapshot-adapter.mjs";
+
+export {
+  DEFAULT_WHATSAPP_SNAPSHOT_ACCOUNT_REF,
+  DEFAULT_WHATSAPP_SNAPSHOT_LIMITS,
+  LocalWhatsAppSnapshotConnector,
+  LocalWhatsAppSnapshotError,
+  WHATSAPP_SNAPSHOT_BUNDLE_FORMAT,
+  WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL
+} from "./connectors/local-whatsapp-snapshot-connector.mjs";

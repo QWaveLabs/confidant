@@ -8,7 +8,10 @@
  * connector contract.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 
 export const PERMISSION_SOURCE_KINDS = Object.freeze({
   gmail: "communication",
@@ -58,6 +61,15 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+// Every permission writer persists the same Setup Session root. Serializing by
+// source/account is therefore insufficient: an unrelated writer could save an
+// older root and resurrect a revoked grant. This process-local lock uses the
+// canonical state-file identity and is re-entrant for specialized connector
+// lifecycles that call the shared permission primitives while already locked.
+const stateStoreOperationTails = new Map();
+const inMemoryStateStoreOperationKeys = new WeakMap();
+const stateStoreLockContext = new AsyncLocalStorage();
+const specializedReentryCapability = Symbol("qwave-specialized-state-lock-reentry");
 
 export class PermissionLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -77,6 +89,71 @@ function assertStateStore(stateStore) {
   if (!stateStore || typeof stateStore.load !== "function" || typeof stateStore.save !== "function") {
     throw new TypeError("A persistent stateStore with load() and save() is required.");
   }
+}
+
+function canonicalStateStorePath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return typeof realpathSync.native === "function" ? realpathSync.native(resolved) : realpathSync(resolved);
+  } catch {
+    const parent = path.dirname(resolved);
+    try {
+      const canonicalParent = typeof realpathSync.native === "function"
+        ? realpathSync.native(parent)
+        : realpathSync(parent);
+      return path.join(canonicalParent, path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function stateStoreOperationKey(stateStore) {
+  if (typeof stateStore?.filePath === "string" && stateStore.filePath) {
+    return `file:${canonicalStateStorePath(stateStore.filePath)}`;
+  }
+  let key = inMemoryStateStoreOperationKeys.get(stateStore);
+  if (!key) {
+    key = {};
+    inMemoryStateStoreOperationKeys.set(stateStore, key);
+  }
+  return key;
+}
+
+/**
+ * Serializes one full read-modify-write operation for a Setup Session root.
+ * This is intentionally process-local; cross-process coordination belongs to
+ * a future durable state-store contract and must not be inferred here.
+ */
+export async function withSourcePermissionStateLock(stateStore, operation, reentryCapability) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  const inherited = stateStoreLockContext.getStore();
+  if (inherited?.keys?.has(key)) {
+    if (reentryCapability === specializedReentryCapability) return operation();
+    throw new PermissionLifecycleError(
+      "REENTRANT_PUBLIC_STATE_MUTATION_BLOCKED",
+      "A source-state action tried to re-enter the same Setup Session transaction. I stopped it so an older full-root save cannot erase or restore permission state."
+    );
+  }
+
+  const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
+  await previous.catch(() => undefined);
+  const keys = new Set(inherited?.keys ?? []);
+  keys.add(key);
+  try {
+    return await stateStoreLockContext.run({ keys }, operation);
+  } finally {
+    release();
+  }
+}
+
+function withSpecializedSourcePermissionStateLock(stateStore, operation) {
+  return withSourcePermissionStateLock(stateStore, operation, specializedReentryCapability);
 }
 
 function assertConnector(connector) {
@@ -119,6 +196,19 @@ function sourceKind(source) {
     );
   }
   return kind;
+}
+
+function assertPublicPermissionSource(source) {
+  if (source === "whatsapp") {
+    throw new PermissionLifecycleError(
+      "SPECIALIZED_SOURCE_BOUNDARY_REQUIRED",
+      "WhatsApp snapshot permission is available only through its private local snapshot flow."
+    );
+  }
+}
+
+function assertSpecializedWhatsAppSource(source) {
+  if (source !== "whatsapp") throw new TypeError("The specialized WhatsApp permission primitive accepts only source: whatsapp.");
 }
 
 function sourceKey(source, accountId) {
@@ -550,6 +640,16 @@ function publicReview(entry, language) {
       contentBodiesRead: entry.bodyFetches > 0,
       approvedContentFetches: entry.bodyFetches,
       itemCount: review.metadata.itemCount,
+      people: clone(review.metadata.people),
+      reviewedItems: review.metadata.items.map((item) => ({
+        id: item.id,
+        label: item.label,
+        kind: item.kind,
+        isGroup: item.isGroup,
+        participantIds: clone(item.participantIds),
+        category: item.category,
+        sensitiveCategories: clone(item.sensitiveCategories)
+      })),
       sensitiveGroups: clone(review.metadata.sensitiveGroups),
       blockedGroupConversations: clone(review.metadata.blockedGroupConversations),
       message: entry.bodyFetches > 0 ? wording.metadataPreflightCompleted : wording.metadataOnly
@@ -621,7 +721,7 @@ async function loadRootState(stateStore) {
  * granular permission request. This is the only entry point that starts a
  * source review; connector discovery is never a body fetch.
  */
-export async function beginSourcePermissionReview({
+async function beginSourcePermissionReviewUnlocked({
   message,
   stateStore,
   connector,
@@ -669,12 +769,22 @@ export async function beginSourcePermissionReview({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function beginSourcePermissionReview(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewUnlocked(args));
+}
+
+export async function beginSpecializedWhatsAppPermissionReview(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewUnlocked(args));
+}
+
 /**
  * Public Setup Session boundary: records one granular immutable grant. A stale
  * review cannot be used after denial or revocation, and a second matching call
  * returns the existing grant rather than widening or duplicating access.
  */
-export async function grantSourcePermission({
+async function grantSourcePermissionUnlocked({
   message,
   stateStore,
   connector,
@@ -744,8 +854,18 @@ export async function grantSourcePermission({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function grantSourcePermission(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionUnlocked(args));
+}
+
+export async function grantSpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionUnlocked(args));
+}
+
 /** Records an explicit denial without treating it as an error or allowing stale approval UI to revive it. */
-export async function denySourcePermission({ message, stateStore, source, accountId, reviewId, language, clock }) {
+async function denySourcePermissionUnlocked({ message, stateStore, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "deny");
   assertStateStore(stateStore);
   const state = await loadRootState(stateStore);
@@ -768,8 +888,18 @@ export async function denySourcePermission({ message, stateStore, source, accoun
   };
 }
 
+export async function denySourcePermission(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionUnlocked(args));
+}
+
+export async function denySpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionUnlocked(args));
+}
+
 /** Revokes local permission state only; it never writes to a connected source application. */
-export async function revokeSourcePermission({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function revokeSourcePermissionUnlocked({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "revoke");
   assertStateStore(stateStore);
   if (!connector || typeof connector.revokePermissionGrant !== "function") {
@@ -806,12 +936,22 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
   };
 }
 
+export async function revokeSourcePermission(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionUnlocked(args));
+}
+
+export async function revokeSpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionUnlocked(args));
+}
+
 /**
  * Public Setup Session boundary for the first bounded content fetch. It sends
  * only a durable active grant to the adapter and returns opaque source refs;
  * it never returns raw source bodies to the conversation, proof, or tests.
  */
-export async function fetchApprovedSourceContent({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function fetchApprovedSourceContentUnlocked({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "fetch");
   assertStateStore(stateStore);
   assertConnector(connector);
@@ -846,27 +986,73 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   if (!result || result.rawBodiesReturned === true || !Array.isArray(result.records)) {
     throw new PermissionLifecycleError("CONNECTOR_BODY_BOUNDARY_INVALID", "The simulated connector did not preserve the safe source-body boundary, so I stopped before exposing any content.");
   }
+  const approvedRecords = result.records.map((record) => {
+    if (record?.source !== undefined && record.source !== source) {
+      throw new PermissionLifecycleError("CONNECTOR_SOURCE_SUBSTITUTION", "The connector returned a record for a different source, so I stopped before exposing it.");
+    }
+    const mediaReferenceIds = record?.mediaReferenceIds;
+    if (mediaReferenceIds !== undefined && (source !== "whatsapp" || !Array.isArray(mediaReferenceIds)
+      || mediaReferenceIds.some((value) => typeof value !== "string" || !/^wa-media-[a-f0-9]{20}$/.test(value))
+      || new Set(mediaReferenceIds).size !== mediaReferenceIds.length)) {
+      throw new PermissionLifecycleError("CONNECTOR_MEDIA_BOUNDARY_INVALID", "The connector did not preserve the private media-reference boundary, so I stopped before exposing it.");
+    }
+    const sourceRecordId = String(record.sourceRecordId ?? record.id);
+    if (source === "whatsapp" && !/^wa-message-[a-f0-9]{20}$/.test(sourceRecordId)) {
+      throw new PermissionLifecycleError("CONNECTOR_RECORD_ALIAS_INVALID", "The WhatsApp connector returned a non-local message identifier, so I stopped before exposing it.");
+    }
+    return {
+      sourceRecordId,
+      processingDisposition: "untrusted-inert-reference",
+      source,
+      ...(mediaReferenceIds?.length ? { mediaReferenceIds: [...mediaReferenceIds] } : {})
+    };
+  });
   const now = isoNow(clock);
   entry.bodyFetches += 1;
+  // Persist only opaque references, never source bodies. Specialized wrappers
+  // can use this receipt to finish an interrupted outer save without repeating
+  // a completed read after process restart.
+  entry.lastApprovedFetch = {
+    reviewId,
+    grantId: grant.id,
+    completedAt: now,
+    records: clone(approvedRecords)
+  };
   entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length });
   pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length });
   await stateStore.save(state);
 
   return {
     permissionReview: publicReview(entry, languageFor(state, language)),
-    approvedRecords: result.records.map((record) => ({
-      sourceRecordId: String(record.sourceRecordId ?? record.id),
-      processingDisposition: "untrusted-inert-reference",
-      source: record.source ?? source
-    }))
+    approvedRecords
   };
 }
 
+export async function fetchApprovedSourceContent(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentUnlocked(args));
+}
+
+export async function fetchSpecializedWhatsAppContent(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentUnlocked(args));
+}
+
 /** Read-only public status boundary for reviews, grants, and revocations. */
-export async function getSourcePermissionStatus({ stateStore, source, accountId, language }) {
+async function getSourcePermissionStatusUnlocked({ stateStore, source, accountId, language }) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   if (!state?.[STATE_KEY]) return null;
   const entry = state[STATE_KEY].entries[sourceKey(source, accountId)];
   return entry ? { permissionReview: publicReview(entry, languageFor(state, language)) } : null;
+}
+
+export async function getSourcePermissionStatus(args) {
+  assertPublicPermissionSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => getSourcePermissionStatusUnlocked(args));
+}
+
+export async function getSpecializedWhatsAppPermissionStatus(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return withSpecializedSourcePermissionStateLock(args?.stateStore, () => getSourcePermissionStatusUnlocked(args));
 }
