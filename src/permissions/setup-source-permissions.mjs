@@ -9,7 +9,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import path from "node:path";
 
@@ -61,6 +61,7 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+const METADATA_DIGEST = /^[a-f0-9]{64}$/;
 // Every lifecycle writer persists the same Setup Session root object. A
 // source/account-scoped lock cannot protect that shared document: an unrelated
 // source could otherwise save an older root and resurrect a revoked grant.
@@ -418,6 +419,76 @@ function normalizeMetadata(preflight, source) {
   };
 }
 
+function sourcePermissionMetadataDigest(metadata) {
+  return createHash("sha256").update(JSON.stringify(metadata)).digest("hex");
+}
+
+function assertReviewMetadataIntegrity(review) {
+  const metadata = review?.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_METADATA_INVALID",
+      "The saved metadata review is incomplete, so no source content was read. Start a new metadata-only review."
+    );
+  }
+  const people = Array.isArray(metadata.people) ? metadata.people : [];
+  const items = Array.isArray(metadata.items) ? metadata.items : [];
+  const peopleById = new Map(people.map((person) => [person?.id, person]));
+  const expectedUnknownParticipantIds = uniqueStrings(items
+    .flatMap((item) => Array.isArray(item?.participantIds) ? item.participantIds : [])
+    .filter((id) => !peopleById.has(id)));
+  const expectedBlockedGroupConversations = items
+    .filter((item) => item?.kind === "conversation"
+      && item.isGroup === true
+      && Array.isArray(item.participantIds)
+      && item.participantIds.some((id) => peopleById.get(id)?.accessLevel === "blocked"))
+    .map((item) => ({ id: item.id, label: item.label }));
+  const expectedSensitiveGroups = SENSITIVE_CATEGORIES
+    .map((category) => {
+      const matching = items.filter((item) => Array.isArray(item?.sensitiveCategories) && item.sensitiveCategories.includes(category));
+      return matching.length === 0 ? null : {
+        category,
+        count: matching.length,
+        itemLabels: matching.map((item) => item.label)
+      };
+    })
+    .filter(Boolean);
+  const malformedPeople = people.some((person) => (
+    !person
+    || typeof person.id !== "string"
+    || !person.id.trim()
+    || !ACCESS_LEVELS.has(person.accessLevel)
+  ));
+  const malformedItems = items.some((item) => (
+    !item
+    || typeof item.id !== "string"
+    || !item.id.trim()
+    || !Array.isArray(item.participantIds)
+    || item.participantIds.some((id) => typeof id !== "string" || !id.trim())
+    || !Array.isArray(item.sensitiveCategories)
+    || item.sensitiveCategories.some((category) => !SENSITIVE_CATEGORIES.includes(category))
+  ));
+  const digest = sourcePermissionMetadataDigest(metadata);
+  if (
+    malformedPeople
+    || malformedItems
+    || new Set(people.map((person) => person.id)).size !== people.length
+    || new Set(items.map((item) => item.id)).size !== items.length
+    || metadata.itemCount !== items.length
+    || JSON.stringify(metadata.unknownParticipantIds) !== JSON.stringify(expectedUnknownParticipantIds)
+    || JSON.stringify(metadata.blockedGroupConversations) !== JSON.stringify(expectedBlockedGroupConversations)
+    || JSON.stringify(metadata.sensitiveGroups) !== JSON.stringify(expectedSensitiveGroups)
+    || !METADATA_DIGEST.test(review.metadataDigest ?? "")
+    || review.metadataDigest !== digest
+  ) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_METADATA_INVALID",
+      "The saved metadata review no longer matches its integrity-bound snapshot, so no source content was read. Start a new metadata-only review."
+    );
+  }
+  return digest;
+}
+
 function dateRangeFor(kind, now) {
   const base = new Date(now);
   if (kind === "communication") {
@@ -734,6 +805,21 @@ export function assertPersistedSourcePermissionGrantStillMatchesReview(grant, en
       "The saved permission no longer includes the required privacy acknowledgements, so no source content was read. Start a new review."
     );
   }
+  let metadataDigest;
+  try {
+    metadataDigest = assertReviewMetadataIntegrity(entry?.review);
+  } catch {
+    throw new PermissionLifecycleError(
+      "PERSISTED_GRANT_INVALID",
+      "The saved permission no longer matches its integrity-bound metadata review, so no source content was read. Start a new review."
+    );
+  }
+  if (grant?.metadataDigest !== metadataDigest) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_GRANT_INVALID",
+      "The saved permission was not bound to this metadata review, so no source content was read. Start a new review."
+    );
+  }
   let canonicalScope;
   try {
     canonicalScope = normalizedScope(grant.scope, entry.review, entry.sourceKind, isoNow(clock));
@@ -803,6 +889,7 @@ async function beginSourcePermissionReviewLocked({
       id: reviewId,
       source,
       metadata,
+      metadataDigest: sourcePermissionMetadataDigest(metadata),
       requestedScope: defaultScope(metadata, kind, now),
       createdAt: now
     },
@@ -859,6 +946,7 @@ async function grantSourcePermissionLocked({
   }
 
   const now = isoNow(clock);
+  const metadataDigest = assertReviewMetadataIntegrity(entry.review);
   const normalized = normalizedScope(scope, entry.review, entry.sourceKind, now);
   const existing = entry.grants.find((grant) => grant.status === "active");
   if (existing) {
@@ -874,6 +962,7 @@ async function grantSourcePermissionLocked({
     reviewId,
     source,
     accountId,
+    metadataDigest,
     status: "active",
     approvedAt: now,
     scope: normalized,

@@ -40,10 +40,17 @@ become a competing authority.
 - Missing or malformed person access metadata defaults to Restricted during a
   fresh QWA-139 review. Unknown sensitivity labels and malformed uncertainty
   markers become `uncertain-sensitivity`, which remains excluded by default.
-  During compilation, the persisted grant is re-normalized against the review's
-  metadata on every first attempt and resume; missing/unknown access,
-  sensitivity, or participant metadata and a forged Blocked-to-Allowed
-  promotion all fail closed before staging.
+  The complete normalized metadata snapshot (including its derived unknown
+  participants, blocked groups, sensitive groups, and item count) has a durable
+  SHA-256 digest stored on both review and grant. Grant activation, bounded
+  fetch, first compilation, and resume revalidate that digest and all derived
+  structures. Missing/unknown access, sensitivity, or participant metadata and
+  persisted Restricted-to-Allowed or Blocked-to-Allowed promotion attempts all
+  fail closed before staging or resumed processing.
+- Every effective recognized sensitive category must be explicitly present in
+  the grant's included list and absent from its excluded list. A separately
+  reviewed and explicitly included fixture category compiles; adding that same
+  category to persisted metadata after staging invalidates resume.
 - Source timestamp, participant references, label, stable link, reviewed scope,
   grant identity, and acknowledgement mismatches are rejected before staging
   or compilation.
@@ -64,25 +71,46 @@ become a competing authority.
   stage. Post-open write, fsync, and close failures unwind safely without an
   untracked record file.
 - The worker receives only the private staging root, opaque batch ID, fixed
-  expiry, opaque lease ID, and worker ID; it never reads or logs staged records
-  and does not inherit caller secrets or a caller sentinel. A process-level test
-  proves it deletes the batch after the creator process exits.
+  expiry, opaque lease ID, worker ID, and one-time claim nonce; it never reads
+  or logs staged records and does not inherit caller secrets or a caller
+  sentinel. A process-level test proves it deletes the batch after the creator
+  process exits.
 - Record, marker, owner, tombstone, and receipt names are bound to a hash of the
   opaque lease. A worker for an older generation therefore cannot unlink a
-  later stage that reuses the same batch ID. A durable same-generation owner and
-  heartbeat let a restarted adapter adopt existing coverage instead of spawning
-  a duplicate sleeper; early deletion removes ownership and all workers exit.
+  later stage that reuses the same batch ID. A claimed worker must durably bind
+  its exact PID, process-start timestamp, random process nonce, claim nonce, and
+  generation identity, acknowledge that protocol over IPC, and continue moving
+  the owner-file heartbeat. A restarted adapter adopts coverage only after
+  observing that exact identity advance; an unrelated live PID in a static
+  owner is replaced. Early deletion removes ownership and all workers exit.
 - A fresh adapter rechecks every durable expiry and re-arms independent cleanup
   for an unexpired batch. If it cannot restore retention coverage, it deletes
   the batch early and marks the lifecycle discarded rather than retaining it
   without the promised cleanup.
+- Restart and detached-worker recovery never treat a pre-existing missing data
+  path as proof that this generation unlinked it. An expired prepared marker
+  whose data path is newly absent, and a generation whose data has another
+  hard link, retain their exact lease and retry coverage with an unverified
+  tombstone and no completion receipt. A stale worker that finds both old
+  generation paths already absent exits ownership without fabricating evidence
+  and cannot affect a later same-ID generation.
 - Successful compilation deletes the protected batch. Deletion first persists
-  a content-free generation-bound tombstone, verifies both record and marker
-  paths are absent, and then persists a generation-bound receipt; file and
-  parent-directory durability is requested for each mutation where the host
+  a content-free generation-bound tombstone. The record path is checked with
+  `lstat`, then opened without following links and checked with `fstat`; exact
+  device/inode identity and `nlink === 1` are required before processing and
+  again immediately before deletion. The still-open file is checked after
+  unlink, and only a durable tombstone update recording `nlink === 0` allows
+  marker deletion or a generation-bound receipt. A pre-existing hard link and
+  a hard link introduced after open both retain coverage and produce no false
+  receipt; an unverified post-unlink crash window stays needs-attention. File
+  and parent-directory durability is requested for each mutation where the host
   supports it. Receipt rename/write or parent-fsync interruption remains
-  cleanup-pending and resumes from the tombstone without losing a durable
-  compiled result.
+  cleanup-pending and resumes from the verified tombstone without losing a
+  durable compiled result.
+- Cleanup acknowledgement is an internal lifecycle capability. It rejects a
+  public or premature call, and it disarms coverage only after an exact-version,
+  exact-lease, canonical non-future receipt or verified tombstone is present and
+  both the data and lease paths are confirmed absent.
 - On a running host, interrupted staging has an independently scheduled fixed
   24-hour deletion attempt. Transient unlink failures are retried until absence
   is verified, and later lifecycle resume fails closed after deletion. Expiry
@@ -105,11 +133,15 @@ become a competing authority.
 - Compiled and discarded batches whose generation deletion is still pending
   expose `retryable: true` with an English/Spanish cleanup-only message. A
   normal-language continue request retries that exact generation and changes
-  public deletion truth only after durable lifecycle persistence.
+  public deletion truth only after durable lifecycle persistence. An additional
+  filesystem link exposes `needsAttention: true`; removing a pre-existing link
+  allows a safe retry, while an unverified post-unlink case requires local
+  review and never reports deletion automatically.
 - Startup accepts a worker receipt or tombstone only when its version, batch,
-  current lifecycle lease, generation filename, and canonical timestamp all
-  match and both exact generation paths are absent. Wrong-version, wrong-lease,
-  non-canonical-time, stale, or forged artifacts cannot alter lifecycle truth.
+  current lifecycle lease, generation filename, canonical timestamp, and
+  durable unlink-verification state all match and both exact generation paths
+  are absent. Wrong-version, wrong-lease, non-canonical/future-time, stale,
+  unverified, or forged artifacts cannot alter lifecycle truth.
 - Compilation and the generic QWA-139 lifecycle share one canonical, full-root
   in-process lock. Ordinary calls serialize across canonical path aliases, and
   a descendant public writer invoked from a state-store/connector callback now
@@ -127,11 +159,16 @@ become a competing authority.
 npm run test:qwa-146
 npm run test:qwa-139
 npm test
+rg --files src test test-support -g '*.mjs' | xargs -n 1 node --check
+git diff --check
+! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **33/33 passed**.
+- QWA-146 focused suite: **42/42 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **81/81 passed**.
+- Full repository suite: **90/90 passed**.
+- All source, test, and test-support `.mjs` files passed `node --check`, and
+  `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
   verification.
 
@@ -145,6 +182,11 @@ The shared state lock is in-process only; it does not provide cross-process
 atomicity. Whole-root safety also remains dependent on QWA-149 integrating all
 specialized source lifecycle writers with this same lock.
 
+The metadata digest binds the exact normalized snapshot and catches stale or
+inconsistent persisted state; it is not a keyed signature against an actor who
+already has arbitrary write access to the private state file and can recompute
+the digest. Local state-file access remains part of the trusted host boundary.
+
 The detached retention worker survives the compiler creator process exiting,
 but a host shutdown can interrupt it. On the next adapter startup, durable
 staging is rechecked and either adopted/re-armed or deleted early if coverage
@@ -154,3 +196,9 @@ already removed bytes: transient host/filesystem failures remain explicit and
 retry until absence is verified. A running worker records content-free,
 generation-bound cleanup evidence and will not delete a newer generation that
 reuses the same batch ID.
+
+If staged bytes are moved away or retained through another filesystem hard
+link outside the private staging entry, this adapter cannot prove or erase
+that external residue. It keeps the generation in a truthful needs-attention
+state, preserves retry coverage, and requires local operator review instead of
+claiming the 24-hour cleanup completed.

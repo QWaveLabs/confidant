@@ -7,7 +7,7 @@
  * logs content, or inherits the compiler's environment.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readFile, realpath, rename, unlink, utimes } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
@@ -42,7 +42,7 @@ function artifactPaths(root, batchId, leaseId) {
 }
 
 function safeArguments(argv) {
-  const [rootInput, batchId, expiresAt, leaseId, workerId] = argv;
+  const [rootInput, batchId, expiresAt, leaseId, workerId, claimNonce] = argv;
   if (
     typeof rootInput !== "string"
     || !isAbsolute(rootInput)
@@ -54,8 +54,10 @@ function safeArguments(argv) {
     || !OPAQUE_ID.test(leaseId)
     || typeof workerId !== "string"
     || !OPAQUE_ID.test(workerId)
+    || typeof claimNonce !== "string"
+    || !OPAQUE_ID.test(claimNonce)
   ) return null;
-  return { root: resolve(rootInput), batchId, expiresAt, leaseId, workerId };
+  return { root: resolve(rootInput), batchId, expiresAt, leaseId, workerId, claimNonce };
 }
 
 async function pathAbsent(target) {
@@ -127,8 +129,43 @@ function ownerMatches(owner, job) {
     && owner.leaseId === job.leaseId
     && owner.expiresAt === job.expiresAt
     && owner.workerId === job.workerId
+    && owner.claimNonce === job.claimNonce
+    && owner.phase === "running"
+    && owner.pid === process.pid
+    && owner.processNonce === job.processNonce
+    && owner.processStartedAt === job.processStartedAt
     && canonicalTimestamp(owner.startedAt)
     && canonicalTimestamp(owner.heartbeatAt));
+}
+
+async function bindOwnership(job) {
+  const paths = artifactPaths(job.root, job.batchId, job.leaseId);
+  const claimed = await readJson(paths.owner).catch(() => null);
+  if (
+    claimed?.version !== STAGING_VERSION
+    || claimed.batchId !== job.batchId
+    || claimed.leaseId !== job.leaseId
+    || claimed.expiresAt !== job.expiresAt
+    || claimed.workerId !== job.workerId
+    || claimed.claimNonce !== job.claimNonce
+    || claimed.phase !== "claimed"
+    || !canonicalTimestamp(claimed.startedAt)
+    || !canonicalTimestamp(claimed.heartbeatAt)
+  ) return null;
+  const processStartedAt = new Date().toISOString();
+  const processNonce = `process-${randomUUID()}`;
+  const running = {
+    ...claimed,
+    phase: "running",
+    pid: process.pid,
+    processNonce,
+    processStartedAt,
+    heartbeatAt: processStartedAt
+  };
+  await durableJsonWrite(paths.owner, running);
+  job.processNonce = processNonce;
+  job.processStartedAt = processStartedAt;
+  return running;
 }
 
 async function readOwnedRecord(job) {
@@ -159,27 +196,113 @@ async function unlinkAndSync(target) {
   }
 }
 
-function validTombstone(value, job) {
+function sameFileIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino;
+}
+
+async function markTombstoneBlocked(job) {
+  const paths = artifactPaths(job.root, job.batchId, job.leaseId);
+  const existing = await readJson(paths.tombstone).catch(() => null);
+  const deleteStartedAt = canonicalTimestamp(existing?.deleteStartedAt) ?? new Date().toISOString();
+  await durableJsonWrite(paths.tombstone, {
+    version: STAGING_VERSION,
+    batchId: job.batchId,
+    leaseId: job.leaseId,
+    deleteStartedAt,
+    dataUnlinkVerified: false,
+    cleanupBlockedReason: "multiple-links-after-unlink",
+    detectedAt: new Date().toISOString()
+  });
+}
+
+async function markTombstoneUnlinkVerified(job) {
+  const paths = artifactPaths(job.root, job.batchId, job.leaseId);
+  const existing = await readJson(paths.tombstone).catch(() => null);
+  if (!validTombstoneBase(existing, job) || existing.cleanupBlockedReason != null) return false;
+  try {
+    await durableJsonWrite(paths.tombstone, {
+      ...existing,
+      dataUnlinkVerified: true,
+      dataUnlinkVerifiedAt: new Date().toISOString()
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function unlinkSingleLinkData(job, tombstone) {
+  const paths = artifactPaths(job.root, job.batchId, job.leaseId);
+  let before;
+  try {
+    before = await lstat(paths.data);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      if (tombstone.value.dataUnlinkVerified === true) return "absent";
+      return "needs-attention";
+    }
+    return "retry";
+  }
+  if (before.isSymbolicLink()) {
+    // Remove only the generation-specific directory entry without following
+    // the invalid link or touching its target.
+    try {
+      await unlinkAndSync(paths.data);
+      return await markTombstoneUnlinkVerified(job) ? "deleted" : "needs-attention";
+    } catch {
+      return "retry";
+    }
+  }
+  if (!before.isFile() || before.nlink !== 1) return "needs-attention";
+  let handle;
+  let outcome = "retry";
+  try {
+    handle = await open(paths.data, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1 || !sameFileIdentity(before, opened)) return "needs-attention";
+    await unlinkAndSync(paths.data);
+    const remainingLinks = (await handle.stat()).nlink;
+    if (remainingLinks !== 0) {
+      await markTombstoneBlocked(job).catch(() => undefined);
+      return "needs-attention";
+    }
+    outcome = "deleted";
+  } catch {
+    outcome = "retry";
+  } finally {
+    try { await handle?.close(); } catch { outcome = "retry"; }
+  }
+  if (outcome === "deleted" && !await markTombstoneUnlinkVerified(job)) return "needs-attention";
+  return outcome;
+}
+
+function validTombstoneBase(value, job) {
   return Boolean(value?.version === STAGING_VERSION
     && value.batchId === job.batchId
     && value.leaseId === job.leaseId
+    && [true, false].includes(value.dataUnlinkVerified)
+    && (value.dataUnlinkVerified === false || canonicalTimestamp(value.dataUnlinkVerifiedAt))
     && canonicalTimestamp(value.deleteStartedAt));
 }
 
 async function ensureTombstone(job) {
   const paths = artifactPaths(job.root, job.batchId, job.leaseId);
   const existing = await readJson(paths.tombstone).catch(() => null);
-  if (existing) return validTombstone(existing, job);
+  if (existing) return validTombstoneBase(existing, job) && existing.cleanupBlockedReason == null
+    ? { created: false, value: existing }
+    : null;
+  const tombstone = {
+    version: STAGING_VERSION,
+    batchId: job.batchId,
+    leaseId: job.leaseId,
+    deleteStartedAt: new Date().toISOString(),
+    dataUnlinkVerified: false
+  };
   try {
-    await durableJsonWrite(paths.tombstone, {
-      version: STAGING_VERSION,
-      batchId: job.batchId,
-      leaseId: job.leaseId,
-      deleteStartedAt: new Date().toISOString()
-    }, { exclusive: true });
-    return true;
+    await durableJsonWrite(paths.tombstone, tombstone, { exclusive: true });
+    return { created: true, value: tombstone };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -196,9 +319,23 @@ async function finalizeGenerationDeletion(job) {
   if (!rootReal || rootReal !== job.root) return "superseded";
   const paths = artifactPaths(job.root, job.batchId, job.leaseId);
   if (Object.values(paths).some((target) => dirname(target) !== job.root)) return "superseded";
-  if (!await ensureTombstone(job)) return "retry";
+  const existingTombstone = await readJson(paths.tombstone).catch(() => null);
+  const lease = await readJson(paths.lease).catch(() => null);
+  const dataAbsentBeforeMarker = await pathAbsent(paths.data).catch(() => false);
+  const leaseAbsentBeforeMarker = await pathAbsent(paths.lease).catch(() => false);
+  if (dataAbsentBeforeMarker && leaseAbsentBeforeMarker && !existingTombstone) {
+    // The generation paths were removed outside this worker and there is no
+    // durable unlink proof. Exit stale ownership without fabricating a
+    // deletion receipt for data that could have been moved or linked away.
+    await removeOwnership(job);
+    return "superseded";
+  }
+  const tombstone = await ensureTombstone(job);
+  if (!tombstone) return "retry";
 
-  try { await unlinkAndSync(paths.data); } catch { return "retry"; }
+  const dataOutcome = await unlinkSingleLinkData(job, tombstone);
+  if (dataOutcome === "needs-attention") return "needs-attention";
+  if (dataOutcome === "retry") return "retry";
   if (!await pathAbsent(paths.data).catch(() => false)) return "retry";
   try { await unlinkAndSync(paths.lease); } catch { return "retry"; }
   if (!await pathAbsent(paths.lease).catch(() => false)) return "retry";
@@ -242,7 +379,11 @@ async function confirmSchedule(job) {
         type: "qwave-retention-armed",
         batchId: job.batchId,
         leaseId: job.leaseId,
-        workerId: job.workerId
+        workerId: job.workerId,
+        claimNonce: job.claimNonce,
+        pid: process.pid,
+        processNonce: job.processNonce,
+        processStartedAt: job.processStartedAt
       }, (error) => error ? rejectConfirmation(error) : resolveConfirmation());
     });
     process.disconnect?.();
@@ -254,7 +395,7 @@ async function confirmSchedule(job) {
 
 async function main() {
   const job = safeArguments(process.argv.slice(2));
-  if (!job || !await readOwnedRecord(job) || !await confirmSchedule(job)) return;
+  if (!job || !await bindOwnership(job) || !await readOwnedRecord(job) || !await confirmSchedule(job)) return;
   let owner = await readOwnedRecord(job);
   let lastHeartbeat = Date.now();
   while (owner) {

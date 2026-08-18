@@ -56,7 +56,10 @@ function recordFitsScope(record, scope) {
     ...declaredSensitive,
     ...(record.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])
   ];
-  if (sensitiveCategories.some((category) => scope.sensitiveGroups.excluded.includes(category))) return false;
+  if (sensitiveCategories.some((category) => (
+    scope.sensitiveGroups.excluded.includes(category)
+    || !scope.sensitiveGroups.included.includes(category)
+  ))) return false;
   return true;
 }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, mkdir, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,6 +20,7 @@ import {
   beginSourcePermissionReview,
   cleanupExpiredKnowledgeStaging,
   compileApprovedRecords,
+  fetchApprovedSourceContent,
   getKnowledgeCompilationStatus,
   grantSourcePermission,
   revokeSourcePermission,
@@ -280,7 +281,9 @@ class FailOnceReadStaging {
 
   async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
 
-  async acknowledgeCleanupReceipt(input) { return this.delegate.acknowledgeCleanupReceipt(input); }
+  async acknowledgeCleanupReceipt(input, internalToken) {
+    return this.delegate.acknowledgeCleanupReceipt(input, internalToken);
+  }
 }
 
 class ControlledFailureStaging {
@@ -313,7 +316,36 @@ class ControlledFailureStaging {
 
   async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
 
-  async acknowledgeCleanupReceipt(input) { return this.delegate.acknowledgeCleanupReceipt(input); }
+  async acknowledgeCleanupReceipt(input, internalToken) {
+    return this.delegate.acknowledgeCleanupReceipt(input, internalToken);
+  }
+}
+
+class HardLinkOnFirstDeleteStaging {
+  constructor(delegate, root, survivorPath) {
+    this.delegate = delegate;
+    this.root = root;
+    this.survivorPath = survivorPath;
+    this.linked = false;
+  }
+
+  async stage(input) { return this.delegate.stage(input); }
+
+  async read(input) { return this.delegate.read(input); }
+
+  async delete(input) {
+    if (!this.linked) {
+      this.linked = true;
+      await link(stagingArtifacts(this.root, input.batchId, input.leaseId).data, this.survivorPath);
+    }
+    return this.delegate.delete(input);
+  }
+
+  async cleanupExpired(input) { return this.delegate.cleanupExpired(input); }
+
+  async acknowledgeCleanupReceipt(input, internalToken) {
+    return this.delegate.acknowledgeCleanupReceipt(input, internalToken);
+  }
 }
 
 class HookedStateStore {
@@ -835,7 +867,7 @@ test("an approved record with a participant omitted from the selected allowlist 
   });
 });
 
-test("persisted Blocked-to-Allowed corruption is revalidated against immutable review metadata before compilation", async () => {
+test("integrity-bound metadata rejects persisted Blocked-to-Allowed promotion before compilation", async () => {
   await withCompilerFixture(async ({ directory, stateStore, staging }) => {
     const accountId = "fixture-blocked-integrity-account";
     const sourceRecordId = "fixture-blocked-integrity-group";
@@ -884,6 +916,7 @@ test("persisted Blocked-to-Allowed corruption is revalidated against immutable r
     const state = await stateStore.load();
     const entry = state.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(accountId)}`];
     const grant = entry.grants.find((candidate) => candidate.status === "active");
+    entry.review.metadata.people.find((person) => person.id === "person-blocked").accessLevel = "allowed";
     for (const boundary of [entry.review.requestedScope, grant.scope]) {
       boundary.people.allowed = [...new Set([...boundary.people.allowed, "person-blocked"])].sort();
       boundary.people.blocked = boundary.people.blocked.filter((id) => id !== "person-blocked");
@@ -919,6 +952,153 @@ test("persisted Blocked-to-Allowed corruption is revalidated against immutable r
   });
 });
 
+test("metadata, review, and grant corruption cannot promote a Restricted person through fetch or compilation", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging }) => {
+    const accountId = "fixture-restricted-integrity-account";
+    const sourceRecordId = "fixture-restricted-integrity-record";
+    const connector = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: accountId, label: "Restricted integrity fixture" },
+      people: [
+        { id: "person-allowed", label: "Allowed", accessLevel: "allowed" },
+        { id: "person-restricted", label: "Restricted", accessLevel: "restricted" }
+      ],
+      items: [{
+        id: sourceRecordId,
+        kind: "item",
+        area: "inbox",
+        category: "planning",
+        timestamp: startedAt,
+        participantIds: ["person-allowed"],
+        label: "Restricted integrity record"
+      }]
+    });
+    const reviewId = "restricted-integrity-review";
+    const grantId = "restricted-integrity-grant";
+    const review = await beginSourcePermissionReview({
+      message: "Review this bounded Gmail source",
+      stateStore,
+      connector,
+      source: "gmail",
+      clock: clockAt(startedAt),
+      reviewIdFactory: () => reviewId
+    });
+    await grantSourcePermission({
+      message: "Approve only the default Allowed person",
+      stateStore,
+      connector,
+      source: "gmail",
+      accountId,
+      reviewId,
+      scope: scopeForApproval(review),
+      clock: clockAt(startedAt),
+      grantIdFactory: () => grantId
+    });
+
+    const state = await stateStore.load();
+    const entry = state.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(accountId)}`];
+    const grant = entry.grants.find((candidate) => candidate.status === "active");
+    entry.review.metadata.people.find((person) => person.id === "person-restricted").accessLevel = "allowed";
+    entry.review.metadata.items[0].participantIds.push("person-restricted");
+    for (const boundary of [entry.review.requestedScope, grant.scope]) {
+      boundary.people.allowed = [...new Set([...boundary.people.allowed, "person-restricted"])].sort();
+      boundary.people.restricted = boundary.people.restricted.filter((id) => id !== "person-restricted");
+      boundary.exclusions.people = boundary.exclusions.people.filter((id) => id !== "person-restricted");
+    }
+    await stateStore.save(state);
+
+    await assert.rejects(
+      () => fetchApprovedSourceContent({
+        message: "Import the approved Gmail source",
+        stateStore,
+        connector,
+        source: "gmail",
+        accountId,
+        reviewId,
+        clock: clockAt(laterToday)
+      }),
+      (error) => error?.code === "PERSISTED_GRANT_INVALID"
+    );
+
+    const permission = {
+      source: "gmail",
+      accountId,
+      sourceRecordId,
+      reviewId,
+      grantId,
+      sourceTimestamp: startedAt,
+      participantRefs: ["person-allowed", "person-restricted"],
+      sourceLabel: "Restricted integrity record",
+      stableLink: null
+    };
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Compile my approved notes",
+        stateStore,
+        staging,
+        batchId: "fixture-restricted-integrity",
+        approvedRecords: [approvedRecord(permission, [
+          assertion("knowledge", "knowledge-restricted-integrity", "Restricted integrity", "This forged promotion must never compile.")
+        ])],
+        clock: clockAt(laterToday)
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "PERSISTED_GRANT_INVALID"
+    );
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
+test("grant activation rejects a metadata snapshot changed after review", async () => {
+  await withCompilerFixture(async ({ directory, stateStore }) => {
+    const accountId = "fixture-grant-metadata-integrity-account";
+    const connector = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: accountId, label: "Grant integrity fixture" },
+      items: [{
+        id: "fixture-grant-integrity-record",
+        kind: "item",
+        area: "inbox",
+        category: "planning",
+        timestamp: startedAt,
+        participantIds: [],
+        label: "Grant integrity record"
+      }]
+    });
+    const reviewId = "grant-metadata-integrity-review";
+    const review = await beginSourcePermissionReview({
+      message: "Review this bounded Gmail source",
+      stateStore,
+      connector,
+      source: "gmail",
+      clock: clockAt(startedAt),
+      reviewIdFactory: () => reviewId
+    });
+    const state = await stateStore.load();
+    state.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(accountId)}`]
+      .review.metadata.items[0].sensitiveCategories = ["medical-information"];
+    await stateStore.save(state);
+
+    await assert.rejects(
+      () => grantSourcePermission({
+        message: "Approve this unchanged reviewed scope",
+        stateStore,
+        connector,
+        source: "gmail",
+        accountId,
+        reviewId,
+        scope: scopeForApproval(review),
+        clock: clockAt(startedAt),
+        grantIdFactory: () => "grant-metadata-integrity-grant"
+      }),
+      (error) => error?.code === "PERSISTED_METADATA_INVALID"
+    );
+    await assert.rejects(
+      () => lstat(path.join(directory, ".qwave-second-brain-staging")),
+      (error) => error?.code === "ENOENT"
+    );
+  });
+});
+
 test("missing or unknown access, sensitivity, and participant metadata fail closed before staging", async () => {
   await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
     const baseline = await stateStore.load();
@@ -951,6 +1131,117 @@ test("missing or unknown access, sensitivity, and participant metadata fail clos
       assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
     }
     await stateStore.save(baseline);
+  });
+});
+
+test("a recognized sensitive category compiles only when it is explicitly included in the durable grant", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging }) => {
+    const accountId = "fixture-explicit-sensitive-account";
+    const sourceRecordId = "fixture-explicit-sensitive-record";
+    const connector = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: accountId, label: "Explicit sensitive fixture" },
+      items: [{
+        id: sourceRecordId,
+        kind: "item",
+        area: "inbox",
+        category: "planning",
+        timestamp: startedAt,
+        participantIds: [],
+        sensitiveCategories: ["medical-information"],
+        label: "Explicitly reviewed sensitive record"
+      }]
+    });
+    const reviewId = "explicit-sensitive-review";
+    const grantId = "explicit-sensitive-grant";
+    const review = await beginSourcePermissionReview({
+      message: "Review this bounded Gmail source",
+      stateStore,
+      connector,
+      source: "gmail",
+      clock: clockAt(startedAt),
+      reviewIdFactory: () => reviewId
+    });
+    const scope = scopeForApproval(review);
+    scope.sensitiveGroups.included = ["medical-information"];
+    scope.sensitiveGroups.excluded = scope.sensitiveGroups.excluded.filter((category) => category !== "medical-information");
+    await grantSourcePermission({
+      message: "I explicitly approve the reviewed medical-information category",
+      stateStore,
+      connector,
+      source: "gmail",
+      accountId,
+      reviewId,
+      scope,
+      clock: clockAt(startedAt),
+      grantIdFactory: () => grantId
+    });
+    const permission = {
+      source: "gmail",
+      accountId,
+      sourceRecordId,
+      reviewId,
+      grantId,
+      sourceTimestamp: startedAt,
+      participantRefs: [],
+      sourceLabel: "Explicitly reviewed sensitive record",
+      stableLink: null
+    };
+    const result = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging,
+      batchId: "fixture-explicit-sensitive",
+      approvedRecords: [approvedRecord(permission, [
+        assertion("knowledge", "knowledge-explicit-sensitive", "Explicit sensitive approval", "The recognized category was separately and explicitly approved.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(result.compilation.status, "compiled");
+    assert.equal(result.compilation.staging.status, "deleted-after-compilation");
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
+  });
+});
+
+test("recognized sensitivity added after staging invalidates resume instead of becoming ordinary content", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const batchId = "fixture-sensitive-resume-integrity";
+    const interrupted = new FailOnceReadStaging(staging);
+    const first = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: interrupted,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-sensitive-resume", "Sensitive resume integrity", "A changed metadata snapshot must invalidate resume.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(first.compilation.status, "staged");
+
+    const state = await stateStore.load();
+    const entry = state.sourcePermissionLifecycle.entries[`gmail:${encodeURIComponent(gmail.accountId)}`];
+    entry.review.metadata.items[0].sensitiveCategories = ["medical-information"];
+    entry.review.metadata.sensitiveGroups = [{
+      category: "medical-information",
+      count: 1,
+      itemLabels: [entry.review.metadata.items[0].label]
+    }];
+    await stateStore.save(state);
+
+    await assert.rejects(
+      () => compileApprovedRecords({
+        message: "Continue compiling my approved notes",
+        stateStore,
+        staging: interrupted,
+        batchId,
+        clock: clockAt("2026-08-17T13:05:00.000Z")
+      }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "PERSISTED_GRANT_INVALID"
+    );
+    const durable = await stateStore.load();
+    assert.equal(durable.knowledgeCompilationLifecycle.batches[batchId].status, "discarded");
+    assert.deepEqual(await readdir(path.join(directory, ".qwave-second-brain-staging")), []);
   });
 });
 
@@ -1171,7 +1462,8 @@ test("forged completion receipts cannot change lifecycle truth while the exact g
     const forgeries = [
       { version: 999, batchId, leaseId, deletedAt: laterToday },
       { version: 1, batchId, leaseId: "lease-forged-other", deletedAt: laterToday },
-      { version: 1, batchId, leaseId, deletedAt: "2026-08-17 13:00:00Z" }
+      { version: 1, batchId, leaseId, deletedAt: "2026-08-17 13:00:00Z" },
+      { version: 1, batchId, leaseId, deletedAt: "2030-01-01T00:00:00.000Z" }
     ];
     for (const forged of forgeries) {
       await writeFile(artifacts.receipt, `${JSON.stringify(forged)}\n`, "utf8");
@@ -1187,7 +1479,6 @@ test("forged completion receipts cannot change lifecycle truth while the exact g
       assert.equal((await lstat(artifacts.lease)).isFile(), true);
     }
     await staging.delete({ batchId, leaseId });
-    await staging.acknowledgeCleanupReceipt({ batchId, leaseId });
   });
 });
 
@@ -1559,6 +1850,59 @@ test("a fresh staging adapter removes an expired durable batch on restart and le
   });
 });
 
+test("restart keeps unexplained prepared-file absence and hard-link residue armed without false cleanup receipts", async () => {
+  for (const scenario of ["absent", "hard-linked"]) {
+    const directory = await mkdtemp(path.join(os.tmpdir(), `qwave-second-brain-qwa146-restart-${scenario}-`));
+    try {
+      const root = path.join(directory, ".qwave-second-brain-staging");
+      const batchId = `fixture-restart-${scenario}`;
+      const staged = fixtureStaging(root);
+      const receipt = await staged.stage({
+        batchId,
+        records: [inertStagingRecord({ sourceRecordId: `fixture-restart-${scenario}-record` })],
+        createdAt: new Date().toISOString()
+      });
+      const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+      const survivor = path.join(directory, `${scenario}-survivor.json`);
+      if (scenario === "absent") {
+        await unlink(artifacts.data);
+        const preparedLease = JSON.parse(await readFile(artifacts.lease, "utf8"));
+        preparedLease.phase = "prepared";
+        await writeFile(artifacts.lease, `${JSON.stringify(preparedLease)}\n`, "utf8");
+      } else {
+        await link(artifacts.data, survivor);
+      }
+
+      const restartedRetention = new FixtureRetentionService();
+      const restarted = fixtureStaging(root, { retentionService: restartedRetention });
+      await restarted.initialize();
+      const cleanup = await restarted.cleanupExpired({
+        now: new Date(Date.now() + (scenario === "absent" ? 25 * 60 * 60 * 1_000 : 60_000)).toISOString()
+      });
+
+      assert.deepEqual(cleanup.removedBatchIds, []);
+      assert.deepEqual(cleanup.completionReceipts, []);
+      assert.equal(restartedRetention.armed.length >= 1, true);
+      assert.equal(restartedRetention.armed.every((entry) => (
+        entry.batchId === batchId && entry.leaseId === receipt.leaseId
+      )), true);
+      assert.equal((await lstat(artifacts.lease)).isFile(), true);
+      await assert.rejects(() => lstat(artifacts.receipt), (error) => error?.code === "ENOENT");
+      const tombstone = JSON.parse(await readFile(artifacts.tombstone, "utf8"));
+      assert.equal(tombstone.dataUnlinkVerified, false);
+
+      if (scenario === "absent") {
+        await assert.rejects(() => lstat(artifacts.data), (error) => error?.code === "ENOENT");
+      } else {
+        assert.equal((await lstat(artifacts.data)).nlink, 2);
+        assert.equal((await lstat(survivor)).nlink, 2);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("retention arming occurs before a temporary batch write and fails closed when the service is unavailable", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-retention-arm-"));
   try {
@@ -1607,7 +1951,7 @@ test("retention arming occurs before a temporary batch write and fails closed wh
       "data-opened"
     ]);
     await staging.delete({ batchId: "fixture-retention-arm", leaseId: receipt.leaseId });
-    await staging.acknowledgeCleanupReceipt({ batchId: "fixture-retention-arm", leaseId: receipt.leaseId });
+    const completedArtifacts = stagingArtifacts(root, "fixture-retention-arm", receipt.leaseId);
 
     const unavailable = fixtureStaging(root, {
       retentionService: {
@@ -1629,10 +1973,184 @@ test("retention arming occurs before a temporary batch write and fails closed wh
       }),
       (error) => error instanceof KnowledgeCompilationError && error.code === "RETENTION_SERVICE_UNAVAILABLE"
     );
-    assert.deepEqual(await readdir(root), []);
+    assert.deepEqual((await readdir(root)).sort(), [
+      path.basename(completedArtifacts.receipt),
+      path.basename(completedArtifacts.tombstone)
+    ].sort());
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("public cleanup acknowledgement cannot disarm retention before exact completion evidence exists", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-cleanup-ack-"));
+  const batchId = "fixture-premature-cleanup-ack";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const staging = new LocalTemporaryStaging({ root, retentionService: new DetachedLocalRetentionService() });
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: new Date().toISOString()
+    });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+
+    await assert.rejects(
+      () => staging.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_CLEANUP_ACK_INTERNAL_ONLY"
+    );
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.equal((await lstat(artifacts.owner)).isFile(), true);
+    assert.equal((await retentionWorkerCommands(batchId)).length, 1);
+
+    await staging.delete({ batchId, leaseId: receipt.leaseId });
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual((await readdir(root)).sort(), [
+      path.basename(artifacts.receipt),
+      path.basename(artifacts.tombstone)
+    ].sort());
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an external hard link keeps cleanup armed and cannot produce a false deletion receipt", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-hardlink-"));
+  const batchId = "fixture-external-hardlink";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const staging = new LocalTemporaryStaging({ root, retentionService: new DetachedLocalRetentionService() });
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: new Date().toISOString()
+    });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    const survivor = path.join(directory, "retained-fixture-link.json");
+    await link(artifacts.data, survivor);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+
+    await assert.rejects(
+      () => staging.read({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_HARDLINK_BLOCKED"
+    );
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"
+    );
+    assert.equal((await lstat(artifacts.data)).nlink, 2);
+    assert.equal((await lstat(survivor)).nlink, 2);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.equal((await lstat(artifacts.owner)).isFile(), true);
+    await assert.rejects(() => lstat(artifacts.receipt), (error) => error?.code === "ENOENT");
+    assert.equal((await retentionWorkerCommands(batchId)).length, 1);
+
+    await unlink(survivor);
+    assert.equal(await staging.delete({ batchId, leaseId: receipt.leaseId }), true);
+    await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.deepEqual((await readdir(root)).sort(), [
+      path.basename(artifacts.receipt),
+      path.basename(artifacts.tombstone)
+    ].sort());
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a hard link added after open cannot become a false receipt after the private path is unlinked", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-hardlink-race-"));
+  const batchId = "fixture-post-open-hardlink";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const survivor = path.join(directory, "post-open-survivor.json");
+    let injectLink = false;
+    const staging = fixtureStaging(root, {
+      fileSystem: {
+        async unlink(target) {
+          if (injectLink && isStagingDataPath(target)) {
+            injectLink = false;
+            await link(target, survivor);
+          }
+          return unlink(target);
+        }
+      }
+    });
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: startedAt
+    });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    injectLink = true;
+
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"
+    );
+    await assert.rejects(() => lstat(artifacts.data), (error) => error?.code === "ENOENT");
+    assert.equal((await lstat(survivor)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    await assert.rejects(() => lstat(artifacts.receipt), (error) => error?.code === "ENOENT");
+    const tombstone = JSON.parse(await readFile(artifacts.tombstone, "utf8"));
+    assert.equal(tombstone.cleanupBlockedReason, "multiple-links-after-unlink");
+
+    await unlink(survivor);
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"
+    );
+    await assert.rejects(() => lstat(artifacts.receipt), (error) => error?.code === "ENOENT");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("compiled cleanup reports hard-link attention truthfully and resumes cleanup after the extra link is removed", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const survivor = path.join(directory, "compiled-cleanup-survivor.json");
+    const controlled = new HardLinkOnFirstDeleteStaging(staging, root, survivor);
+    const batchId = "fixture-compiled-hardlink-attention";
+    const first = await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-hardlink-attention", "Cleanup attention", "Cleanup status remains truthful until the additional link is removed.")
+      ])],
+      clock: clockAt(laterToday)
+    });
+    assert.equal(first.compilation.status, "compiled");
+    assert.equal(first.compilation.staging.status, "result-persisted-pending-deletion");
+    assert.equal(first.compilation.staging.needsAttention, true);
+    assert.equal(first.compilation.needsAttention, true);
+    assert.equal(first.compilation.retryable, true);
+    assert.match(first.compilation.message, /filesystem link/i);
+    assert.equal((await lstat(survivor)).isFile(), true);
+
+    const durablePending = await stateStore.load();
+    assert.equal(
+      durablePending.knowledgeCompilationLifecycle.batches[batchId].staging.cleanupNeedsAttention,
+      "filesystem-generation-integrity"
+    );
+    await unlink(survivor);
+
+    const resumed = await compileApprovedRecords({
+      message: "Continue compiling my approved notes",
+      stateStore,
+      staging: controlled,
+      batchId,
+      clock: clockAt("2026-08-17T13:05:00.000Z")
+    });
+    assert.equal(resumed.compilation.staging.status, "deleted-after-compilation");
+    assert.equal(resumed.compilation.staging.needsAttention, false);
+    assert.equal(resumed.compilation.needsAttention, false);
+    assert.equal(resumed.compilation.retryable, false);
+    assert.deepEqual(await readdir(root), []);
+  });
 });
 
 test("post-open write, fsync, and close failures never leave untracked staging data", async () => {
@@ -1722,8 +2240,10 @@ test("a transient data-unlink failure keeps generation-bound cleanup retryable u
     assert.equal((await lstat(artifacts.tombstone)).isFile(), true);
 
     assert.equal(await staging.delete({ batchId, leaseId: receipt.leaseId }), true);
-    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId });
-    assert.deepEqual(await readdir(root), []);
+    assert.deepEqual((await readdir(root)).sort(), [
+      path.basename(artifacts.receipt),
+      path.basename(artifacts.tombstone)
+    ].sort());
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1819,15 +2339,17 @@ test("a restarted staging adapter adopts one generation owner and early deletion
     assert.equal((await retentionWorkerCommands(batchId)).length, 1);
 
     await restarted.delete({ batchId, leaseId: receipt.leaseId });
-    await restarted.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId });
     await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
-    assert.deepEqual(await readdir(root), []);
+    assert.deepEqual((await readdir(root)).sort(), [
+      path.basename(stagingArtifacts(root, batchId, receipt.leaseId).receipt),
+      path.basename(stagingArtifacts(root, batchId, receipt.leaseId).tombstone)
+    ].sort());
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("restart replaces a fresh-looking owner whose bound worker process has crashed", async () => {
+test("restart replaces a static protocol-shaped owner that names an unrelated live PID", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-crashed-owner-"));
   const batchId = "fixture-crashed-owner-restart";
   const leaseId = "lease-crashed-owner-restart";
@@ -1852,7 +2374,11 @@ test("restart replaces a fresh-looking owner whose bound worker process has cras
       leaseId,
       expiresAt,
       workerId: "worker-crashed-fixture",
-      pid: 2_147_483_647,
+      claimNonce: "claim-unrelated-live-fixture",
+      phase: "running",
+      pid: process.pid,
+      processNonce: "process-unrelated-live-fixture",
+      processStartedAt: createdAt,
       startedAt: createdAt,
       heartbeatAt: createdAt
     })}\n`, { encoding: "utf8", mode: 0o600 });
@@ -1862,7 +2388,8 @@ test("restart replaces a fresh-looking owner whose bound worker process has cras
     assert.equal(armed.adopted, false);
     const replacement = JSON.parse(await readFile(artifacts.owner, "utf8"));
     assert.notEqual(replacement.workerId, "worker-crashed-fixture");
-    assert.notEqual(replacement.pid, 2_147_483_647);
+    assert.notEqual(replacement.processNonce, "process-unrelated-live-fixture");
+    assert.notEqual(replacement.pid, process.pid);
     await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
 
     await service.disarm({ root, batchId, leaseId });
@@ -1874,7 +2401,7 @@ test("restart replaces a fresh-looking owner whose bound worker process has cras
   }
 });
 
-test("an old generation worker cannot delete a later same-ID stage", async () => {
+test("a stale old-generation worker exits without forging a receipt or deleting a later same-ID stage", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-generation-reuse-"));
   const batchId = "fixture-generation-reuse";
   try {
@@ -1896,21 +2423,19 @@ test("an old generation worker cannot delete a later same-ID stage", async () =>
     const newArtifacts = stagingArtifacts(root, batchId, newReceipt.leaseId);
     assert.notEqual(newArtifacts.data, oldArtifacts.data);
 
-    await waitFor(async () => {
-      const names = await readdir(root);
-      return names.includes(path.basename(oldArtifacts.receipt))
-        && !names.includes(path.basename(oldArtifacts.owner));
-    });
+    await waitFor(async () => !(await readdir(root)).includes(path.basename(oldArtifacts.owner)));
+    await assert.rejects(() => lstat(oldArtifacts.receipt), (error) => error?.code === "ENOENT");
+    await assert.rejects(() => lstat(oldArtifacts.tombstone), (error) => error?.code === "ENOENT");
     const newStage = await staging.read({ batchId, leaseId: newReceipt.leaseId });
     assert.equal(newStage.records[0].sourceRecordId, "fixture-new-generation-record");
     assert.equal((await lstat(newArtifacts.data)).isFile(), true);
     assert.equal((await lstat(newArtifacts.lease)).isFile(), true);
 
-    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: oldReceipt.leaseId });
     await staging.delete({ batchId, leaseId: newReceipt.leaseId });
-    await staging.acknowledgeCleanupReceipt({ batchId, leaseId: newReceipt.leaseId });
     await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
-    assert.deepEqual(await readdir(root), []);
+    assert.deepEqual((await readdir(root)).filter((name) => (
+      name.endsWith(".receipt.json") || name.endsWith(".tombstone.json")
+    )).length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
