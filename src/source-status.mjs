@@ -1684,68 +1684,14 @@ function authorizationOutcomeFor(adapter, reported) {
   return null;
 }
 
-function safePersistedIso(value) {
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
-}
-
 /**
- * A live Gmail handoff is allowed only when the application itself persisted
- * the full outcome of the official read-only lifecycle. A string status, a
- * caller-supplied evidence object, or a simulated plugin can never meet these
- * linked evidence requirements.
+ * This simulated/local candidate cannot establish an official-host Gmail
+ * verification. A future registered host-provider integration must publish
+ * trusted evidence from outside this public API; persisted shapes and injected
+ * plugin fields are never sufficient here.
  */
-function trustedPersistedGmailLiveVerification(state, entry) {
-  const accountId = typeof entry?.accountId === "string" && OPAQUE_ID.test(entry.accountId) ? entry.accountId : null;
-  const reviewId = typeof entry?.reviewId === "string" && OPAQUE_ID.test(entry.reviewId) ? entry.reviewId : null;
-  const activationGrantId = typeof entry?.grantActivation?.grantId === "string" && OPAQUE_ID.test(entry.grantActivation.grantId)
-    ? entry.grantActivation.grantId
-    : null;
-  const verifiedAt = safePersistedIso(entry?.connection?.verifiedAt);
-  if (!accountId || !reviewId || !activationGrantId || !verifiedAt
-    || entry?.status !== "live-and-verified"
-    || entry?.connection?.state !== "live-and-verified"
-    || entry?.connection?.live !== true
-    || entry?.connection?.readOnly !== true
-    || entry?.connection?.simulationOnly !== false
-    || entry?.plugin?.status !== "connected"
-    || entry?.plugin?.simulated !== false
-    || entry?.plugin?.hostAttested !== true
-    || entry?.grantActivation?.status !== "active"
-    || entry?.grantActivation?.reviewId !== reviewId
-    || entry?.grantActivation?.revocationConfirmed === true) {
-    return null;
-  }
-  const permissionEntry = state?.sourcePermissionLifecycle?.entries?.[`gmail:${encodeURIComponent(accountId)}`];
-  const activeGrant = permissionEntry?.grants?.find((grant) => (
-    grant?.status === "active"
-    && grant?.id === activationGrantId
-    && grant?.source === "gmail"
-    && grant?.accountId === accountId
-    && grant?.reviewId === reviewId
-    && grant?.scope
-  ));
-  if (permissionEntry?.status !== "granted" || permissionEntry?.review?.id !== reviewId || permissionEntry?.review?.metadata?.account?.id !== accountId || !activeGrant) {
-    return null;
-  }
-  const readback = (Array.isArray(entry?.audit) ? entry.audit : []).find((event) => (
-    event?.type === "gmail-approved-page-processed"
-    && event?.actualRead === true
-    && event?.simulated === false
-    && event?.bodiesExposed === false
-    && safePersistedIso(event?.at)
-  ));
-  if (!readback) return null;
-  return {
-    connectorId: `gmail-readonly:${accountId}`,
-    source: "gmail",
-    accountContext: `gmail:${accountId}`,
-    readOnly: true,
-    independentlyVerified: true,
-    verificationMethod: "persisted-official-read-only-readback",
-    verifiedAt,
-    processingComplete: entry?.import?.complete === true && entry?.import?.status === "complete"
-  };
+function trustedPersistedGmailLiveVerification() {
+  return null;
 }
 
 function persistedAdapterSourceStatus({ sourceId, adapter, adapterStatus, language, trustedLiveVerification = null }) {
@@ -1822,7 +1768,7 @@ function persistedAdapterStatuses(state, language) {
       sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GMAIL, gmailEntry.accountId),
       adapter: SOURCE_ADAPTER_NAMES.GMAIL,
       adapterStatus: reported,
-      trustedLiveVerification: trustedPersistedGmailLiveVerification(state, gmailEntry),
+      trustedLiveVerification: trustedPersistedGmailLiveVerification(),
       language
     }));
   }
@@ -1913,8 +1859,8 @@ function releaseGate(language, adapterStatuses) {
     verifiedLiveConnectors,
     message: satisfied ? wording(language).releaseGateSatisfied : wording(language).releaseGateUnsatisfied,
     note: satisfied
-      ? "The gate is satisfied only by a qualifying Gmail record persisted through the approved read-only lifecycle. Caller-supplied evidence and adapter status text remain ignored."
-      : "QWA-149 has no trusted persisted connector, grant, and independent read-verification record. Caller-supplied evidence and adapter status text are ignored; a separately reviewed live-connector lifecycle must satisfy this gate."
+      ? "A future registered host-provider integration supplied separately reviewed trusted evidence."
+      : "QWA-149 has no registered live connector integration. Caller-supplied evidence, injected plugin fields, persisted lifecycle shapes, and adapter status text are ignored; a separately reviewed host-provider lifecycle must satisfy this gate."
   };
 }
 

@@ -39,31 +39,6 @@ const BODY_FIELD_NAMES = new Set([
   "mime",
   "attachments"
 ]);
-const trustedGmailHostCapabilities = new WeakMap();
-
-/**
- * The desktop composition root must deliberately bind the official read-only
- * plugin instance before any response can be considered non-simulated. Plugin
- * fields and caller-created lookalike objects are not capabilities.
- */
-export function createTrustedGmailHostCapability({
-  plugin,
-  hostAttestedOfficialReadOnly = false
-} = {}) {
-  if (!plugin || (typeof plugin !== "object" && typeof plugin !== "function")
-    || plugin.isSimulation !== false
-    || hostAttestedOfficialReadOnly !== true) {
-    throw new TypeError("A host-attested, explicitly non-simulated Gmail plugin is required.");
-  }
-  const capability = Object.freeze({ kind: "trusted-gmail-host-capability" });
-  trustedGmailHostCapabilities.set(capability, plugin);
-  return capability;
-}
-
-function hasTrustedGmailHostCapability(plugin, capability) {
-  return Boolean(capability && trustedGmailHostCapabilities.get(capability) === plugin);
-}
-
 export const GMAIL_CONNECTION_STATES = Object.freeze({
   SELECTED_BUT_UNFINISHED: "selected-but-unfinished",
   NEEDS_ATTENTION: "needs-attention",
@@ -297,8 +272,7 @@ function newEntry(now) {
     plugin: {
       status: "not-started",
       attempts: 0,
-      simulated: null,
-      hostAttested: false
+      simulated: null
     },
     grantActivation: {
       status: "not-started",
@@ -388,7 +362,6 @@ function statusMessage(entry, language) {
   if (entry.connection.simulationOnly && entry.import.status === "complete" && entry.import.empty) return wording.simulatedEmpty;
   if (entry.import.status === "complete" && entry.import.empty) return wording.empty;
   if (entry.connection.simulationOnly && entry.import.recordsProcessed > 0) return wording.simulatedVerified;
-  if (entry.connection.live) return wording.liveVerified;
   if (entry.import.status === "ready-to-verify") return wording.scopeGranted;
   if (entry.reviewId) return wording.reviewReady;
   if (entry.plugin.status === "connected") return wording.connected;
@@ -396,16 +369,23 @@ function statusMessage(entry, language) {
 }
 
 function publicView(entry, language, permissionReview = null) {
+  // This candidate deliberately has no registered official-host integration.
+  // Persisted or injected fields must therefore never turn its Gmail view into
+  // a live verification claim. A future host-owned integration must expose its
+  // evidence through a separately reviewed, non-public boundary.
+  const status = entry.status === GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED
+    ? GMAIL_CONNECTION_STATES.NEEDS_ATTENTION
+    : entry.status;
   return {
     source: SOURCE,
-    status: entry.status,
+    status,
     message: statusMessage(entry, language),
     connection: {
-      state: entry.connection.state,
-      live: entry.connection.live,
+      state: status,
+      live: false,
       readOnly: true,
-      verifiedAt: entry.connection.verifiedAt,
-      simulationOnly: entry.connection.simulationOnly,
+      verifiedAt: null,
+      simulationOnly: true,
       canSendMail: false,
       canLabelMail: false,
       canArchiveMail: false,
@@ -414,8 +394,7 @@ function publicView(entry, language, permissionReview = null) {
     },
     plugin: {
       status: entry.plugin.status,
-      simulated: entry.plugin.simulated === true,
-      hostAttested: entry.plugin.hostAttested === true
+      simulated: true
     },
     grantLifecycle: {
       status: grantActivation(entry).status,
@@ -452,10 +431,10 @@ function assertPluginMethod(plugin, method, message) {
   }
 }
 
-function pluginIsSimulated(plugin, result = {}, hostCapability = null) {
-  return !hasTrustedGmailHostCapability(plugin, hostCapability)
-    || plugin?.isSimulation !== false
-    || result?.simulated !== false;
+function pluginIsSimulated() {
+  // All injectable plugins in this simulation/local contract are deliberately
+  // non-live, even when their caller-controlled fields claim otherwise.
+  return true;
 }
 
 function normalizeMetadataResult(result) {
@@ -492,7 +471,7 @@ function normalizeMetadataResult(result) {
   };
 }
 
-function normalizePageResult(result, { accountId, plugin, grant, hostCapability }) {
+function normalizePageResult(result, { accountId, grant }) {
   if (!result || typeof result !== "object") {
     throw new GmailReadOnlyError("GMAIL_PAGE_INVALID", "Gmail did not return a safe approved page, so I stopped before exposing source data.");
   }
@@ -503,10 +482,7 @@ function normalizePageResult(result, { accountId, plugin, grant, hostCapability 
     throw new GmailReadOnlyError("GMAIL_BODY_BOUNDARY_VIOLATION", "Gmail did not preserve the read-only source-body boundary, so I stopped before exposing source data.");
   }
   assertNoBodyFields(result, "approved-page response");
-  const simulated = pluginIsSimulated(plugin, result, hostCapability);
-  if (!simulated && result.actualRead !== true) {
-    throw new GmailReadOnlyError("GMAIL_ACTUAL_READ_NOT_PROVEN", "Gmail did not prove a real, read-only read, so I will not label it as live.");
-  }
+  const simulated = pluginIsSimulated();
   if (!Array.isArray(result.records)) {
     throw new GmailReadOnlyError("GMAIL_PAGE_INVALID", "Gmail did not return a safe approved page, so I stopped before exposing source data.");
   }
@@ -534,9 +510,8 @@ function normalizePageResult(result, { accountId, plugin, grant, hostCapability 
  * approved page; lifecycle code persists the checkpoint between pages.
  */
 export class GmailReadOnlyConnector {
-  constructor({ plugin, hostCapability = null, pageToken = null, pageSize = 50 } = {}) {
+  constructor({ plugin, pageToken = null, pageSize = 50 } = {}) {
     this.plugin = plugin;
-    this.hostCapability = hostCapability;
     this.pageToken = opaqueIdentifier(pageToken, "page checkpoint", { nullable: true });
     this.pageSize = Number.isSafeInteger(pageSize) && pageSize > 0 && pageSize <= 100 ? pageSize : 50;
     this.lastMetadata = null;
@@ -580,7 +555,7 @@ export class GmailReadOnlyConnector {
         pageToken: this.pageToken,
         pageSize: this.pageSize
       }),
-      { accountId, plugin: this.plugin, grant, hostCapability: this.hostCapability }
+      { accountId, grant }
     );
     this.lastPage = page;
     return {
@@ -623,7 +598,7 @@ function validateConnectionResult(result) {
  * function it gives exactly one in-app fallback action and performs no source
  * access. A successful plugin connection still is not a live verification.
  */
-async function beginGmailConnectionInternal({ message, stateStore, plugin, hostCapability, language, clock } = {}) {
+async function beginGmailConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
   assertNaturalLanguage(message, "start");
   const state = await loadState(stateStore);
   const entry = prepareFreshEntry(state, clock);
@@ -649,8 +624,7 @@ async function beginGmailConnectionInternal({ message, stateStore, plugin, hostC
       const result = await plugin.initiateReadOnlyConnection({ source: SOURCE, purpose: "Start a Gmail metadata-only review after customer request." });
       const connectionStatus = validateConnectionResult(result);
       entry.plugin.status = connectionStatus;
-      entry.plugin.hostAttested = hasTrustedGmailHostCapability(plugin, hostCapability);
-      entry.plugin.simulated = pluginIsSimulated(plugin, result, hostCapability);
+      entry.plugin.simulated = pluginIsSimulated();
       entry.connection.simulationOnly = entry.plugin.simulated === true;
       if (connectionStatus === "connected") {
         entry.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
@@ -684,7 +658,7 @@ export async function beginGmailConnection(args = {}) {
 }
 
 /** Runs the QWA-139 metadata-only preflight after a saved Gmail plugin connection. */
-async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, hostCapability, language, clock, reviewIdFactory } = {}) {
+async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, language, clock, reviewIdFactory } = {}) {
   assertNaturalLanguage(message, "start");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -697,7 +671,7 @@ async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, ho
     return { gmail: publicView(entry, locale) };
   }
 
-  const connector = new GmailReadOnlyConnector({ plugin, hostCapability });
+  const connector = new GmailReadOnlyConnector({ plugin });
   try {
     const review = await beginSourcePermissionReview({
       message,
@@ -741,7 +715,7 @@ export async function beginGmailPrivacyReview(args = {}) {
 }
 
 /** Saves a granular QWA-139 grant; it does not read Gmail itself. */
-async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, hostCapability, scope, language, clock, grantIdFactory } = {}) {
+async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, scope, language, clock, grantIdFactory } = {}) {
   assertNaturalLanguage(message, "grant");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -836,7 +810,7 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, ho
     return { gmail: publicView(entry, locale, existingPermission?.permissionReview), recoverable: true };
   }
 
-  const connector = new GmailReadOnlyConnector({ plugin, hostCapability });
+  const connector = new GmailReadOnlyConnector({ plugin });
   let cleanupGrantId = durableGrantId;
   try {
     const granted = await grantSourcePermission({
@@ -1137,7 +1111,7 @@ async function synchronizeExternalRevocation({ stateStore, plugin, entry, langua
  * Each page is committed as a checkpoint, so a later interruption resumes from
  * the exact next opaque page token instead of restarting a large account.
  */
-async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugin, hostCapability, language, clock, maxPages } = {}) {
+async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugin, language, clock, maxPages } = {}) {
   assertNaturalLanguage(message, "fetch");
   const budget = pageBudget(maxPages);
   let state = await loadState(stateStore);
@@ -1154,7 +1128,7 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
   const newlyProcessed = [];
   for (let pageIndex = 0; pageIndex < budget; pageIndex += 1) {
     const currentCheckpoint = entry.import.nextPageToken ?? "initial";
-    const connector = new GmailReadOnlyConnector({ plugin, hostCapability, pageToken: entry.import.nextPageToken });
+    const connector = new GmailReadOnlyConnector({ plugin, pageToken: entry.import.nextPageToken });
     let fetched;
     try {
       if (pageCheckpointHistory(entry).includes(currentCheckpoint)) {
@@ -1230,11 +1204,6 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
       entry.connection.live = false;
       entry.connection.state = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
       entry.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
-    } else if (page.actualRead) {
-      entry.connection.live = true;
-      entry.connection.state = GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED;
-      entry.connection.verifiedAt = isoNow(clock);
-      entry.status = GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED;
     }
     entry.audit.push({
       type: "gmail-approved-page-processed",

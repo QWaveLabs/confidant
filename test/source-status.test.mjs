@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import * as PublicApi from "../src/index.mjs";
 
 import {
   FileStateStore,
@@ -18,7 +19,6 @@ import {
   beginGmailPrivacyReview,
   beginSimulatedExportPreview,
   buildSimulatedExportPermissionScope,
-  createTrustedGmailHostCapability,
   explainUnsupportedSource,
   fetchApprovedGmailReferences,
   getGmailReadOnlyStatus,
@@ -71,19 +71,17 @@ function approvedGmailScope(gmail) {
   return scope;
 }
 
-async function connectReviewAndGrantGmail({ stateStore, plugin, hostCapability = null }) {
+async function connectReviewAndGrantGmail({ stateStore, plugin }) {
   await beginGmailConnection({
     message: "Connect Gmail to my second brain",
     stateStore,
     plugin,
-    hostCapability,
     clock
   });
   const review = await beginGmailPrivacyReview({
     message: "Review Gmail for my second brain",
     stateStore,
     plugin,
-    hostCapability,
     clock,
     reviewIdFactory: () => "gmail-review"
   });
@@ -91,7 +89,6 @@ async function connectReviewAndGrantGmail({ stateStore, plugin, hostCapability =
     message: "I approve the reviewed Gmail scope",
     stateStore,
     plugin,
-    hostCapability,
     scope: approvedGmailScope(review.gmail),
     clock,
     grantIdFactory: () => "gmail-grant"
@@ -937,7 +934,7 @@ test("legacy and mismatched Gmail grant generations are migrated without duplica
   });
 });
 
-test("trusted persisted Gmail readback satisfies the live gate while primary Calendar state is projected additively", async () => {
+test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Calendar state is projected additively", async () => {
   await withFixture(async ({ stateStore }) => {
     const plugin = gmailPluginFixture();
     await connectReviewAndGrantGmail({ stateStore, plugin });
@@ -946,7 +943,6 @@ test("trusted persisted Gmail readback satisfies the live gate while primary Cal
     gmail.status = "live-and-verified";
     gmail.plugin.status = "connected";
     gmail.plugin.simulated = false;
-    gmail.plugin.hostAttested = true;
     gmail.connection.state = "live-and-verified";
     gmail.connection.live = true;
     gmail.connection.readOnly = true;
@@ -980,40 +976,27 @@ test("trusted persisted Gmail readback satisfies the live gate while primary Cal
     const handoff = await getSourceStatusHandoff({ stateStore });
     const gmailStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "gmail:gmail-work");
     const calendarStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "calendar:calendar-work");
-    assert.equal(gmailStatus.state, SOURCE_STATUS_STATES.IMPORTED);
-    assert.equal(gmailStatus.connection.live, true);
-    assert.equal(gmailStatus.connection.independentlyVerified, true);
-    assert.equal(gmailStatus.connection.readOnly, true);
-    assert.equal(gmailStatus.adapterReportedState, null);
+    assert.equal(gmailStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(gmailStatus.connection.live, false);
+    assert.equal(gmailStatus.connection.independentlyVerified, false);
+    assert.equal(gmailStatus.connection.readOnly, null);
+    assert.equal(gmailStatus.adapterReportedState?.value, "live-and-verified");
     assert.equal(calendarStatus.state, SOURCE_STATUS_STATES.IMPORTED);
     assert.equal(calendarStatus.source.adapter, "google-calendar");
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, true);
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors.length, 1);
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors[0].source, "gmail");
-
-    state.gmailReadOnlyLifecycle.entry.plugin.simulated = true;
-    await stateStore.save(state);
-    const downgraded = await getSourceStatusHandoff({ stateStore });
-    const downgradedGmail = downgraded.sourceStatusHandoff.sources.find((item) => item.source.id === "gmail:gmail-work");
-    assert.equal(downgraded.sourceStatusHandoff.releaseGate.satisfied, false);
-    assert.equal(downgradedGmail.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
-    assert.equal(downgradedGmail.connection.live, false);
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
+    assert.deepEqual(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors, []);
   });
 });
 
-test("Gmail live verification requires the host-bound capability plus explicit non-simulation markers", async () => {
+test("injected Gmail plugin shapes remain non-live without a public trusted-capability path", async () => {
+  assert.equal("createTrustedGmailHostCapability" in PublicApi, false);
   await withFixture(async ({ stateStore }) => {
     const plugin = syntheticNonSimulatedGmailPlugin({ includeSimulationMarkers: false });
-    const hostCapability = createTrustedGmailHostCapability({
-      plugin,
-      hostAttestedOfficialReadOnly: true
-    });
-    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability });
+    await connectReviewAndGrantGmail({ stateStore, plugin });
     const fetched = await fetchApprovedGmailReferences({
       message: "Process the approved synthetic Gmail reference",
       stateStore,
       plugin,
-      hostCapability,
       clock
     });
     assert.equal(fetched.gmail.connection.live, false);
@@ -1025,7 +1008,7 @@ test("Gmail live verification requires the host-bound capability plus explicit n
   await withFixture(async ({ stateStore }) => {
     const plugin = syntheticNonSimulatedGmailPlugin();
     const forgedCapability = Object.freeze({ kind: "trusted-gmail-host-capability" });
-    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability: forgedCapability });
+    await connectReviewAndGrantGmail({ stateStore, plugin });
     const fetched = await fetchApprovedGmailReferences({
       message: "Process the approved synthetic Gmail reference",
       stateStore,
@@ -1041,25 +1024,19 @@ test("Gmail live verification requires the host-bound capability plus explicit n
 
   await withFixture(async ({ stateStore }) => {
     const plugin = syntheticNonSimulatedGmailPlugin();
-    const hostCapability = createTrustedGmailHostCapability({
-      plugin,
-      hostAttestedOfficialReadOnly: true
-    });
-    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability });
+    await connectReviewAndGrantGmail({ stateStore, plugin });
     const fetched = await fetchApprovedGmailReferences({
       message: "Process the approved synthetic Gmail reference",
       stateStore,
       plugin,
-      hostCapability,
       clock
     });
-    assert.equal(fetched.gmail.connection.live, true);
-    assert.equal(fetched.gmail.connection.simulationOnly, false);
-    assert.equal(fetched.gmail.status, "live-and-verified");
+    assert.equal(fetched.gmail.connection.live, false);
+    assert.equal(fetched.gmail.connection.simulationOnly, true);
+    assert.notEqual(fetched.gmail.status, "live-and-verified");
     const handoff = await getSourceStatusHandoff({ stateStore });
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, true);
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors.length, 1);
-    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors[0].source, "gmail");
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
+    assert.deepEqual(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors, []);
   });
 });
 

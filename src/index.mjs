@@ -81,7 +81,6 @@ export {
   beginGmailConnection,
   beginGmailPrivacyReview,
   cancelGmailReadOnlyScope,
-  createTrustedGmailHostCapability,
   fetchApprovedGmailReferences,
   getGmailReadOnlyStatus,
   grantGmailReadOnlyScope,

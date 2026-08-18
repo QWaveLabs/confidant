@@ -72,16 +72,15 @@ The synthetic proof produced by `npm run proof:qwa-149` deliberately leaves
 an adapter-reported state, nor a caller-supplied evidence object can label a
 source as live.
 
-The gate can be satisfied only from linked persisted Gmail lifecycle evidence:
-a host-bound capability deliberately issued for an explicitly non-simulated
-read-only plugin instance, explicit `simulated: false` markers from both the
-connection and approved-page response, an `actualRead: true` page, its matching
-active granular QWA-139 permission, and a persisted approved-page audit with no
-body exposure. Missing markers and a caller-created capability lookalike fail
-closed as simulation. The focused tests exercise one synthetic positive
-capability path plus missing-marker and forged-capability negatives without
-network or Gmail access. Those tests are **not** live Gmail evidence and do not
-complete QWA-145's outstanding real Gmail verification.
+This candidate cannot satisfy the gate. Every injectable, synthetic, host-shaped,
+or caller-supplied plugin remains simulation-only, even when it reports
+`simulated: false` and `actualRead: true`. Persisted lifecycle shapes are also
+not accepted as live evidence. A future actual registered host-provider
+integration must supply separately reviewed trusted evidence outside this public
+API; it is intentionally absent here. The focused tests exercise missing-marker,
+lookalike, synthetic, and fabricated-persisted-shape negatives without network
+or Gmail access. Those tests are **not** live Gmail evidence and do not complete
+QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 

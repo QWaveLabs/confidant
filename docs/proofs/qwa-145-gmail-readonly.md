@@ -29,4 +29,4 @@ Result on this branch: **11 passing tests, 0 failures**. The black-box scenarios
 
 ## Remaining limitation
 
-This slice only supplies an injected connector contract and a simulation. An actual Gmail connection may be labeled `live-and-verified` only when an official host plugin returns a real read-only verification result (`actualRead: true`, `simulated: false`) after the saved Permission Grant exists. Clean-Mac/official-plugin verification remains a release-gate activity and has not been claimed here.
+This slice only supplies an injected connector contract and a simulation. No injected plugin can be labeled `live-and-verified` in this candidate, regardless of caller-controlled `actualRead` or `simulated` fields. A future registered host-provider integration must establish any real read-only verification outside this public API. Clean-Mac/official-plugin verification remains a release-gate activity and has not been claimed here.
