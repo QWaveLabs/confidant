@@ -34,10 +34,27 @@ local record becomes `needs-attention` with a durable revocation generation.
 It cannot be skipped, restarted, or granted again until revocation is
 confirmed. A concurrent revoke wins over a stale import response; the stale
 response returns no snapshot references and cannot overwrite the persisted
-revoked state. If the process exits after the durable `importing` checkpoint,
-the next process can recover that checkpoint by revoking the possible grant
-and narrowing the source back to a fresh metadata-only preview. Recovery does
-not replay the import or expose snapshot references.
+revoked state. When revoke overtakes an in-flight grant registration, the
+customer-visible result stays `needs-attention` until that registration has
+actually settled and a second adapter cleanup has been confirmed. If that
+post-registration cleanup fails, the durable result is
+`revocation-unconfirmed`, even while the simulated adapter still holds the
+grant; an explicit retry closes it before `revoked` can be shown. If the
+process exits after the durable `importing` checkpoint, the next process can
+recover that checkpoint by revoking the possible grant and narrowing the
+source back to a fresh metadata-only preview. Recovery does not replay the
+import or expose snapshot references.
+
+Gmail now saves the exact plugin grant identifier before activation. If the
+plugin accepts that identifier and a later generic/full-root save fails, the
+identifier remains a durable cleanup obligation. Gmail stays
+`needs-attention`; skip or revoke retries the plugin identifier, reconciles the
+linked generic grant, and only then presents `skipped` or `revoked`. Legacy
+generic grants are checkpointed without registering a duplicate, and a
+mismatched interrupted generation closes both possible plugin identifiers
+before local permission state is cleared. The same fail-closed rule applies
+when a provider reports external revocation but local/plugin cleanup cannot be
+confirmed.
 
 All full-root lifecycle writers in this candidate for Gmail, Google Drive, and
 iMessage use the same canonical, per-state-root re-entrant lock as the generic
@@ -56,18 +73,21 @@ an adapter-reported state, nor a caller-supplied evidence object can label a
 source as live.
 
 The gate can be satisfied only from linked persisted Gmail lifecycle evidence:
-a non-simulated `live-and-verified` read-only connection, its matching active
-granular QWA-139 permission, and a persisted non-simulated approved-page audit
-showing an actual read with no body exposure. The focused test constructs this
-combination with synthetic local state to prove the decision rule and then
-shows that a simulated plugin record downgrades it. That test is **not** live
-Gmail evidence, and it does not complete QWA-145's outstanding real Gmail
-verification.
+a host-bound capability deliberately issued for an explicitly non-simulated
+read-only plugin instance, explicit `simulated: false` markers from both the
+connection and approved-page response, an `actualRead: true` page, its matching
+active granular QWA-139 permission, and a persisted approved-page audit with no
+body exposure. Missing markers and a caller-created capability lookalike fail
+closed as simulation. The focused tests exercise one synthetic positive
+capability path plus missing-marker and forged-capability negatives without
+network or Gmail access. Those tests are **not** live Gmail evidence and do not
+complete QWA-145's outstanding real Gmail verification.
 
 ## Verified checks
 
-- `npm run test:qwa-149` — **20/20** focused checks passed.
-- `npm test` — **78/78** repository checks passed in this isolated candidate.
+- `npm run test:qwa-149` — **25/25** focused checks passed.
+- `npm run test:qwa-145` — **11/11** Gmail compatibility checks passed.
+- `npm test` — **83/83** repository checks passed in this isolated candidate.
 - `npm run proof:qwa-149` — generated a synthetic-only JSON proof with `bodyReads: 0`, `writeCalls: 0`, a labelled simulated snapshot, and an unsatisfied live-connector gate.
 
 ## Boundaries and limitations
@@ -76,7 +96,8 @@ verification.
 - No source bodies, customer records, attachments, links, staging data, or secrets are stored in this proof.
 - Unsupported sources receive a safe explanation instead of a made-up connection, link, or live status.
 - Final handoff and the Gmail, Drive, and iMessage status lookups use saved local lifecycle state only. A provider denial or cancellation remains unfinished with its exact authorization outcome; it is never silently presented as a customer skip.
-- Skipping Gmail first revokes both the connector/plugin grant and the linked generic permission. If the plugin needed to revoke the connector grant is unavailable, skip fails closed as `needs-attention` instead of hiding an active grant.
-- Google Calendar status projection is covered against the current-primary persisted lifecycle shape, but this older candidate branch does not contain the newer primary Calendar adapter. Additive integration must wrap Calendar's four full-root writers with the shared lock, add the persisted status getter, preserve the primary adapter, and rerun the integrated suite.
+- Skipping Gmail first revokes every durably tracked connector/plugin generation and the linked generic permission. If plugin cleanup is unavailable or interrupted, skip fails closed as `needs-attention` instead of hiding an active grant.
+- Google Calendar status projection is covered against the current-primary persisted lifecycle shape, but this older candidate branch does not contain the newer primary Calendar adapter. Additive integration must import `withSourcePermissionStateLock`, wrap `beginGoogleCalendarReview`, `grantGoogleCalendarContent`, `fetchApprovedGoogleCalendarContent`, and `revokeGoogleCalendarContent` under that canonical re-entrant root lock, add `getPersistedAdapterSourceStatus(...)` to `getGoogleCalendarStatus`, preserve the primary Calendar implementation and index exports, and rerun the integrated suite.
+- Primary integration must preserve QWA-148's stronger shared permission module and its exports. QWA-149's source-status and Gmail changes are additive dependencies; the older candidate permission file must not replace the QWA-148 primary version.
 - The canonical state lock coordinates aliases and nested calls only within one Node.js process. Separate processes can still race on the same JSON state root and require a later cross-process atomicity mechanism.
 - This is a status and simulated-export vertical slice, not a live connector release.

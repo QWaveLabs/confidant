@@ -18,7 +18,9 @@ import {
   beginGmailPrivacyReview,
   beginSimulatedExportPreview,
   buildSimulatedExportPermissionScope,
+  createTrustedGmailHostCapability,
   explainUnsupportedSource,
+  fetchApprovedGmailReferences,
   getGmailReadOnlyStatus,
   getGoogleDriveConnectionStatus,
   getIMessageBetaStatus,
@@ -69,17 +71,19 @@ function approvedGmailScope(gmail) {
   return scope;
 }
 
-async function connectReviewAndGrantGmail({ stateStore, plugin }) {
+async function connectReviewAndGrantGmail({ stateStore, plugin, hostCapability = null }) {
   await beginGmailConnection({
     message: "Connect Gmail to my second brain",
     stateStore,
     plugin,
+    hostCapability,
     clock
   });
   const review = await beginGmailPrivacyReview({
     message: "Review Gmail for my second brain",
     stateStore,
     plugin,
+    hostCapability,
     clock,
     reviewIdFactory: () => "gmail-review"
   });
@@ -87,11 +91,57 @@ async function connectReviewAndGrantGmail({ stateStore, plugin }) {
     message: "I approve the reviewed Gmail scope",
     stateStore,
     plugin,
+    hostCapability,
     scope: approvedGmailScope(review.gmail),
     clock,
     grantIdFactory: () => "gmail-grant"
   });
   return { review, granted };
+}
+
+function syntheticNonSimulatedGmailPlugin({ includeSimulationMarkers = true } = {}) {
+  const authorizedGrantIds = new Set();
+  const marker = includeSimulationMarkers ? { simulated: false } : {};
+  return {
+    isSimulation: false,
+    authorizedGrantIds,
+    async initiateReadOnlyConnection() {
+      return { status: "connected", readOnly: true, ...marker };
+    },
+    async discoverMetadata() {
+      return {
+        source: "gmail",
+        readOnly: true,
+        ...marker,
+        account: { id: "gmail-synthetic-host", label: "Synthetic host fixture" },
+        estimatedItemCount: 1,
+        paginationExpected: false,
+        items: [{ id: "synthetic-mail-001", area: "mail", timestamp: "2026-08-10T12:00:00.000Z" }]
+      };
+    },
+    async registerPermissionGrant({ grant }) {
+      authorizedGrantIds.add(grant.id);
+    },
+    async revokePermissionGrant({ grantId }) {
+      authorizedGrantIds.delete(grantId);
+    },
+    async fetchApprovedPage() {
+      return {
+        readOnly: true,
+        rawBodiesReturned: false,
+        actualRead: true,
+        ...marker,
+        records: [{
+          id: "synthetic-mail-001",
+          threadId: "synthetic-thread-001",
+          area: "mail",
+          category: "email",
+          timestamp: "2026-08-10T12:00:00.000Z"
+        }],
+        nextPageToken: null
+      };
+    }
+  };
 }
 
 async function withFixture(run, { language = "en", adapterOptions = {} } = {}) {
@@ -563,13 +613,94 @@ test("a durable revoke wins over a stale concurrent simulated grant registration
     await new Promise((resolve) => setImmediate(resolve));
     releaseRegistration();
 
-    const [discardedGrant, revoked] = await Promise.all([staleGrant, revoke]);
-    assert.equal(revoked.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
-    assert.notEqual(discardedGrant.sourceStatus.state, SOURCE_STATUS_STATES.READY_TO_IMPORT);
-    assert.notEqual(discardedGrant.sourceStatus.granularPermission.status, "active");
+    const [settledGrant, pendingRevoke] = await Promise.all([staleGrant, revoke]);
+    assert.equal(pendingRevoke.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(pendingRevoke.sourceStatus.granularPermission.status, "revocation-awaiting-registration");
+    assert.equal(pendingRevoke.sourceStatus.granularPermission.revocationConfirmed, false);
+    assert.equal(settledGrant.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+    assert.notEqual(settledGrant.sourceStatus.state, SOURCE_STATUS_STATES.READY_TO_IMPORT);
+    assert.notEqual(settledGrant.sourceStatus.granularPermission.status, "active");
     assert.equal(adapter.activeGrantIds.has("grant-race-grant"), false);
     const persisted = await getSourceStatus({ stateStore });
     assert.equal(persisted.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+  });
+});
+
+test("a revoke overtaking registration stays unconfirmed when post-registration cleanup fails and a retry closes the adapter grant", async () => {
+  await withFixture(async ({ stateStore, adapter }) => {
+    const preview = await beginSimulatedExportPreview({
+      message: "Preview a simulated export for my second brain",
+      stateStore,
+      adapter,
+      clock,
+      reviewIdFactory: () => "grant-cleanup-race-review"
+    });
+    const normalRegister = adapter.registerSnapshotPermission.bind(adapter);
+    const normalRevoke = adapter.revokeSnapshotPermission.bind(adapter);
+    let registrationStarted;
+    const registrationStartedPromise = new Promise((resolve) => { registrationStarted = resolve; });
+    let releaseRegistration;
+    const releaseRegistrationPromise = new Promise((resolve) => { releaseRegistration = resolve; });
+    adapter.registerSnapshotPermission = async (request) => {
+      registrationStarted();
+      await releaseRegistrationPromise;
+      return normalRegister(request);
+    };
+    let revocationAttempt = 0;
+    let initialRevocationCompleted;
+    const initialRevocationCompletedPromise = new Promise((resolve) => { initialRevocationCompleted = resolve; });
+    adapter.revokeSnapshotPermission = async (request) => {
+      revocationAttempt += 1;
+      if (revocationAttempt === 2) throw new Error("Synthetic post-registration cleanup interruption.");
+      const result = await normalRevoke(request);
+      if (revocationAttempt === 1) initialRevocationCompleted();
+      return result;
+    };
+
+    const staleGrant = grantSimulatedExportPermission({
+      message: "I approve this exact simulated export item",
+      stateStore,
+      adapter,
+      reviewId: "grant-cleanup-race-review",
+      scope: approvedScope(preview.sourceStatus),
+      clock,
+      grantIdFactory: () => "grant-cleanup-race-grant"
+    });
+    await registrationStartedPromise;
+    const revoke = revokeSimulatedExportPermission({
+      message: "Revoke this simulated export permission now",
+      stateStore: new FileStateStore(stateStore.filePath),
+      adapter,
+      reviewId: "grant-cleanup-race-review",
+      clock
+    });
+    await initialRevocationCompletedPromise;
+    releaseRegistration();
+
+    const [failedCleanup, pendingRevoke] = await Promise.all([staleGrant, revoke]);
+    assert.equal(pendingRevoke.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(failedCleanup.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(failedCleanup.sourceStatus.granularPermission.status, "revocation-unconfirmed");
+    assert.equal(failedCleanup.sourceStatus.granularPermission.revocationConfirmed, false);
+    assert.equal(failedCleanup.sourceStatus.lastSafeError.code, "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED");
+    assert.equal(adapter.activeGrantIds.has("grant-cleanup-race-grant"), true);
+
+    const persistedFailure = await getSourceStatus({ stateStore: new FileStateStore(stateStore.filePath) });
+    assert.equal(persistedFailure.sourceStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
+    assert.equal(persistedFailure.sourceStatus.granularPermission.revocationConfirmed, false);
+    assert.equal(persistedFailure.sourceStatus.nextAction.kind, "confirm-or-retry-simulated-export-revocation");
+
+    const retried = await revokeSimulatedExportPermission({
+      message: "Retry and confirm this simulated export revocation",
+      stateStore: new FileStateStore(stateStore.filePath),
+      adapter,
+      reviewId: "grant-cleanup-race-review",
+      clock
+    });
+    assert.equal(retried.sourceStatus.state, SOURCE_STATUS_STATES.REVOKED);
+    assert.equal(retried.sourceStatus.granularPermission.revocationConfirmed, true);
+    assert.equal(adapter.activeGrantIds.has("grant-cleanup-race-grant"), false);
+    assert.equal(revocationAttempt, 3);
   });
 });
 
@@ -684,6 +815,128 @@ test("skipping Gmail fails closed without its plugin and revokes both generic an
   });
 });
 
+test("a Gmail plugin grant survives a generic save failure only as a durable cleanup obligation and skip retries that exact identifier", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const plugin = gmailPluginFixture();
+    await beginGmailConnection({
+      message: "Connect Gmail to my second brain",
+      stateStore,
+      plugin,
+      clock
+    });
+    const review = await beginGmailPrivacyReview({
+      message: "Review Gmail for my second brain",
+      stateStore,
+      plugin,
+      clock,
+      reviewIdFactory: () => "gmail-save-failure-review"
+    });
+
+    const normalRevoke = plugin.revokePermissionGrant.bind(plugin);
+    let revocationAttempt = 0;
+    plugin.revokePermissionGrant = async (request) => {
+      revocationAttempt += 1;
+      if (revocationAttempt === 1) throw new Error("Synthetic Gmail cleanup interruption.");
+      return normalRevoke(request);
+    };
+    let failNextActivatedSave = true;
+    const failureStore = {
+      filePath: stateStore.filePath,
+      load: () => stateStore.load(),
+      async save(value) {
+        if (failNextActivatedSave && plugin.authorizedGrantIds.has("gmail-save-failure-grant")) {
+          failNextActivatedSave = false;
+          const error = new Error("Synthetic durable generic grant save interruption.");
+          error.code = "SYNTHETIC_GENERIC_SAVE_FAILED";
+          throw error;
+        }
+        return stateStore.save(value);
+      }
+    };
+
+    const failed = await grantGmailReadOnlyScope({
+      message: "I approve the reviewed Gmail scope",
+      stateStore: failureStore,
+      plugin,
+      scope: approvedGmailScope(review.gmail),
+      clock,
+      grantIdFactory: () => "gmail-save-failure-grant"
+    });
+    assert.equal(failed.recoverable, true);
+    assert.equal(failed.gmail.status, "needs-attention");
+    assert.equal(failed.gmail.grantLifecycle.status, "revocation-unconfirmed");
+    assert.equal(failed.gmail.grantLifecycle.revocationConfirmed, false);
+    assert.equal(failed.gmail.permissionReview?.activeGrant ?? null, null);
+    assert.equal(plugin.authorizedGrantIds.has("gmail-save-failure-grant"), true);
+
+    const persistedFailure = await stateStore.load();
+    assert.equal(persistedFailure.gmailReadOnlyLifecycle.entry.grantActivation.grantId, "gmail-save-failure-grant");
+    assert.equal(persistedFailure.gmailReadOnlyLifecycle.entry.grantActivation.status, "revocation-unconfirmed");
+    assert.equal(persistedFailure.gmailReadOnlyLifecycle.entry.grantActivation.revocationConfirmed, false);
+
+    const skipped = await skipGmailConnection({
+      message: "Retry the saved Gmail cleanup and skip Gmail",
+      stateStore: new FileStateStore(stateStore.filePath),
+      plugin,
+      clock
+    });
+    assert.equal(skipped.gmail.status, "skipped");
+    assert.equal(skipped.gmail.grantLifecycle.status, "revoked");
+    assert.equal(skipped.gmail.grantLifecycle.revocationConfirmed, true);
+    assert.equal(plugin.authorizedGrantIds.has("gmail-save-failure-grant"), false);
+    assert.equal(revocationAttempt, 2);
+    const persistedSkip = await stateStore.load();
+    assert.equal(persistedSkip.gmailReadOnlyLifecycle.entry.status, "skipped");
+    assert.equal(persistedSkip.gmailReadOnlyLifecycle.entry.grantActivation.revocationConfirmed, true);
+  });
+});
+
+test("legacy and mismatched Gmail grant generations are migrated without duplication and both close before skip", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const plugin = gmailPluginFixture();
+    const { review } = await connectReviewAndGrantGmail({ stateStore, plugin });
+    const beforeMigrationCalls = plugin.grantRegistrationCalls;
+    const legacyState = await stateStore.load();
+    delete legacyState.gmailReadOnlyLifecycle.entry.grantActivation;
+    await stateStore.save(legacyState);
+
+    const migrated = await grantGmailReadOnlyScope({
+      message: "I approve the same reviewed Gmail scope",
+      stateStore: new FileStateStore(stateStore.filePath),
+      plugin,
+      scope: approvedGmailScope(review.gmail),
+      clock,
+      grantIdFactory: () => "gmail-must-not-duplicate"
+    });
+    assert.equal(migrated.gmail.grantLifecycle.status, "active");
+    assert.equal(plugin.grantRegistrationCalls, beforeMigrationCalls);
+    assert.equal(plugin.authorizedGrantIds.has("gmail-grant"), true);
+    assert.equal(plugin.authorizedGrantIds.has("gmail-must-not-duplicate"), false);
+
+    const mismatchedState = await stateStore.load();
+    mismatchedState.gmailReadOnlyLifecycle.entry.grantActivation = {
+      status: "revocation-unconfirmed",
+      grantId: "gmail-orphan-generation",
+      reviewId: "gmail-review",
+      revocationConfirmed: false,
+      updatedAt: clock.now().toISOString()
+    };
+    plugin.authorizedGrantIds.add("gmail-orphan-generation");
+    await stateStore.save(mismatchedState);
+
+    const skipped = await skipGmailConnection({
+      message: "Close every saved Gmail grant generation and skip Gmail",
+      stateStore: new FileStateStore(stateStore.filePath),
+      plugin,
+      clock
+    });
+    assert.equal(skipped.gmail.status, "skipped");
+    assert.equal(plugin.authorizedGrantIds.has("gmail-orphan-generation"), false);
+    assert.equal(plugin.authorizedGrantIds.has("gmail-grant"), false);
+    assert.equal(plugin.grantRevocationCalls, 2);
+  });
+});
+
 test("trusted persisted Gmail readback satisfies the live gate while primary Calendar state is projected additively", async () => {
   await withFixture(async ({ stateStore }) => {
     const plugin = gmailPluginFixture();
@@ -693,6 +946,7 @@ test("trusted persisted Gmail readback satisfies the live gate while primary Cal
     gmail.status = "live-and-verified";
     gmail.plugin.status = "connected";
     gmail.plugin.simulated = false;
+    gmail.plugin.hostAttested = true;
     gmail.connection.state = "live-and-verified";
     gmail.connection.live = true;
     gmail.connection.readOnly = true;
@@ -744,6 +998,98 @@ test("trusted persisted Gmail readback satisfies the live gate while primary Cal
     assert.equal(downgraded.sourceStatusHandoff.releaseGate.satisfied, false);
     assert.equal(downgradedGmail.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(downgradedGmail.connection.live, false);
+  });
+});
+
+test("Gmail live verification requires the host-bound capability plus explicit non-simulation markers", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const plugin = syntheticNonSimulatedGmailPlugin({ includeSimulationMarkers: false });
+    const hostCapability = createTrustedGmailHostCapability({
+      plugin,
+      hostAttestedOfficialReadOnly: true
+    });
+    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability });
+    const fetched = await fetchApprovedGmailReferences({
+      message: "Process the approved synthetic Gmail reference",
+      stateStore,
+      plugin,
+      hostCapability,
+      clock
+    });
+    assert.equal(fetched.gmail.connection.live, false);
+    assert.equal(fetched.gmail.connection.simulationOnly, true);
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
+  });
+
+  await withFixture(async ({ stateStore }) => {
+    const plugin = syntheticNonSimulatedGmailPlugin();
+    const forgedCapability = Object.freeze({ kind: "trusted-gmail-host-capability" });
+    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability: forgedCapability });
+    const fetched = await fetchApprovedGmailReferences({
+      message: "Process the approved synthetic Gmail reference",
+      stateStore,
+      plugin,
+      hostCapability: forgedCapability,
+      clock
+    });
+    assert.equal(fetched.gmail.connection.live, false);
+    assert.equal(fetched.gmail.connection.simulationOnly, true);
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, false);
+  });
+
+  await withFixture(async ({ stateStore }) => {
+    const plugin = syntheticNonSimulatedGmailPlugin();
+    const hostCapability = createTrustedGmailHostCapability({
+      plugin,
+      hostAttestedOfficialReadOnly: true
+    });
+    await connectReviewAndGrantGmail({ stateStore, plugin, hostCapability });
+    const fetched = await fetchApprovedGmailReferences({
+      message: "Process the approved synthetic Gmail reference",
+      stateStore,
+      plugin,
+      hostCapability,
+      clock
+    });
+    assert.equal(fetched.gmail.connection.live, true);
+    assert.equal(fetched.gmail.connection.simulationOnly, false);
+    assert.equal(fetched.gmail.status, "live-and-verified");
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.satisfied, true);
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors.length, 1);
+    assert.equal(handoff.sourceStatusHandoff.releaseGate.verifiedLiveConnectors[0].source, "gmail");
+  });
+});
+
+test("an explicit Gmail skip overrides an earlier cancelled authorization in the persisted handoff", async () => {
+  await withFixture(async ({ stateStore }) => {
+    const plugin = new SimulatedGmailPlugin({
+      account: { id: "gmail-cancelled", label: "Cancelled fixture" },
+      connectionResults: ["cancelled"],
+      pages: []
+    });
+    const cancelled = await beginGmailConnection({
+      message: "Connect Gmail to my second brain",
+      stateStore,
+      plugin,
+      clock
+    });
+    assert.equal(cancelled.gmail.plugin.status, "cancelled");
+
+    const skipped = await skipGmailConnection({
+      message: "Skip Gmail for now",
+      stateStore,
+      clock
+    });
+    assert.equal(skipped.gmail.status, "skipped");
+
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    const gmail = handoff.sourceStatusHandoff.sources.find((source) => source.source.adapter === "gmail-readonly");
+    assert.equal(gmail.state, SOURCE_STATUS_STATES.SKIPPED);
+    assert.equal(gmail.handoffCategory, SOURCE_HANDOFF_CATEGORIES.SKIPPED);
+    assert.equal(gmail.authorizationOutcome, null);
   });
 });
 

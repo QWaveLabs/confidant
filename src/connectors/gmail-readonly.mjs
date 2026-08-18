@@ -8,6 +8,8 @@
  * refuses to expose message bodies, snippets, headers, or raw payloads.
  */
 
+import { randomUUID } from "node:crypto";
+
 import {
   beginSourcePermissionReview,
   denySourcePermission,
@@ -37,6 +39,30 @@ const BODY_FIELD_NAMES = new Set([
   "mime",
   "attachments"
 ]);
+const trustedGmailHostCapabilities = new WeakMap();
+
+/**
+ * The desktop composition root must deliberately bind the official read-only
+ * plugin instance before any response can be considered non-simulated. Plugin
+ * fields and caller-created lookalike objects are not capabilities.
+ */
+export function createTrustedGmailHostCapability({
+  plugin,
+  hostAttestedOfficialReadOnly = false
+} = {}) {
+  if (!plugin || (typeof plugin !== "object" && typeof plugin !== "function")
+    || plugin.isSimulation !== false
+    || hostAttestedOfficialReadOnly !== true) {
+    throw new TypeError("A host-attested, explicitly non-simulated Gmail plugin is required.");
+  }
+  const capability = Object.freeze({ kind: "trusted-gmail-host-capability" });
+  trustedGmailHostCapabilities.set(capability, plugin);
+  return capability;
+}
+
+function hasTrustedGmailHostCapability(plugin, capability) {
+  return Boolean(capability && trustedGmailHostCapabilities.get(capability) === plugin);
+}
 
 export const GMAIL_CONNECTION_STATES = Object.freeze({
   SELECTED_BUT_UNFINISHED: "selected-but-unfinished",
@@ -271,7 +297,15 @@ function newEntry(now) {
     plugin: {
       status: "not-started",
       attempts: 0,
-      simulated: null
+      simulated: null,
+      hostAttested: false
+    },
+    grantActivation: {
+      status: "not-started",
+      grantId: null,
+      reviewId: null,
+      revocationConfirmed: null,
+      updatedAt: now
     },
     connection: {
       readOnly: true,
@@ -310,6 +344,24 @@ function requireEntry(state) {
     );
   }
   return entry;
+}
+
+function grantActivation(entry, clock) {
+  if (!entry.grantActivation || typeof entry.grantActivation !== "object") {
+    entry.grantActivation = {
+      status: "not-started",
+      grantId: null,
+      reviewId: null,
+      revocationConfirmed: null,
+      updatedAt: isoNow(clock)
+    };
+  }
+  return entry.grantActivation;
+}
+
+function activationMayRemainActive(entry) {
+  return ["pending", "active", "revocation-pending", "revocation-unconfirmed"]
+    .includes(grantActivation(entry).status);
 }
 
 function setFailure(state, entry, { code, stage, clock, language = "en", externalRevocation = false }) {
@@ -362,7 +414,13 @@ function publicView(entry, language, permissionReview = null) {
     },
     plugin: {
       status: entry.plugin.status,
-      simulated: entry.plugin.simulated === true
+      simulated: entry.plugin.simulated === true,
+      hostAttested: entry.plugin.hostAttested === true
+    },
+    grantLifecycle: {
+      status: grantActivation(entry).status,
+      cleanupRequired: activationMayRemainActive(entry),
+      revocationConfirmed: grantActivation(entry).revocationConfirmed === true
     },
     account: entry.accountId ? { context: `gmail:${entry.accountId}` } : null,
     import: {
@@ -394,8 +452,10 @@ function assertPluginMethod(plugin, method, message) {
   }
 }
 
-function pluginIsSimulated(plugin, result = {}) {
-  return plugin?.isSimulation === true || result?.simulated === true;
+function pluginIsSimulated(plugin, result = {}, hostCapability = null) {
+  return !hasTrustedGmailHostCapability(plugin, hostCapability)
+    || plugin?.isSimulation !== false
+    || result?.simulated !== false;
 }
 
 function normalizeMetadataResult(result) {
@@ -432,7 +492,7 @@ function normalizeMetadataResult(result) {
   };
 }
 
-function normalizePageResult(result, { accountId, plugin, grant }) {
+function normalizePageResult(result, { accountId, plugin, grant, hostCapability }) {
   if (!result || typeof result !== "object") {
     throw new GmailReadOnlyError("GMAIL_PAGE_INVALID", "Gmail did not return a safe approved page, so I stopped before exposing source data.");
   }
@@ -443,7 +503,7 @@ function normalizePageResult(result, { accountId, plugin, grant }) {
     throw new GmailReadOnlyError("GMAIL_BODY_BOUNDARY_VIOLATION", "Gmail did not preserve the read-only source-body boundary, so I stopped before exposing source data.");
   }
   assertNoBodyFields(result, "approved-page response");
-  const simulated = pluginIsSimulated(plugin, result);
+  const simulated = pluginIsSimulated(plugin, result, hostCapability);
   if (!simulated && result.actualRead !== true) {
     throw new GmailReadOnlyError("GMAIL_ACTUAL_READ_NOT_PROVEN", "Gmail did not prove a real, read-only read, so I will not label it as live.");
   }
@@ -474,8 +534,9 @@ function normalizePageResult(result, { accountId, plugin, grant }) {
  * approved page; lifecycle code persists the checkpoint between pages.
  */
 export class GmailReadOnlyConnector {
-  constructor({ plugin, pageToken = null, pageSize = 50 } = {}) {
+  constructor({ plugin, hostCapability = null, pageToken = null, pageSize = 50 } = {}) {
     this.plugin = plugin;
+    this.hostCapability = hostCapability;
     this.pageToken = opaqueIdentifier(pageToken, "page checkpoint", { nullable: true });
     this.pageSize = Number.isSafeInteger(pageSize) && pageSize > 0 && pageSize <= 100 ? pageSize : 50;
     this.lastMetadata = null;
@@ -519,7 +580,7 @@ export class GmailReadOnlyConnector {
         pageToken: this.pageToken,
         pageSize: this.pageSize
       }),
-      { accountId, plugin: this.plugin, grant }
+      { accountId, plugin: this.plugin, grant, hostCapability: this.hostCapability }
     );
     this.lastPage = page;
     return {
@@ -562,7 +623,7 @@ function validateConnectionResult(result) {
  * function it gives exactly one in-app fallback action and performs no source
  * access. A successful plugin connection still is not a live verification.
  */
-async function beginGmailConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
+async function beginGmailConnectionInternal({ message, stateStore, plugin, hostCapability, language, clock } = {}) {
   assertNaturalLanguage(message, "start");
   const state = await loadState(stateStore);
   const entry = prepareFreshEntry(state, clock);
@@ -588,7 +649,8 @@ async function beginGmailConnectionInternal({ message, stateStore, plugin, langu
       const result = await plugin.initiateReadOnlyConnection({ source: SOURCE, purpose: "Start a Gmail metadata-only review after customer request." });
       const connectionStatus = validateConnectionResult(result);
       entry.plugin.status = connectionStatus;
-      entry.plugin.simulated = pluginIsSimulated(plugin, result);
+      entry.plugin.hostAttested = hasTrustedGmailHostCapability(plugin, hostCapability);
+      entry.plugin.simulated = pluginIsSimulated(plugin, result, hostCapability);
       entry.connection.simulationOnly = entry.plugin.simulated === true;
       if (connectionStatus === "connected") {
         entry.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
@@ -622,7 +684,7 @@ export async function beginGmailConnection(args = {}) {
 }
 
 /** Runs the QWA-139 metadata-only preflight after a saved Gmail plugin connection. */
-async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, language, clock, reviewIdFactory } = {}) {
+async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, hostCapability, language, clock, reviewIdFactory } = {}) {
   assertNaturalLanguage(message, "start");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -635,7 +697,7 @@ async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, la
     return { gmail: publicView(entry, locale) };
   }
 
-  const connector = new GmailReadOnlyConnector({ plugin });
+  const connector = new GmailReadOnlyConnector({ plugin, hostCapability });
   try {
     const review = await beginSourcePermissionReview({
       message,
@@ -679,7 +741,7 @@ export async function beginGmailPrivacyReview(args = {}) {
 }
 
 /** Saves a granular QWA-139 grant; it does not read Gmail itself. */
-async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, scope, language, clock, grantIdFactory } = {}) {
+async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, hostCapability, scope, language, clock, grantIdFactory } = {}) {
   assertNaturalLanguage(message, "grant");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -687,7 +749,95 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
   if (!entry.accountId || !entry.reviewId || entry.status === GMAIL_CONNECTION_STATES.REVOKED) {
     throw new GmailReadOnlyError("GMAIL_REVIEW_REQUIRED", "Complete the saved Gmail metadata review before approving content access.");
   }
-  const connector = new GmailReadOnlyConnector({ plugin });
+  const existingPermission = await getSourcePermissionStatus({
+    stateStore,
+    source: SOURCE,
+    accountId: entry.accountId,
+    language: locale
+  });
+  const activation = grantActivation(entry, clock);
+  if (activation.status === "active"
+    && existingPermission?.permissionReview?.activeGrant?.grantId === activation.grantId) {
+    return { gmail: publicView(entry, locale, existingPermission.permissionReview) };
+  }
+  if (existingPermission?.permissionReview?.activeGrant && activation.status === "not-started") {
+    // Upgrade an earlier persisted generic grant into the durable Gmail
+    // activation record without minting or registering a second identifier.
+    entry.grantActivation = {
+      status: "active",
+      grantId: existingPermission.permissionReview.activeGrant.grantId,
+      reviewId: entry.reviewId,
+      revocationConfirmed: false,
+      updatedAt: isoNow(clock)
+    };
+    entry.import.status = "ready-to-verify";
+    entry.pendingAction = null;
+    entry.lastSafeError = null;
+    entry.audit.push({
+      type: "gmail-existing-grant-activation-checkpoint-migrated",
+      at: isoNow(clock),
+      reviewId: entry.reviewId,
+      bodiesExposed: false
+    });
+    await stateStore.save(initial);
+    return { gmail: publicView(entry, locale, existingPermission.permissionReview) };
+  }
+  if (existingPermission?.permissionReview?.activeGrant) {
+    setFailure(initial, entry, {
+      code: "GMAIL_GRANT_GENERATION_MISMATCH",
+      stage: "grant-recovery",
+      clock,
+      language: locale
+    });
+    await stateStore.save(initial);
+    return { gmail: publicView(entry, locale, existingPermission.permissionReview), recoverable: true };
+  }
+  if (activationMayRemainActive(entry)) {
+    setFailure(initial, entry, {
+      code: "GMAIL_GRANT_CLEANUP_REQUIRED",
+      stage: "grant-recovery",
+      clock,
+      language: locale
+    });
+    await stateStore.save(initial);
+    return { gmail: publicView(entry, locale, existingPermission?.permissionReview), recoverable: true };
+  }
+
+  const durableGrantId = opaqueIdentifier(
+    (grantIdFactory ?? (() => `permission-grant-${randomUUID()}`))(),
+    "permission grant"
+  );
+  const activationStartedAt = isoNow(clock);
+  entry.grantActivation = {
+    status: "pending",
+    grantId: durableGrantId,
+    reviewId: entry.reviewId,
+    revocationConfirmed: false,
+    updatedAt: activationStartedAt
+  };
+  entry.audit.push({
+    type: "gmail-grant-activation-checkpoint-saved",
+    at: activationStartedAt,
+    reviewId: entry.reviewId,
+    bodiesExposed: false
+  });
+  try {
+    // The adapter receives only an identifier that was already durably saved.
+    // If any later full-root save fails, recovery can still revoke this exact
+    // plugin-side activation instead of losing its identity.
+    await stateStore.save(initial);
+  } catch (error) {
+    setFailure(initial, entry, {
+      code: safeErrorCode(error, "GMAIL_GRANT_CHECKPOINT_SAVE_FAILED"),
+      stage: "grant-checkpoint",
+      clock,
+      language: locale
+    });
+    return { gmail: publicView(entry, locale, existingPermission?.permissionReview), recoverable: true };
+  }
+
+  const connector = new GmailReadOnlyConnector({ plugin, hostCapability });
+  let cleanupGrantId = durableGrantId;
   try {
     const granted = await grantSourcePermission({
       message,
@@ -699,10 +849,19 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
       scope,
       language: locale,
       clock,
-      grantIdFactory
+      grantIdFactory: () => durableGrantId
     });
     const state = await loadState(stateStore);
     const updated = requireEntry(state);
+    const activeGrantId = granted.permissionReview?.activeGrant?.grantId ?? durableGrantId;
+    cleanupGrantId = activeGrantId;
+    updated.grantActivation = {
+      status: "active",
+      grantId: activeGrantId,
+      reviewId: updated.reviewId,
+      revocationConfirmed: false,
+      updatedAt: isoNow(clock)
+    };
     updated.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.connection.state = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.import.status = "ready-to-verify";
@@ -712,11 +871,40 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
     await stateStore.save(state);
     return { gmail: publicView(updated, locale, granted.permissionReview) };
   } catch (error) {
+    const cleanup = await deactivatePersistedGmailGrant({
+      stateStore,
+      plugin,
+      accountId: entry.accountId,
+      reviewId: entry.reviewId,
+      grantId: cleanupGrantId,
+      language: locale,
+      clock
+    });
     const state = await loadState(stateStore);
     const updated = requireEntry(state);
-    setFailure(state, updated, { code: safeErrorCode(error, "GMAIL_GRANT_FAILED"), stage: "grant", clock, language: locale });
+    updated.grantActivation = {
+      status: cleanup.confirmed ? "revoked-after-failure" : "revocation-unconfirmed",
+      grantId: cleanupGrantId,
+      reviewId: entry.reviewId,
+      revocationConfirmed: cleanup.confirmed,
+      updatedAt: isoNow(clock)
+    };
+    setFailure(state, updated, {
+      code: cleanup.confirmed
+        ? safeErrorCode(error, "GMAIL_GRANT_FAILED")
+        : "GMAIL_GRANT_REVOCATION_UNCONFIRMED",
+      stage: cleanup.confirmed ? "grant" : "grant-cleanup",
+      clock,
+      language: locale
+    });
+    updated.audit.push({
+      type: cleanup.confirmed ? "gmail-failed-grant-cleanup-confirmed" : "gmail-failed-grant-cleanup-unconfirmed",
+      at: isoNow(clock),
+      reviewId: entry.reviewId,
+      bodiesExposed: false
+    });
     await stateStore.save(state);
-    return { gmail: publicView(updated, locale), recoverable: true };
+    return { gmail: publicView(updated, locale, cleanup.permissionReview), recoverable: true };
   }
 }
 
@@ -798,34 +986,150 @@ const LOCAL_GMAIL_GRANT_REVOCATION_CONNECTOR = Object.freeze({
   }
 });
 
-async function synchronizeExternalRevocation({ stateStore, plugin, entry, language, clock }) {
-  if (!entry.accountId || !entry.reviewId) return;
-  const request = {
-    message: language === "es" ? "Revocar el permiso guardado de Gmail" : "Revoke the saved Gmail permission",
-    stateStore,
-    source: SOURCE,
-    accountId: entry.accountId,
-    reviewId: entry.reviewId,
-    language,
-    clock
-  };
+/**
+ * Closes the plugin-side identifier first, then reconciles the generic local
+ * grant if it was durably saved. Success means both boundaries were observed
+ * closed; an exception or unverifiable readback remains retryable and is never
+ * presented as confirmed revocation.
+ */
+async function deactivatePersistedGmailGrant({
+  stateStore,
+  plugin,
+  accountId,
+  reviewId,
+  grantId,
+  language,
+  clock
+}) {
+  if (!plugin || typeof plugin.revokePermissionGrant !== "function" || typeof grantId !== "string") {
+    return { confirmed: false, permissionReview: null, code: "GMAIL_PLUGIN_REVOCATION_REQUIRED" };
+  }
+
   try {
-    await revokeSourcePermission({
-      connector: new GmailReadOnlyConnector({ plugin }),
-      ...request
-    });
-  } catch {
+    await plugin.revokePermissionGrant({ grantId });
+  } catch (error) {
+    return {
+      confirmed: false,
+      permissionReview: null,
+      code: safeErrorCode(error, "GMAIL_PLUGIN_REVOCATION_FAILED")
+    };
+  }
+
+  if (!accountId || !reviewId) {
+    return { confirmed: true, permissionReview: null, code: null };
+  }
+
+  let current;
+  try {
+    current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  } catch (error) {
+    return {
+      confirmed: false,
+      permissionReview: null,
+      code: safeErrorCode(error, "GMAIL_LOCAL_REVOCATION_READBACK_FAILED")
+    };
+  }
+
+  if (current?.permissionReview?.activeGrant
+    && current.permissionReview.activeGrant.grantId !== grantId) {
     try {
-      await revokeSourcePermission({
-        connector: LOCAL_GMAIL_GRANT_REVOCATION_CONNECTOR,
-        ...request
+      // Both identifiers can be real after an interrupted migration. Close
+      // the generic generation too; never clear its local record after only
+      // revoking the separately checkpointed plugin generation.
+      await plugin.revokePermissionGrant({
+        grantId: current.permissionReview.activeGrant.grantId
       });
-    } catch {
-      // The Gmail wrapper remains fail-closed even if its generic local state
-      // was already absent or could not be inspected. Its own entry is still
-      // reset before another review can begin.
+    } catch (error) {
+      return {
+        confirmed: false,
+        permissionReview: current.permissionReview,
+        code: safeErrorCode(error, "GMAIL_GRANT_GENERATION_MISMATCH")
+      };
     }
   }
+
+  if (current?.permissionReview?.activeGrant) {
+    try {
+      await revokeSourcePermission({
+        message: language === "es" ? "Revocar el permiso guardado de Gmail" : "Revoke the saved Gmail permission",
+        stateStore,
+        connector: LOCAL_GMAIL_GRANT_REVOCATION_CONNECTOR,
+        source: SOURCE,
+        accountId,
+        reviewId,
+        language,
+        clock
+      });
+    } catch (error) {
+      // A save can fail after the in-memory transition. Always read the
+      // durable state again rather than inferring success from the exception.
+      let afterFailure = null;
+      try {
+        afterFailure = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+      } catch {
+        // The caller will retain the identifier as revocation-unconfirmed.
+      }
+      if (afterFailure?.permissionReview?.activeGrant) {
+        return {
+          confirmed: false,
+          permissionReview: afterFailure.permissionReview,
+          code: safeErrorCode(error, "GMAIL_LOCAL_REVOCATION_FAILED")
+        };
+      }
+      if (!afterFailure) {
+        return {
+          confirmed: false,
+          permissionReview: null,
+          code: safeErrorCode(error, "GMAIL_LOCAL_REVOCATION_READBACK_FAILED")
+        };
+      }
+    }
+  }
+
+  try {
+    const after = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    return {
+      confirmed: !after?.permissionReview?.activeGrant,
+      permissionReview: after?.permissionReview ?? null,
+      code: after?.permissionReview?.activeGrant ? "GMAIL_LOCAL_REVOCATION_UNCONFIRMED" : null
+    };
+  } catch (error) {
+    return {
+      confirmed: false,
+      permissionReview: null,
+      code: safeErrorCode(error, "GMAIL_LOCAL_REVOCATION_READBACK_FAILED")
+    };
+  }
+}
+
+async function synchronizeExternalRevocation({ stateStore, plugin, entry, language, clock }) {
+  if (!entry.accountId || !entry.reviewId) return { confirmed: true, permissionReview: null, grantId: null };
+  let permission = null;
+  try {
+    permission = await getSourcePermissionStatus({
+      stateStore,
+      source: SOURCE,
+      accountId: entry.accountId,
+      language
+    });
+  } catch {
+    return { confirmed: false, permissionReview: null, grantId: null, code: "GMAIL_LOCAL_REVOCATION_READBACK_FAILED" };
+  }
+  const activation = grantActivation(entry, clock);
+  const grantId = (activationMayRemainActive(entry) ? activation.grantId : null)
+    ?? permission?.permissionReview?.activeGrant?.grantId
+    ?? null;
+  if (!grantId) return { confirmed: true, permissionReview: permission?.permissionReview ?? null, grantId: null };
+  const cleanup = await deactivatePersistedGmailGrant({
+    stateStore,
+    plugin,
+    accountId: entry.accountId,
+    reviewId: entry.reviewId,
+    grantId,
+    language,
+    clock
+  });
+  return { ...cleanup, grantId };
 }
 
 /**
@@ -833,7 +1137,7 @@ async function synchronizeExternalRevocation({ stateStore, plugin, entry, langua
  * Each page is committed as a checkpoint, so a later interruption resumes from
  * the exact next opaque page token instead of restarting a large account.
  */
-async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugin, language, clock, maxPages } = {}) {
+async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugin, hostCapability, language, clock, maxPages } = {}) {
   assertNaturalLanguage(message, "fetch");
   const budget = pageBudget(maxPages);
   let state = await loadState(stateStore);
@@ -850,7 +1154,7 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
   const newlyProcessed = [];
   for (let pageIndex = 0; pageIndex < budget; pageIndex += 1) {
     const currentCheckpoint = entry.import.nextPageToken ?? "initial";
-    const connector = new GmailReadOnlyConnector({ plugin, pageToken: entry.import.nextPageToken });
+    const connector = new GmailReadOnlyConnector({ plugin, hostCapability, pageToken: entry.import.nextPageToken });
     let fetched;
     try {
       if (pageCheckpointHistory(entry).includes(currentCheckpoint)) {
@@ -872,17 +1176,31 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
       pageMatchesGenericBoundary(connector.lastPage, fetched.approvedRecords);
     } catch (error) {
       const code = safeErrorCode(error, "GMAIL_FETCH_FAILED");
+      let externalCleanup = null;
       if (code === "GMAIL_ACCESS_REVOKED") {
-        await synchronizeExternalRevocation({ stateStore, plugin, entry, language: locale, clock });
+        externalCleanup = await synchronizeExternalRevocation({ stateStore, plugin, entry, language: locale, clock });
       }
       const refreshed = await loadState(stateStore);
       const updated = requireEntry(refreshed);
+      if (code === "GMAIL_ACCESS_REVOKED") {
+        updated.grantActivation = {
+          status: externalCleanup?.confirmed ? "revoked" : "revocation-unconfirmed",
+          grantId: externalCleanup?.grantId ?? grantActivation(updated, clock).grantId,
+          reviewId: updated.reviewId,
+          revocationConfirmed: externalCleanup?.confirmed === true,
+          updatedAt: isoNow(clock)
+        };
+      }
       setFailure(refreshed, updated, {
-        code,
-        stage: "approved-read",
+        code: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed !== true
+          ? "GMAIL_EXTERNAL_REVOCATION_RECONCILIATION_FAILED"
+          : code,
+        stage: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed !== true
+          ? "external-revocation-cleanup"
+          : "approved-read",
         clock,
         language: locale,
-        externalRevocation: code === "GMAIL_ACCESS_REVOKED"
+        externalRevocation: code === "GMAIL_ACCESS_REVOKED" && externalCleanup?.confirmed === true
       });
       await stateStore.save(refreshed);
       const permission = updated.accountId ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: updated.accountId, language: locale }) : null;
@@ -948,42 +1266,69 @@ export async function fetchApprovedGmailReferences(args = {}) {
 /** Revokes only the persisted local grant; it cannot change any Gmail message. */
 async function revokeGmailReadOnlyConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
   assertNaturalLanguage(message, "revoke");
-  const initial = await loadState(stateStore);
-  const entry = requireEntry(initial);
-  const locale = languageFor(initial, language);
+  let state = await loadState(stateStore);
+  let entry = requireEntry(state);
+  const locale = languageFor(state, language);
   if (!entry.accountId || !entry.reviewId) {
     throw new GmailReadOnlyError("GMAIL_REVIEW_REQUIRED", "There is no saved Gmail permission to revoke yet.");
   }
-  const connector = new GmailReadOnlyConnector({ plugin });
-  try {
-    const revoked = await revokeSourcePermission({
-      message,
-      stateStore,
-      connector,
-      source: SOURCE,
-      accountId: entry.accountId,
-      reviewId: entry.reviewId,
-      language: locale,
-      clock
-    });
-    const state = await loadState(stateStore);
-    const updated = requireEntry(state);
-    updated.status = GMAIL_CONNECTION_STATES.REVOKED;
-    updated.connection.state = GMAIL_CONNECTION_STATES.REVOKED;
-    updated.connection.live = false;
-    updated.import.status = "revoked";
-    updated.import.nextPageToken = null;
-    updated.pendingAction = null;
-    updated.audit.push({ type: "gmail-read-only-grant-revoked", at: isoNow(clock), reviewId: updated.reviewId, bodiesExposed: false });
-    await stateStore.save(state);
-    return { gmail: publicView(updated, locale, revoked.permissionReview) };
-  } catch (error) {
-    const state = await loadState(stateStore);
-    const updated = requireEntry(state);
-    setFailure(state, updated, { code: safeErrorCode(error, "GMAIL_REVOCATION_FAILED"), stage: "revocation", clock, language: locale });
-    await stateStore.save(state);
-    return { gmail: publicView(updated, locale), recoverable: true };
+  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
+  const activeGrant = permission?.permissionReview?.activeGrant;
+  const activation = grantActivation(entry, clock);
+  const grantId = (activationMayRemainActive(entry) ? activation.grantId : null) ?? activeGrant?.grantId ?? null;
+  if (!grantId) {
+    throw new GmailReadOnlyError("GMAIL_ACTIVE_GRANT_REQUIRED", "There is no saved Gmail permission grant to revoke.");
   }
+
+  entry.grantActivation = {
+    status: "revocation-pending",
+    grantId,
+    reviewId: entry.reviewId,
+    revocationConfirmed: false,
+    updatedAt: isoNow(clock)
+  };
+  entry.pendingAction = { kind: "retry-saved-gmail-step", message: copy(locale).retrySavedStep };
+  await stateStore.save(state);
+
+  const cleanup = await deactivatePersistedGmailGrant({
+    stateStore,
+    plugin,
+    accountId: entry.accountId,
+    reviewId: entry.reviewId,
+    grantId,
+    language: locale,
+    clock
+  });
+  state = await loadState(stateStore);
+  entry = requireEntry(state);
+  entry.grantActivation = {
+    status: cleanup.confirmed ? "revoked" : "revocation-unconfirmed",
+    grantId,
+    reviewId: entry.reviewId,
+    revocationConfirmed: cleanup.confirmed,
+    updatedAt: isoNow(clock)
+  };
+  if (!cleanup.confirmed) {
+    setFailure(state, entry, {
+      code: cleanup.code ?? "GMAIL_REVOCATION_UNCONFIRMED",
+      stage: "revocation",
+      clock,
+      language: locale
+    });
+    await stateStore.save(state);
+    return { gmail: publicView(entry, locale, cleanup.permissionReview), recoverable: true };
+  }
+
+  entry.status = GMAIL_CONNECTION_STATES.REVOKED;
+  entry.connection.state = GMAIL_CONNECTION_STATES.REVOKED;
+  entry.connection.live = false;
+  entry.import.status = "revoked";
+  entry.import.nextPageToken = null;
+  entry.pendingAction = null;
+  entry.lastSafeError = null;
+  entry.audit.push({ type: "gmail-read-only-grant-revoked", at: isoNow(clock), reviewId: entry.reviewId, bodiesExposed: false });
+  await stateStore.save(state);
+  return { gmail: publicView(entry, locale, cleanup.permissionReview) };
 }
 
 export async function revokeGmailReadOnlyConnection(args = {}) {
@@ -1008,53 +1353,75 @@ async function skipGmailConnectionInternal({ message, stateStore, plugin, langua
     ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
     : null;
   const activeGrant = permission?.permissionReview?.activeGrant;
+  const activation = grantActivation(entry, clock);
+  const grantId = (activationMayRemainActive(entry) ? activation.grantId : null) ?? activeGrant?.grantId ?? null;
 
-  if (activeGrant) {
-    if (!plugin || !entry.reviewId) {
+  if (grantId) {
+    if (!plugin) {
       entry.status = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
       entry.connection.state = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
       entry.connection.live = false;
       entry.import.status = "paused-after-error";
       entry.pendingAction = { kind: "revoke-active-gmail-grant-before-skip", message: copy(locale).retrySavedStep };
       entry.lastSafeError = { code: "GMAIL_SKIP_REVOCATION_REQUIRED", stage: "skip-revocation", at: isoNow(clock) };
-      entry.audit.push({ type: "gmail-skip-blocked-active-grant", at: isoNow(clock), grantId: activeGrant.grantId, bodiesExposed: false });
+      entry.grantActivation = {
+        status: "revocation-unconfirmed",
+        grantId,
+        reviewId: activation.reviewId ?? entry.reviewId,
+        revocationConfirmed: false,
+        updatedAt: isoNow(clock)
+      };
+      entry.audit.push({ type: "gmail-skip-blocked-active-grant", at: isoNow(clock), bodiesExposed: false });
       await stateStore.save(state);
-      return { gmail: publicView(entry, locale, permission.permissionReview), recoverable: true };
+      return { gmail: publicView(entry, locale, permission?.permissionReview), recoverable: true };
     }
 
-    try {
-      const revoked = await revokeSourcePermission({
-        message,
-        stateStore,
-        connector: new GmailReadOnlyConnector({ plugin }),
-        source: SOURCE,
-        accountId: entry.accountId,
-        reviewId: entry.reviewId,
-        language: locale,
-        clock
+    entry.grantActivation = {
+      status: "revocation-pending",
+      grantId,
+      reviewId: activation.reviewId ?? entry.reviewId,
+      revocationConfirmed: false,
+      updatedAt: isoNow(clock)
+    };
+    await stateStore.save(state);
+    const cleanup = await deactivatePersistedGmailGrant({
+      stateStore,
+      plugin,
+      accountId: entry.accountId,
+      reviewId: activation.reviewId ?? entry.reviewId,
+      grantId,
+      language: locale,
+      clock
+    });
+    state = await loadState(stateStore);
+    entry = requireEntry(state);
+    entry.grantActivation = {
+      status: cleanup.confirmed ? "revoked" : "revocation-unconfirmed",
+      grantId,
+      reviewId: activation.reviewId ?? entry.reviewId,
+      revocationConfirmed: cleanup.confirmed,
+      updatedAt: isoNow(clock)
+    };
+    if (!cleanup.confirmed) {
+      setFailure(state, entry, {
+        code: cleanup.code ?? "GMAIL_SKIP_REVOCATION_FAILED",
+        stage: "skip-revocation",
+        clock,
+        language: locale
       });
-      // Reload after the generic lifecycle confirms revocation so a resumed
-      // FileStateStore never saves the stale pre-revocation Gmail root.
-      state = await loadState(stateStore);
-      entry = requireEntry(state);
-      entry.status = GMAIL_CONNECTION_STATES.SKIPPED;
-      entry.connection.state = GMAIL_CONNECTION_STATES.SKIPPED;
-      entry.connection.live = false;
-      entry.import.status = "skipped";
-      entry.pendingAction = null;
-      entry.audit.push({ type: "gmail-skipped-after-grant-revocation", at: isoNow(clock), grantId: activeGrant.grantId, bodiesExposed: false });
       await stateStore.save(state);
-      return { gmail: publicView(entry, locale, revoked.permissionReview) };
-    } catch (error) {
-      state = await loadState(stateStore);
-      entry = requireEntry(state);
-      setFailure(state, entry, { code: safeErrorCode(error, "GMAIL_SKIP_REVOCATION_FAILED"), stage: "skip-revocation", clock, language: locale });
-      await stateStore.save(state);
-      const current = entry.accountId
-        ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
-        : null;
-      return { gmail: publicView(entry, locale, current?.permissionReview), recoverable: true };
+      return { gmail: publicView(entry, locale, cleanup.permissionReview), recoverable: true };
     }
+
+    entry.status = GMAIL_CONNECTION_STATES.SKIPPED;
+    entry.connection.state = GMAIL_CONNECTION_STATES.SKIPPED;
+    entry.connection.live = false;
+    entry.import.status = "skipped";
+    entry.pendingAction = null;
+    entry.lastSafeError = null;
+    entry.audit.push({ type: "gmail-skipped-after-grant-revocation", at: isoNow(clock), bodiesExposed: false });
+    await stateStore.save(state);
+    return { gmail: publicView(entry, locale, cleanup.permissionReview) };
   }
 
   entry.status = GMAIL_CONNECTION_STATES.SKIPPED;
@@ -1062,6 +1429,7 @@ async function skipGmailConnectionInternal({ message, stateStore, plugin, langua
   entry.connection.live = false;
   entry.import.status = "skipped";
   entry.pendingAction = null;
+  entry.lastSafeError = null;
   entry.audit.push({ type: "gmail-skipped", at: isoNow(clock), bodiesExposed: false });
   await stateStore.save(state);
   return { gmail: publicView(entry, locale) };

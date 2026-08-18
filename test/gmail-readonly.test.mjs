@@ -500,6 +500,7 @@ test("external revocation and a body-boundary violation fail closed without a li
   await withGmailFixture(async ({ stateStore, plugin, clock }) => {
     plugin.revokedPageTokens = new Set(["page-2"]);
     await connectReviewAndGrant({ stateStore, plugin, clock, reviewId: "external-revoke-review", grantId: "external-revoke-grant" });
+    const normalRevoke = plugin.revokePermissionGrant.bind(plugin);
     plugin.revokePermissionGrant = async () => {
       throw new Error("Simulated local plugin grant cleanup failure.");
     };
@@ -510,14 +511,27 @@ test("external revocation and a body-boundary violation fail closed without a li
       clock,
       maxPages: 3
     });
-    assert.equal(revoked.gmail.status, "revoked");
-    assert.equal(revoked.recoverable, false);
+    assert.equal(revoked.gmail.status, "needs-attention");
+    assert.equal(revoked.recoverable, true);
+    assert.equal(revoked.gmail.grantLifecycle.status, "revocation-unconfirmed");
+    assert.equal(revoked.gmail.grantLifecycle.revocationConfirmed, false);
     assert.equal(revoked.gmail.connection.live, false);
     assert.deepEqual(revoked.approvedReferences.map((reference) => reference.sourceRecordId), ["gmail:mail-001"]);
+    assert.equal(plugin.authorizedGrantIds.has("external-revoke-grant"), true);
 
     const status = await getGmailReadOnlyStatus({ stateStore });
-    assert.equal(status.gmail.status, "revoked");
+    assert.equal(status.gmail.status, "needs-attention");
 
+    plugin.revokePermissionGrant = normalRevoke;
+    const retried = await revokeGmailReadOnlyConnection({
+      message: "Retry and confirm Gmail revocation",
+      stateStore,
+      plugin,
+      clock
+    });
+    assert.equal(retried.gmail.status, "revoked");
+    assert.equal(retried.gmail.grantLifecycle.revocationConfirmed, true);
+    assert.equal(plugin.authorizedGrantIds.has("external-revoke-grant"), false);
     await beginGmailConnection({ message: "Connect Gmail again for my second brain", stateStore, plugin, clock });
     const fresh = await beginGmailPrivacyReview({
       message: "Start a fresh Gmail review for my second brain",
@@ -527,7 +541,7 @@ test("external revocation and a body-boundary violation fail closed without a li
       reviewIdFactory: () => "after-external-revocation"
     });
     assert.equal(fresh.gmail.permissionReview.permissionRequest.reviewId, "after-external-revocation");
-    assert.equal(fresh.gmail.permissionReview.activeGrant, null, "an externally revoked grant is not reused by a new review even when plugin cleanup fails");
+    assert.equal(fresh.gmail.permissionReview.activeGrant, null, "an externally revoked grant is not reused after cleanup is explicitly confirmed");
   });
 
   await withGmailFixture(async ({ stateStore, plugin, clock }) => {

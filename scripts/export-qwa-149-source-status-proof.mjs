@@ -82,6 +82,7 @@ try {
     state: imported.sourceStatus.state,
     connection: imported.sourceStatus.connection,
     metadataPreview: imported.sourceStatus.metadataPreview,
+    granularPermission: imported.sourceStatus.granularPermission,
     snapshotImport: imported.sourceStatus.snapshotImport,
     releaseGate: handoff.sourceStatusHandoff.releaseGate,
     adapterCounters: {
