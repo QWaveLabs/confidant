@@ -14,7 +14,8 @@ import {
   getSourcePermissionStatus,
   grantSourcePermission,
   PermissionLifecycleError,
-  revokeSourcePermission
+  revokeSourcePermission,
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -459,7 +460,7 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
 }
 
 /** Starts the separate, normal-language Drive connection; it does not authorize or read anything. */
-export async function beginGoogleDriveConnection({ message, stateStore, accountId = "google-drive", language, clock }) {
+async function beginGoogleDriveConnectionInternal({ message, stateStore, accountId = "google-drive", language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const records = lifecycle(state);
@@ -473,8 +474,12 @@ export async function beginGoogleDriveConnection({ message, stateStore, accountI
   return { drive: publicView(records.entries[key], languageFor(state, language)) };
 }
 
+export async function beginGoogleDriveConnection(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginGoogleDriveConnectionInternal(args));
+}
+
 /** Opens an injected official desktop-plugin authorization only after explicit customer approval. */
-export async function authorizeGoogleDriveReadOnly({
+async function authorizeGoogleDriveReadOnlyInternal({
   message,
   stateStore,
   plugin,
@@ -536,8 +541,12 @@ export async function authorizeGoogleDriveReadOnly({
   return startFolderReview({ stateStore, connector, accountId, entry, language: languageFor(state, language), clock, reviewIdFactory });
 }
 
+export async function authorizeGoogleDriveReadOnly(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => authorizeGoogleDriveReadOnlyInternal(args));
+}
+
 /** Saves a selected-folder-only grant; a folder outside the plugin allowlist cannot be added. */
-export async function grantGoogleDriveFolderContent({
+async function grantGoogleDriveFolderContentInternal({
   message,
   stateStore,
   connector,
@@ -576,8 +585,12 @@ export async function grantGoogleDriveFolderContent({
   return { drive: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview) };
 }
 
+export async function grantGoogleDriveFolderContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => grantGoogleDriveFolderContentInternal(args));
+}
+
 /** Fetches only approved opaque Drive references, enriching them with safe preflight metadata. */
-export async function fetchApprovedGoogleDriveContent({ message, stateStore, connector, accountId = "google-drive", reviewId, language, clock }) {
+async function fetchApprovedGoogleDriveContentInternal({ message, stateStore, connector, accountId = "google-drive", reviewId, language, clock }) {
   assertNaturalLanguage(message);
   assertConnector(connector);
   const state = await loadState(stateStore);
@@ -640,8 +653,12 @@ export async function fetchApprovedGoogleDriveContent({ message, stateStore, con
   };
 }
 
+export async function fetchApprovedGoogleDriveContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedGoogleDriveContentInternal(args));
+}
+
 /** Revokes the local grant and asks the plugin to revoke its read-only authorization when supported. */
-export async function revokeGoogleDriveConnection({ message, stateStore, connector, plugin, accountId = "google-drive", reviewId, language, clock }) {
+async function revokeGoogleDriveConnectionInternal({ message, stateStore, connector, plugin, accountId = "google-drive", reviewId, language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
@@ -668,6 +685,10 @@ export async function revokeGoogleDriveConnection({ message, stateStore, connect
   refreshedEntry.audit.push({ type: "drive-connection-revocation-requested", at: isoNow(clock), reviewId: reviewId ?? null, pluginRevoked });
   await stateStore.save(refreshed);
   return { drive: publicView(refreshedEntry, languageFor(refreshed, language), permissionReview?.permissionReview) };
+}
+
+export async function revokeGoogleDriveConnection(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeGoogleDriveConnectionInternal(args));
 }
 
 /** Read-only status lookup; never invokes a Drive plugin or connector. */

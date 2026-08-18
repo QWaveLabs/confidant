@@ -13,7 +13,8 @@ import {
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
   grantSourcePermission,
-  revokeSourcePermission
+  revokeSourcePermission,
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -269,7 +270,7 @@ async function beginContentPrivacyReview({
 }
 
 /** Starts the non-blocking, customer-visible choice between local beta and snapshot import. */
-export async function beginIMessageBeta({ message, stateStore, accountId = "local-imessage", language, clock }) {
+async function beginIMessageBetaInternal({ message, stateStore, accountId = "local-imessage", language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const records = lifecycle(state);
@@ -283,12 +284,16 @@ export async function beginIMessageBeta({ message, stateStore, accountId = "loca
   return { iMessageBeta: publicView(records.entries[key], languageFor(state, language)) };
 }
 
+export async function beginIMessageBeta(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginIMessageBetaInternal(args));
+}
+
 /**
  * Attempts local database access only after the caller records explicit macOS
  * approval. A denial, unavailable adapter, or local failure moves to the
  * snapshot path without changing the Setup Session's completion state.
  */
-export async function attemptIMessageLocalAccess({
+async function attemptIMessageLocalAccessInternal({
   message,
   stateStore,
   localAdapter,
@@ -348,8 +353,12 @@ export async function attemptIMessageLocalAccess({
   });
 }
 
+export async function attemptIMessageLocalAccess(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => attemptIMessageLocalAccessInternal(args));
+}
+
 /** Starts a one-time snapshot privacy review. It reads metadata only and never calls the local adapter. */
-export async function beginIMessageSnapshotImport({
+async function beginIMessageSnapshotImportInternal({
   message,
   stateStore,
   connector,
@@ -393,8 +402,12 @@ export async function beginIMessageSnapshotImport({
   return result;
 }
 
+export async function beginIMessageSnapshotImport(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginIMessageSnapshotImportInternal(args));
+}
+
 /** Records separately requested attachment/high-risk handling without touching a message source. */
-export async function approveIMessageSensitiveContent({
+async function approveIMessageSensitiveContentInternal({
   message,
   stateStore,
   accountId = "local-imessage",
@@ -427,8 +440,12 @@ export async function approveIMessageSensitiveContent({
   return { iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview) };
 }
 
+export async function approveIMessageSensitiveContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => approveIMessageSensitiveContentInternal(args));
+}
+
 /** Grants the normal QWA-139 message-body scope while enforcing iMessage's separate high-risk gate. */
-export async function grantIMessageContent({
+async function grantIMessageContentInternal({
   message,
   stateStore,
   connector,
@@ -469,12 +486,16 @@ export async function grantIMessageContent({
   return { iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview) };
 }
 
+export async function grantIMessageContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => grantIMessageContentInternal(args));
+}
+
 /**
  * Fetches only opaque approved records. The connector receives the persisted
  * separate-content policy before the QWA-139 fetch, so attachments and high
  * risk records are excluded structurally rather than filtered after access.
  */
-export async function fetchApprovedIMessageContent({
+async function fetchApprovedIMessageContentInternal({
   message,
   stateStore,
   connector,
@@ -518,8 +539,12 @@ export async function fetchApprovedIMessageContent({
   };
 }
 
+export async function fetchApprovedIMessageContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedIMessageContentInternal(args));
+}
+
 /** Revokes the standard read-only grant; it cannot send, alter, or delete an iMessage. */
-export async function revokeIMessageContent({ message, stateStore, connector, accountId = "local-imessage", reviewId, language, clock }) {
+async function revokeIMessageContentInternal({ message, stateStore, connector, accountId = "local-imessage", reviewId, language, clock }) {
   assertNaturalLanguage(message);
   const revoked = await revokeSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
   const state = await loadState(stateStore);
@@ -529,6 +554,10 @@ export async function revokeIMessageContent({ message, stateStore, connector, ac
   entry.audit.push({ type: "imessage-content-revoked", at: isoNow(clock), reviewId });
   await stateStore.save(state);
   return { iMessageBeta: publicView(entry, languageFor(state, language), revoked.permissionReview) };
+}
+
+export async function revokeIMessageContent(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeIMessageContentInternal(args));
 }
 
 /** Read-only status lookup; it never invokes a local adapter or connector. */

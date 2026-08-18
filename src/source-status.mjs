@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { withSourcePermissionStateLock } from "./permissions/setup-source-permissions.mjs";
 
 const STATE_KEY = "sourceStatusV2";
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -64,6 +65,7 @@ export const SOURCE_HANDOFF_CATEGORIES = Object.freeze({
 export const SOURCE_ADAPTER_NAMES = Object.freeze({
   GENERIC_EXPORT: "simulated-generic-export",
   GMAIL: "gmail-readonly",
+  GOOGLE_CALENDAR: "google-calendar",
   GOOGLE_DRIVE: "google-drive",
   IMESSAGE: "imessage-beta"
 });
@@ -163,7 +165,7 @@ function wording(language) {
       metadataOnly: "Solo metadatos: nombres genéricos de elementos, identificadores opacos y categorías. No hay cuerpos, adjuntos, mensajes, archivos ni enlaces de fuente.",
       noLiveConnection: "No hay una conexión en vivo ni verificada en esta vista segura.",
       releaseGateUnsatisfied: "La puerta de lanzamiento sigue sin cumplir: esta entrega no tiene al menos un conector en vivo verificado de forma independiente. Las simulaciones y los estados informados por adaptadores no cuentan.",
-      releaseGateSatisfied: "La puerta de lanzamiento cuenta con evidencia externa de al menos un conector en vivo y de solo lectura verificado de forma independiente.",
+      releaseGateSatisfied: "La puerta de lanzamiento cuenta con un conector en vivo y de solo lectura verificado de forma independiente y guardado por su ciclo de vida aprobado.",
       unsupportedSafe: "No puedo conectar esta fuente desde esta configuración. No inventaré una conexión, enlace ni estado en vivo."
     };
   }
@@ -180,7 +182,7 @@ function wording(language) {
     metadataOnly: "Metadata only: generic item labels, opaque ids, and categories. No bodies, attachments, messages, files, or source links are present.",
     noLiveConnection: "There is no live or verified connection in this safe view.",
     releaseGateUnsatisfied: "The release gate remains unsatisfied: this delivery has no independently verified live connector. Simulations and adapter-reported states do not count.",
-    releaseGateSatisfied: "The release gate has externally supplied evidence of at least one independently verified, read-only live connector.",
+    releaseGateSatisfied: "The release gate has at least one independently verified, read-only live connector recorded by its approved lifecycle.",
     unsupportedSafe: "I cannot connect this source from this safe setup. I will not invent a connection, link, or live status."
   };
 }
@@ -280,6 +282,15 @@ async function loadState(stateStore) {
   return state;
 }
 
+// QWA-149 shares the same complete Setup Session document as QWA-139. Keep
+// every local read-modify-write section on its canonical state-store lock, but
+// deliberately release it for adapter calls and revalidate the durable
+// generation when the call returns. That lets an explicit revoke win while a
+// resumed process is waiting on an adapter.
+function withSourceStatusStateLock(stateStore, operation) {
+  return withSourcePermissionStateLock(stateStore, operation);
+}
+
 function defaultEntry(sourceId, now) {
   return {
     sourceId,
@@ -348,9 +359,16 @@ function safePreview(preview) {
   };
 }
 
-function publicSourceStatus(entry, language, { adapterReportedState = null, external = false, statusOrigin = null, authorizationOutcome = null } = {}) {
+function publicSourceStatus(entry, language, {
+  adapterReportedState = null,
+  external = false,
+  statusOrigin = null,
+  authorizationOutcome = null,
+  trustedLiveVerification = null
+} = {}) {
   const simulated = entry.adapter === SOURCE_ADAPTER_NAMES.GENERIC_EXPORT;
   const category = handoffCategoryFor(entry.state);
+  const verifiedLive = Boolean(trustedLiveVerification);
   return {
     source: {
       id: entry.sourceId,
@@ -363,14 +381,16 @@ function publicSourceStatus(entry, language, { adapterReportedState = null, exte
     handoffCategory: category,
     message: stateMessage(entry.state, language),
     connection: {
-      status: simulated ? "not-connected-simulation" : "not-verified",
-      live: false,
-      independentlyVerified: false,
-      readOnly: simulated ? true : null,
-      realConnectionAttempted: false,
+      status: simulated ? "not-connected-simulation" : verifiedLive ? "live-and-verified" : "not-verified",
+      live: verifiedLive,
+      independentlyVerified: verifiedLive,
+      readOnly: simulated || verifiedLive ? true : null,
+      realConnectionAttempted: verifiedLive,
       sourceBodiesRead: false,
       sourceWrites: false,
-      note: wording(language).noLiveConnection
+      verifiedAt: trustedLiveVerification?.verifiedAt ?? null,
+      verificationMethod: trustedLiveVerification?.verificationMethod ?? null,
+      note: verifiedLive ? wording(language).releaseGateSatisfied : wording(language).noLiveConnection
     },
     metadataPreview: safePreview(entry.metadataPreview),
     granularPermission: {
@@ -396,7 +416,7 @@ function publicSourceStatus(entry, language, { adapterReportedState = null, exte
     },
     nextAction: nextActionFor(entry, language),
     lastSafeError: entry.lastSafeError ? clone(entry.lastSafeError) : null,
-    adapterReportedState: adapterReportedState ? { value: adapterReportedState, treatedAsProofOfLiveConnection: false } : null,
+    adapterReportedState: adapterReportedState ? { value: adapterReportedState, treatedAsProofOfLiveConnection: verifiedLive } : null,
     statusOrigin,
     authorizationOutcome,
     external,
@@ -412,7 +432,7 @@ function nextActionFor(entry, language) {
       instruction: isEs
         ? "Confirma o vuelve a intentar la revocación antes de omitir, reiniciar o conceder otro permiso para esta fuente."
         : "Confirm or retry revocation before skipping, restarting, or granting another permission for this source."
-    };
+      };
   }
   if (entry.state === SOURCE_STATUS_STATES.AWAITING_GRANT) {
     return {
@@ -424,6 +444,14 @@ function nextActionFor(entry, language) {
     return {
       kind: "import-approved-simulated-snapshot",
       instruction: isEs ? "Importa la instantánea simulada aprobada de una sola vez." : "Import the approved one-time simulated snapshot."
+    };
+  }
+  if (entry.state === SOURCE_STATUS_STATES.IMPORTING) {
+    return {
+      kind: "recover-interrupted-simulated-import",
+      instruction: isEs
+        ? "Reanuda la importación guardada para cerrar de forma segura el permiso interrumpido antes de iniciar una vista previa nueva."
+        : "Resume the saved import to safely close its interrupted permission before starting a fresh preview."
     };
   }
   if (entry.state === SOURCE_STATUS_STATES.SKIPPED) {
@@ -582,82 +610,92 @@ async function failClosedAfterOperation({
   auditType,
   clock
 }) {
-  const beforeCleanup = await loadState(stateStore);
-  const entry = requireEntry(rootLifecycle(beforeCleanup), sourceId);
-  if (!operationStillCurrent(entry, {
-    revision: expectedRevision,
-    grantId,
-    state: expectedState,
-    permissionStatuses: expectedPermissionStatuses
-  })) {
-    // The saved lifecycle changed while the adapter operation was in flight
-    // (normally because a revoke won). Do not overwrite it with stale work.
-    await revokeAdapterPermission(adapter, grantId).catch(() => false);
-    return { entry, state: beforeCleanup, committed: false };
-  }
+  const staged = await withSourceStatusStateLock(stateStore, async () => {
+    const beforeCleanup = await loadState(stateStore);
+    const entry = requireEntry(rootLifecycle(beforeCleanup), sourceId);
+    if (!operationStillCurrent(entry, {
+      revision: expectedRevision,
+      grantId,
+      state: expectedState,
+      permissionStatuses: expectedPermissionStatuses
+    })) {
+      return { entry, state: beforeCleanup, committed: false, cleanupRevision: null, failedAt: null, originalCode: null };
+    }
 
-  const failedAt = isoNow(clock);
-  const originalCode = safeErrorCode(error, failureCode);
-  entry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
-  entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
-  entry.permission.status = "revocation-pending";
-  entry.permission.revocationConfirmed = false;
-  entry.snapshotImport.status = "failed-safely";
-  entry.lastSafeError = {
-    code: originalCode,
-    stage: failureStage,
-    at: failedAt,
-    sourceBodiesRead: false
-  };
-  entry.audit.push({
-    type: `${auditType}-cleanup-started`,
-    at: failedAt,
-    code: originalCode,
-    grantId,
-    sourceBodiesRead: false
-  });
-  const cleanupRevision = bumpEntryRevision(entry);
-  await stateStore.save(beforeCleanup);
-
-  const revoked = await revokeAdapterPermission(adapter, grantId).catch(() => false);
-  const afterCleanup = await loadState(stateStore);
-  const refreshedEntry = requireEntry(rootLifecycle(afterCleanup), sourceId);
-  if (!operationStillCurrent(refreshedEntry, {
-    revision: cleanupRevision,
-    grantId,
-    state: SOURCE_STATUS_STATES.NEEDS_ATTENTION,
-    permissionStatuses: ["revocation-pending"]
-  })) {
-    return { entry: refreshedEntry, state: afterCleanup, committed: false };
-  }
-
-  refreshedEntry.permission.status = revoked ? "revoked-after-failure" : "revocation-unconfirmed";
-  refreshedEntry.permission.revokedAt = revoked ? failedAt : null;
-  refreshedEntry.permission.revocationConfirmed = revoked;
-  refreshedEntry.lastSafeError = revoked
-    ? {
+    const failedAt = isoNow(clock);
+    const originalCode = safeErrorCode(error, failureCode);
+    entry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
+    entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
+    entry.permission.status = "revocation-pending";
+    entry.permission.revocationConfirmed = false;
+    entry.snapshotImport.status = "failed-safely";
+    entry.lastSafeError = {
       code: originalCode,
       stage: failureStage,
       at: failedAt,
       sourceBodiesRead: false
-    }
-    : {
-      code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED",
-      causeCode: originalCode,
-      stage: `${failureStage}-cleanup`,
-      at: failedAt,
-      sourceBodiesRead: false
     };
-  refreshedEntry.audit.push({
-    type: auditType,
-    at: failedAt,
-    code: originalCode,
-    permissionRevocationConfirmed: revoked,
-    sourceBodiesRead: false
+    entry.audit.push({
+      type: `${auditType}-cleanup-started`,
+      at: failedAt,
+      code: originalCode,
+      grantId,
+      sourceBodiesRead: false
+    });
+    const cleanupRevision = bumpEntryRevision(entry);
+    await stateStore.save(beforeCleanup);
+    return { entry, state: beforeCleanup, committed: true, cleanupRevision, failedAt, originalCode };
   });
-  bumpEntryRevision(refreshedEntry);
-  await stateStore.save(afterCleanup);
-  return { entry: refreshedEntry, state: afterCleanup, committed: true };
+
+  if (!staged.committed) {
+    // A durable revoke or other safe transition won while the adapter call was
+    // in flight. Clean up the adapter best-effort, but never restore stale
+    // local state over that newer decision.
+    await revokeAdapterPermission(adapter, grantId).catch(() => false);
+    return staged;
+  }
+
+  const revoked = await revokeAdapterPermission(adapter, grantId).catch(() => false);
+  return withSourceStatusStateLock(stateStore, async () => {
+    const afterCleanup = await loadState(stateStore);
+    const refreshedEntry = requireEntry(rootLifecycle(afterCleanup), sourceId);
+    if (!operationStillCurrent(refreshedEntry, {
+      revision: staged.cleanupRevision,
+      grantId,
+      state: SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      permissionStatuses: ["revocation-pending"]
+    })) {
+      return { entry: refreshedEntry, state: afterCleanup, committed: false };
+    }
+
+    refreshedEntry.permission.status = revoked ? "revoked-after-failure" : "revocation-unconfirmed";
+    refreshedEntry.permission.revokedAt = revoked ? staged.failedAt : null;
+    refreshedEntry.permission.revocationConfirmed = revoked;
+    refreshedEntry.lastSafeError = revoked
+      ? {
+        code: staged.originalCode,
+        stage: failureStage,
+        at: staged.failedAt,
+        sourceBodiesRead: false
+      }
+      : {
+        code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED",
+        causeCode: staged.originalCode,
+        stage: `${failureStage}-cleanup`,
+        at: staged.failedAt,
+        sourceBodiesRead: false
+      };
+    refreshedEntry.audit.push({
+      type: auditType,
+      at: staged.failedAt,
+      code: staged.originalCode,
+      permissionRevocationConfirmed: revoked,
+      sourceBodiesRead: false
+    });
+    bumpEntryRevision(refreshedEntry);
+    await stateStore.save(afterCleanup);
+    return { entry: refreshedEntry, state: afterCleanup, committed: true };
+  });
 }
 
 /** Creates a safe default scope that callers must explicitly acknowledge before granting. */
@@ -694,52 +732,91 @@ export async function beginSimulatedExportPreview({
   if (!adapter || adapter.isSimulation !== true || typeof adapter.previewMetadata !== "function") {
     throw new TypeError("A simulated generic-export adapter with previewMetadata() is required. Real source adapters are not accepted here.");
   }
-  const state = await loadState(stateStore);
-  const records = rootLifecycle(state);
-  const safeLanguage = languageFor(state, language);
-  let entry = records.entries[sourceId];
-  if (entry?.state === SOURCE_STATUS_STATES.SKIPPED || entry?.state === SOURCE_STATUS_STATES.UNSUPPORTED) {
-    return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
-  }
-  if (permissionMayRemainActive(entry)) {
-    // A prior grant may still exist remotely. Do not erase the persisted
-    // uncertainty by starting a fresh local preview.
-    return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
-  }
-  if (entry?.state === SOURCE_STATUS_STATES.AWAITING_GRANT || entry?.state === SOURCE_STATUS_STATES.READY_TO_IMPORT || entry?.state === SOURCE_STATUS_STATES.IMPORTED) {
-    return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
-  }
-  const now = isoNow(clock);
-  if (!entry || entry.state === SOURCE_STATUS_STATES.REVOKED || entry.state === SOURCE_STATUS_STATES.NEEDS_ATTENTION) {
-    const previousAudit = entry?.audit ?? [];
-    const previousRevision = entryRevision(entry);
-    entry = defaultEntry(sourceId, now);
-    entry.revision = previousRevision;
-    bumpEntryRevision(entry);
-    entry.audit.unshift(...previousAudit, { type: "fresh-simulated-preview-started", at: now, sourceBodiesRead: false });
-    records.entries[sourceId] = entry;
-  }
-  try {
-    const preview = normalizePreview(await adapter.previewMetadata({ sourceId }), sourceId, now, safeLanguage);
-    entry.metadataPreview = { ...preview, reviewId: (reviewIdFactory ?? (() => `simulated-export-review-${randomUUID()}`))() };
-    entry.state = SOURCE_STATUS_STATES.AWAITING_GRANT;
-    entry.resumeState = SOURCE_STATUS_STATES.AWAITING_GRANT;
-    entry.permission = { status: "none", reviewId: entry.metadataPreview.reviewId, grantId: null, selectedItemIds: [], grantedAt: null, revokedAt: null, revocationConfirmed: null };
-    entry.snapshotImport = { status: "not-started", snapshotLabel: null, importedAt: null, records: [] };
-    entry.lastSafeError = null;
-    entry.audit.push({ type: "metadata-only-simulated-export-preview", at: now, reviewId: entry.metadataPreview.reviewId, itemCount: preview.itemCount, sourceBodiesRead: false });
-    records.audit.push({ type: "metadata-only-simulated-export-preview", at: now, sourceId, sourceBodiesRead: false });
-    bumpEntryRevision(entry);
-  } catch (error) {
+  const staged = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const records = rootLifecycle(state);
+    const safeLanguage = languageFor(state, language);
+    let entry = records.entries[sourceId];
+    if (entry?.state === SOURCE_STATUS_STATES.SKIPPED || entry?.state === SOURCE_STATUS_STATES.UNSUPPORTED) {
+      return { performPreview: false, entry, state, safeLanguage };
+    }
+    if (permissionMayRemainActive(entry)) {
+      return { performPreview: false, entry, state, safeLanguage };
+    }
+    if ([
+      SOURCE_STATUS_STATES.AWAITING_GRANT,
+      SOURCE_STATUS_STATES.READY_TO_IMPORT,
+      SOURCE_STATUS_STATES.IMPORTING,
+      SOURCE_STATUS_STATES.IMPORTED
+    ].includes(entry?.state)) {
+      return { performPreview: false, entry, state, safeLanguage };
+    }
+
+    const now = isoNow(clock);
+    if (!entry || entry.state === SOURCE_STATUS_STATES.REVOKED || entry.state === SOURCE_STATUS_STATES.NEEDS_ATTENTION) {
+      const previousAudit = entry?.audit ?? [];
+      const previousRevision = entryRevision(entry);
+      entry = defaultEntry(sourceId, now);
+      entry.revision = previousRevision;
+      entry.audit.unshift(...previousAudit, { type: "fresh-simulated-preview-started", at: now, sourceBodiesRead: false });
+      records.entries[sourceId] = entry;
+    }
     entry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
     entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
-    entry.lastSafeError = { code: safeErrorCode(error, "SIMULATED_EXPORT_PREVIEW_FAILED"), stage: "metadata-preview", at: now, sourceBodiesRead: false };
-    entry.audit.push({ type: "simulated-export-preview-paused", at: now, code: entry.lastSafeError.code, sourceBodiesRead: false });
-    records.audit.push({ type: "simulated-export-preview-paused", at: now, sourceId, sourceBodiesRead: false });
-    bumpEntryRevision(entry);
+    entry.snapshotImport.status = "preview-pending";
+    entry.lastSafeError = null;
+    entry.audit.push({ type: "metadata-only-simulated-export-preview-started", at: now, sourceBodiesRead: false });
+    const previewRevision = bumpEntryRevision(entry);
+    await stateStore.save(state);
+    return { performPreview: true, previewRevision, now, entry, state, safeLanguage };
+  });
+
+  if (!staged.performPreview) return { sourceStatus: publicSourceStatus(staged.entry, staged.safeLanguage) };
+
+  let preview = null;
+  let previewError = null;
+  try {
+    preview = normalizePreview(await adapter.previewMetadata({ sourceId }), sourceId, staged.now, staged.safeLanguage);
+  } catch (error) {
+    previewError = error;
   }
-  await stateStore.save(state);
-  return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
+
+  const finalized = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const records = rootLifecycle(state);
+    const entry = requireEntry(records, sourceId);
+    if (!operationStillCurrent(entry, {
+      revision: staged.previewRevision,
+      grantId: null,
+      state: SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      permissionStatuses: ["none"]
+    }) || entry.snapshotImport.status !== "preview-pending") {
+      return { entry, state };
+    }
+
+    if (previewError) {
+      entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
+      entry.snapshotImport.status = "not-started";
+      entry.lastSafeError = { code: safeErrorCode(previewError, "SIMULATED_EXPORT_PREVIEW_FAILED"), stage: "metadata-preview", at: staged.now, sourceBodiesRead: false };
+      entry.audit.push({ type: "simulated-export-preview-paused", at: staged.now, code: entry.lastSafeError.code, sourceBodiesRead: false });
+      records.audit.push({ type: "simulated-export-preview-paused", at: staged.now, sourceId, sourceBodiesRead: false });
+    } else {
+      const reviewId = (reviewIdFactory ?? (() => `simulated-export-review-${randomUUID()}`))();
+      opaqueId(reviewId, "Simulated export review id");
+      entry.metadataPreview = { ...preview, reviewId };
+      entry.state = SOURCE_STATUS_STATES.AWAITING_GRANT;
+      entry.resumeState = SOURCE_STATUS_STATES.AWAITING_GRANT;
+      entry.permission = { status: "none", reviewId, grantId: null, selectedItemIds: [], grantedAt: null, revokedAt: null, revocationConfirmed: null };
+      entry.snapshotImport = { status: "not-started", snapshotLabel: null, importedAt: null, records: [] };
+      entry.lastSafeError = null;
+      entry.audit.push({ type: "metadata-only-simulated-export-preview", at: staged.now, reviewId, itemCount: preview.itemCount, sourceBodiesRead: false });
+      records.audit.push({ type: "metadata-only-simulated-export-preview", at: staged.now, sourceId, sourceBodiesRead: false });
+    }
+    bumpEntryRevision(entry);
+    await stateStore.save(state);
+    return { entry, state };
+  });
+  return { sourceStatus: publicSourceStatus(finalized.entry, languageFor(finalized.state, language)) };
 }
 
 /** Saves a granular, one-time simulated-export permission; it never imports. */
@@ -760,57 +837,62 @@ export async function grantSimulatedExportPermission({
   if (!adapter || adapter.isSimulation !== true || typeof adapter.registerSnapshotPermission !== "function") {
     throw new TypeError("A simulated generic-export adapter with registerSnapshotPermission() is required.");
   }
-  const state = await loadState(stateStore);
-  const records = rootLifecycle(state);
-  const entry = requireEntry(records, sourceId);
-  const safeLanguage = languageFor(state, language);
-  if (entry.state !== SOURCE_STATUS_STATES.AWAITING_GRANT || !entry.metadataPreview || entry.permission.reviewId !== reviewId) {
-    throw new SourceStatusError("STALE_SIMULATED_EXPORT_REVIEW", "That simulated export review is not ready. Start or use the current metadata-only preview before approving anything.");
-  }
-  if (entry.permission.status === "active") {
-    return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
-  }
-  if (permissionMayRemainActive(entry)) {
-    throw new SourceStatusError("REVOCATION_CONFIRMATION_REQUIRED", "I could not confirm that the earlier simulated export permission was revoked. Revoke it explicitly before approving another scope.");
-  }
-  const normalizedScope = normalizePermissionScope(extractPermissionScope({ scope, selectedItemIds }), entry);
-  const now = isoNow(clock);
-  const grant = {
-    id: (grantIdFactory ?? (() => `simulated-export-grant-${randomUUID()}`))(),
-    status: "active",
-    sourceId,
-    reviewId,
-    approvedAt: now,
-    scope: normalizedScope
-  };
-  opaqueId(grant.id, "Simulated export grant id");
+  const staged = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const records = rootLifecycle(state);
+    const entry = requireEntry(records, sourceId);
+    const safeLanguage = languageFor(state, language);
+    if (entry.state !== SOURCE_STATUS_STATES.AWAITING_GRANT || !entry.metadataPreview || entry.permission.reviewId !== reviewId) {
+      throw new SourceStatusError("STALE_SIMULATED_EXPORT_REVIEW", "That simulated export review is not ready. Start or use the current metadata-only preview before approving anything.");
+    }
+    if (entry.permission.status === "active") {
+      return { alreadyActive: true, entry, state, safeLanguage };
+    }
+    if (permissionMayRemainActive(entry)) {
+      throw new SourceStatusError("REVOCATION_CONFIRMATION_REQUIRED", "I could not confirm that the earlier simulated export permission was revoked. Revoke it explicitly before approving another scope.");
+    }
+    const normalizedScope = normalizePermissionScope(extractPermissionScope({ scope, selectedItemIds }), entry);
+    const now = isoNow(clock);
+    const grant = {
+      id: (grantIdFactory ?? (() => `simulated-export-grant-${randomUUID()}`))(),
+      status: "active",
+      sourceId,
+      reviewId,
+      approvedAt: now,
+      scope: normalizedScope
+    };
+    opaqueId(grant.id, "Simulated export grant id");
 
-  // Persist a local generation before the adapter call. If a revoke lands
-  // while the adapter is registering, its newer generation wins when this
-  // request returns.
-  entry.permission = {
-    status: "grant-pending",
-    reviewId,
-    grantId: grant.id,
-    selectedItemIds: normalizedScope.selectedItemIds,
-    grantedAt: now,
-    revokedAt: null,
-    revocationConfirmed: false
-  };
-  entry.lastSafeError = null;
-  entry.audit.push({ type: "simulated-export-granular-permission-registration-started", at: now, reviewId, grantId: grant.id, selectedItemCount: normalizedScope.selectedItemIds.length, sourceBodiesRead: false });
-  const grantRevision = bumpEntryRevision(entry);
-  await stateStore.save(state);
+    // Record the durable pending generation before releasing the lock for the
+    // adapter. A revoke from a reopened FileStateStore can now replace this
+    // exact generation and the post-adapter step will observe that decision.
+    entry.permission = {
+      status: "grant-pending",
+      reviewId,
+      grantId: grant.id,
+      selectedItemIds: normalizedScope.selectedItemIds,
+      grantedAt: now,
+      revokedAt: null,
+      revocationConfirmed: false
+    };
+    entry.lastSafeError = null;
+    entry.audit.push({ type: "simulated-export-granular-permission-registration-started", at: now, reviewId, grantId: grant.id, selectedItemCount: normalizedScope.selectedItemIds.length, sourceBodiesRead: false });
+    const grantRevision = bumpEntryRevision(entry);
+    await stateStore.save(state);
+    return { alreadyActive: false, grant, grantRevision, state, safeLanguage, entry };
+  });
+
+  if (staged.alreadyActive) return { sourceStatus: publicSourceStatus(staged.entry, staged.safeLanguage) };
 
   try {
-    await adapter.registerSnapshotPermission({ grant: clone(grant) });
+    await adapter.registerSnapshotPermission({ grant: clone(staged.grant) });
   } catch (error) {
     const failed = await failClosedAfterOperation({
       stateStore,
       adapter,
       sourceId,
-      expectedRevision: grantRevision,
-      grantId: grant.id,
+      expectedRevision: staged.grantRevision,
+      grantId: staged.grant.id,
       expectedState: SOURCE_STATUS_STATES.AWAITING_GRANT,
       expectedPermissionStatuses: ["grant-pending"],
       error,
@@ -822,31 +904,36 @@ export async function grantSimulatedExportPermission({
     return { sourceStatus: publicSourceStatus(failed.entry, languageFor(failed.state, language)) };
   }
 
-  const refreshed = await loadState(stateStore);
-  const refreshedRecords = rootLifecycle(refreshed);
-  const refreshedEntry = requireEntry(refreshedRecords, sourceId);
-  if (!operationStillCurrent(refreshedEntry, {
-    revision: grantRevision,
-    grantId: grant.id,
-    state: SOURCE_STATUS_STATES.AWAITING_GRANT,
-    permissionStatuses: ["grant-pending"]
-  })) {
-    // A durable revoke or another safe transition won while registration was
-    // in flight. Ensure the adapter grant is not left usable, but never put a
-    // stale active grant back into local state.
-    await revokeAdapterPermission(adapter, grant.id).catch(() => false);
-    return { sourceStatus: publicSourceStatus(refreshedEntry, languageFor(refreshed, language)) };
+  const finalized = await withSourceStatusStateLock(stateStore, async () => {
+    const refreshed = await loadState(stateStore);
+    const refreshedRecords = rootLifecycle(refreshed);
+    const refreshedEntry = requireEntry(refreshedRecords, sourceId);
+    if (!operationStillCurrent(refreshedEntry, {
+      revision: staged.grantRevision,
+      grantId: staged.grant.id,
+      state: SOURCE_STATUS_STATES.AWAITING_GRANT,
+      permissionStatuses: ["grant-pending"]
+    })) {
+      return { stale: true, entry: refreshedEntry, state: refreshed };
+    }
+    refreshedEntry.permission.status = "active";
+    refreshedEntry.permission.revocationConfirmed = false;
+    refreshedEntry.state = SOURCE_STATUS_STATES.READY_TO_IMPORT;
+    refreshedEntry.resumeState = SOURCE_STATUS_STATES.READY_TO_IMPORT;
+    refreshedEntry.lastSafeError = null;
+    refreshedEntry.audit.push({ type: "simulated-export-granular-permission-granted", at: staged.grant.approvedAt, reviewId, grantId: staged.grant.id, selectedItemCount: staged.grant.scope.selectedItemIds.length, sourceBodiesRead: false });
+    refreshedRecords.audit.push({ type: "simulated-export-granular-permission-granted", at: staged.grant.approvedAt, sourceId, reviewId, grantId: staged.grant.id, sourceBodiesRead: false });
+    bumpEntryRevision(refreshedEntry);
+    await stateStore.save(refreshed);
+    return { stale: false, entry: refreshedEntry, state: refreshed };
+  });
+  if (finalized.stale) {
+    // The persisted decision changed after registration (normally a revoke).
+    // Close the adapter grant after releasing the local lock, but never use a
+    // stale in-memory entry to restore it.
+    await revokeAdapterPermission(adapter, staged.grant.id).catch(() => false);
   }
-  refreshedEntry.permission.status = "active";
-  refreshedEntry.permission.revocationConfirmed = false;
-  refreshedEntry.state = SOURCE_STATUS_STATES.READY_TO_IMPORT;
-  refreshedEntry.resumeState = SOURCE_STATUS_STATES.READY_TO_IMPORT;
-  refreshedEntry.lastSafeError = null;
-  refreshedEntry.audit.push({ type: "simulated-export-granular-permission-granted", at: now, reviewId, grantId: grant.id, selectedItemCount: normalizedScope.selectedItemIds.length, sourceBodiesRead: false });
-  refreshedRecords.audit.push({ type: "simulated-export-granular-permission-granted", at: now, sourceId, reviewId, grantId: grant.id, sourceBodiesRead: false });
-  bumpEntryRevision(refreshedEntry);
-  await stateStore.save(refreshed);
-  return { sourceStatus: publicSourceStatus(refreshedEntry, languageFor(refreshed, language)) };
+  return { sourceStatus: publicSourceStatus(finalized.entry, languageFor(finalized.state, language)) };
 }
 
 /** Imports exactly the approved opaque snapshot references, then closes the one-time permission. */
@@ -864,36 +951,46 @@ export async function importSimulatedExportSnapshot({
   if (!adapter || adapter.isSimulation !== true || typeof adapter.importApprovedSnapshot !== "function") {
     throw new TypeError("A simulated generic-export adapter with importApprovedSnapshot() is required.");
   }
-  const state = await loadState(stateStore);
-  const records = rootLifecycle(state);
-  const entry = requireEntry(records, sourceId);
-  const safeLanguage = languageFor(state, language);
-  if (entry.state !== SOURCE_STATUS_STATES.READY_TO_IMPORT || entry.permission.status !== "active" || entry.permission.reviewId !== reviewId) {
-    throw new SourceStatusError("SIMULATED_EXPORT_GRANT_REQUIRED", "No simulated snapshot was imported because there is no active granular permission for this current review.");
-  }
-  const now = isoNow(clock);
-  const grant = {
-    id: entry.permission.grantId,
-    status: "active",
-    sourceId,
-    reviewId,
-    scope: { selectedItemIds: clone(entry.permission.selectedItemIds) }
-  };
-  entry.state = SOURCE_STATUS_STATES.IMPORTING;
-  entry.snapshotImport.status = "importing";
-  entry.audit.push({ type: "simulated-snapshot-import-started", at: now, reviewId, grantId: grant.id, sourceBodiesRead: false });
-  const importRevision = bumpEntryRevision(entry);
-  await stateStore.save(state);
+  const started = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const records = rootLifecycle(state);
+    const entry = requireEntry(records, sourceId);
+    const safeLanguage = languageFor(state, language);
+    if (entry.state !== SOURCE_STATUS_STATES.READY_TO_IMPORT || entry.permission.status !== "active" || entry.permission.reviewId !== reviewId) {
+      throw new SourceStatusError("SIMULATED_EXPORT_GRANT_REQUIRED", "No simulated snapshot was imported because there is no active granular permission for this current review.");
+    }
+    const now = isoNow(clock);
+    const grant = {
+      id: entry.permission.grantId,
+      status: "active",
+      sourceId,
+      reviewId,
+      scope: { selectedItemIds: clone(entry.permission.selectedItemIds) }
+    };
+    entry.state = SOURCE_STATUS_STATES.IMPORTING;
+    entry.snapshotImport.status = "importing";
+    entry.audit.push({ type: "simulated-snapshot-import-started", at: now, reviewId, grantId: grant.id, sourceBodiesRead: false });
+    const importRevision = bumpEntryRevision(entry);
+    await stateStore.save(state);
+    // Keep only the narrow fields needed to validate a later adapter result;
+    // never retain an in-memory state object as authority after releasing the
+    // lock for the adapter call.
+    const validationEntry = {
+      sourceId: entry.sourceId,
+      permission: { selectedItemIds: clone(entry.permission.selectedItemIds) }
+    };
+    return { state, entry, safeLanguage, grant, importRevision, validationEntry };
+  });
   let normalized;
   try {
-    normalized = normalizeSnapshotResult(await adapter.importApprovedSnapshot({ sourceId, grant: clone(grant) }), entry);
+    normalized = normalizeSnapshotResult(await adapter.importApprovedSnapshot({ sourceId, grant: clone(started.grant) }), started.validationEntry);
   } catch (error) {
     const failed = await failClosedAfterOperation({
       stateStore,
       adapter,
       sourceId,
-      expectedRevision: importRevision,
-      grantId: grant.id,
+      expectedRevision: started.importRevision,
+      grantId: started.grant.id,
       expectedState: SOURCE_STATUS_STATES.IMPORTING,
       expectedPermissionStatuses: ["active"],
       error,
@@ -905,91 +1002,99 @@ export async function importSimulatedExportSnapshot({
     return { sourceStatus: publicSourceStatus(failed.entry, languageFor(failed.state, language)), snapshotRecords: [] };
   }
 
-  const beforeFinalization = await loadState(stateStore);
-  const beforeFinalizationEntry = requireEntry(rootLifecycle(beforeFinalization), sourceId);
-  if (!operationStillCurrent(beforeFinalizationEntry, {
-    revision: importRevision,
-    grantId: grant.id,
-    state: SOURCE_STATUS_STATES.IMPORTING,
-    permissionStatuses: ["active"]
-  })) {
-    // A revoke persisted while the adapter was importing. Keep the stale
-    // result out of local state and out of the response.
-    await revokeAdapterPermission(adapter, grant.id).catch(() => false);
-    return {
-      sourceStatus: publicSourceStatus(beforeFinalizationEntry, languageFor(beforeFinalization, language)),
-      snapshotRecords: []
-    };
-  }
+  const finalization = await withSourceStatusStateLock(stateStore, async () => {
+    const beforeFinalization = await loadState(stateStore);
+    const beforeFinalizationEntry = requireEntry(rootLifecycle(beforeFinalization), sourceId);
+    if (!operationStillCurrent(beforeFinalizationEntry, {
+      revision: started.importRevision,
+      grantId: started.grant.id,
+      state: SOURCE_STATUS_STATES.IMPORTING,
+      permissionStatuses: ["active"]
+    })) {
+      return { stale: true, entry: beforeFinalizationEntry, state: beforeFinalization };
+    }
 
-  const finalizationAt = isoNow(clock);
-  beforeFinalizationEntry.permission.status = "consuming-revocation-pending";
-  beforeFinalizationEntry.permission.revocationConfirmed = false;
-  beforeFinalizationEntry.snapshotImport = {
-    status: "revocation-pending",
-    snapshotLabel: null,
-    importedAt: null,
-    records: []
-  };
-  beforeFinalizationEntry.audit.push({ type: "simulated-snapshot-import-finalization-started", at: finalizationAt, grantId: grant.id, sourceBodiesRead: false });
-  const finalizationRevision = bumpEntryRevision(beforeFinalizationEntry);
-  await stateStore.save(beforeFinalization);
-
-  const revoked = await revokeAdapterPermission(adapter, grant.id).catch(() => false);
-  const afterFinalization = await loadState(stateStore);
-  const finalizedEntry = requireEntry(rootLifecycle(afterFinalization), sourceId);
-  if (!operationStillCurrent(finalizedEntry, {
-    revision: finalizationRevision,
-    grantId: grant.id,
-    state: SOURCE_STATUS_STATES.IMPORTING,
-    permissionStatuses: ["consuming-revocation-pending"]
-  })) {
-    return {
-      sourceStatus: publicSourceStatus(finalizedEntry, languageFor(afterFinalization, language)),
-      snapshotRecords: []
-    };
-  }
-
-  const importedAt = isoNow(clock);
-  if (!revoked) {
-    // The adapter may still hold the one-time permission. Do not save or
-    // return even opaque snapshot references until that closure is confirmed.
-    finalizedEntry.snapshotImport = {
-      status: "revocation-unconfirmed",
+    const finalizationAt = isoNow(clock);
+    beforeFinalizationEntry.permission.status = "consuming-revocation-pending";
+    beforeFinalizationEntry.permission.revocationConfirmed = false;
+    beforeFinalizationEntry.snapshotImport = {
+      status: "revocation-pending",
       snapshotLabel: null,
       importedAt: null,
       records: []
     };
-    finalizedEntry.permission.status = "revocation-unconfirmed";
-    finalizedEntry.permission.revokedAt = null;
-    finalizedEntry.permission.revocationConfirmed = false;
-    finalizedEntry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
-    finalizedEntry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
-    finalizedEntry.lastSafeError = { code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED", stage: "post-import-revocation", at: importedAt, sourceBodiesRead: false };
-    finalizedEntry.audit.push({ type: "simulated-snapshot-import-paused-for-unconfirmed-revocation", at: importedAt, recordCountDiscarded: normalized.records.length, sourceBodiesRead: false });
-    bumpEntryRevision(finalizedEntry);
-    await stateStore.save(afterFinalization);
-    return { sourceStatus: publicSourceStatus(finalizedEntry, languageFor(afterFinalization, language)), snapshotRecords: [] };
+    beforeFinalizationEntry.audit.push({ type: "simulated-snapshot-import-finalization-started", at: finalizationAt, grantId: started.grant.id, sourceBodiesRead: false });
+    const finalizationRevision = bumpEntryRevision(beforeFinalizationEntry);
+    await stateStore.save(beforeFinalization);
+    return { stale: false, entry: beforeFinalizationEntry, state: beforeFinalization, finalizationRevision };
+  });
+
+  if (finalization.stale) {
+    // A revoke persisted while the adapter was importing. Discard the stale
+    // result before it reaches state or the caller, then make the adapter
+    // grant unusable without taking the state lock.
+    await revokeAdapterPermission(adapter, started.grant.id).catch(() => false);
+    return {
+      sourceStatus: publicSourceStatus(finalization.entry, languageFor(finalization.state, language)),
+      snapshotRecords: []
+    };
   }
 
-  finalizedEntry.snapshotImport = {
-    status: "imported",
-    snapshotLabel: normalized.snapshotLabel,
-    importedAt,
-    records: normalized.records
-  };
-  finalizedEntry.permission.status = "consumed-and-revoked";
-  finalizedEntry.permission.revokedAt = importedAt;
-  finalizedEntry.permission.revocationConfirmed = true;
-  finalizedEntry.state = SOURCE_STATUS_STATES.IMPORTED;
-  finalizedEntry.resumeState = SOURCE_STATUS_STATES.IMPORTED;
-  finalizedEntry.lastSafeError = null;
-  finalizedEntry.audit.push({ type: "simulated-snapshot-imported", at: importedAt, recordCount: normalized.records.length, oneTimePermissionClosed: true, sourceBodiesRead: false });
-  bumpEntryRevision(finalizedEntry);
-  await stateStore.save(afterFinalization);
+  const revoked = await revokeAdapterPermission(adapter, started.grant.id).catch(() => false);
+  const finalized = await withSourceStatusStateLock(stateStore, async () => {
+    const afterFinalization = await loadState(stateStore);
+    const finalizedEntry = requireEntry(rootLifecycle(afterFinalization), sourceId);
+    if (!operationStillCurrent(finalizedEntry, {
+      revision: finalization.finalizationRevision,
+      grantId: started.grant.id,
+      state: SOURCE_STATUS_STATES.IMPORTING,
+      permissionStatuses: ["consuming-revocation-pending"]
+    })) {
+      return { stale: true, entry: finalizedEntry, state: afterFinalization };
+    }
+
+    const importedAt = isoNow(clock);
+    if (!revoked) {
+      // The adapter may still hold the one-time permission. Do not save or
+      // return even opaque snapshot references until that closure is confirmed.
+      finalizedEntry.snapshotImport = {
+        status: "revocation-unconfirmed",
+        snapshotLabel: null,
+        importedAt: null,
+        records: []
+      };
+      finalizedEntry.permission.status = "revocation-unconfirmed";
+      finalizedEntry.permission.revokedAt = null;
+      finalizedEntry.permission.revocationConfirmed = false;
+      finalizedEntry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
+      finalizedEntry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
+      finalizedEntry.lastSafeError = { code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED", stage: "post-import-revocation", at: importedAt, sourceBodiesRead: false };
+      finalizedEntry.audit.push({ type: "simulated-snapshot-import-paused-for-unconfirmed-revocation", at: importedAt, recordCountDiscarded: normalized.records.length, sourceBodiesRead: false });
+      bumpEntryRevision(finalizedEntry);
+      await stateStore.save(afterFinalization);
+      return { stale: false, entry: finalizedEntry, state: afterFinalization, snapshotRecords: [] };
+    }
+
+    finalizedEntry.snapshotImport = {
+      status: "imported",
+      snapshotLabel: normalized.snapshotLabel,
+      importedAt,
+      records: normalized.records
+    };
+    finalizedEntry.permission.status = "consumed-and-revoked";
+    finalizedEntry.permission.revokedAt = importedAt;
+    finalizedEntry.permission.revocationConfirmed = true;
+    finalizedEntry.state = SOURCE_STATUS_STATES.IMPORTED;
+    finalizedEntry.resumeState = SOURCE_STATUS_STATES.IMPORTED;
+    finalizedEntry.lastSafeError = null;
+    finalizedEntry.audit.push({ type: "simulated-snapshot-imported", at: importedAt, recordCount: normalized.records.length, oneTimePermissionClosed: true, sourceBodiesRead: false });
+    bumpEntryRevision(finalizedEntry);
+    await stateStore.save(afterFinalization);
+    return { stale: false, entry: finalizedEntry, state: afterFinalization, snapshotRecords: normalized.records.map((record) => ({ ...record })) };
+  });
   return {
-    sourceStatus: publicSourceStatus(finalizedEntry, languageFor(afterFinalization, language)),
-    snapshotRecords: normalized.records.map((record) => ({ ...record }))
+    sourceStatus: publicSourceStatus(finalized.entry, languageFor(finalized.state, language)),
+    snapshotRecords: finalized.stale ? [] : finalized.snapshotRecords
   };
 }
 
@@ -1005,18 +1110,35 @@ export async function revokeSimulatedExportPermission({
 } = {}) {
   assertNaturalLanguage(message, "revoke");
   assertSourceId(sourceId);
-  const state = await loadState(stateStore);
-  const records = rootLifecycle(state);
-  const entry = requireEntry(records, sourceId);
-  const safeLanguage = languageFor(state, language);
-  if (entry.permission.reviewId !== reviewId) {
-    throw new SourceStatusError("STALE_SIMULATED_EXPORT_REVIEW", "That earlier review cannot revoke or change the current source state.");
-  }
-  if (entry.state === SOURCE_STATUS_STATES.REVOKED) return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
-  if (permissionMayRemainActive(entry)) {
+  const staged = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const records = rootLifecycle(state);
+    const entry = requireEntry(records, sourceId);
+    const safeLanguage = languageFor(state, language);
+    if (entry.permission.reviewId !== reviewId) {
+      throw new SourceStatusError("STALE_SIMULATED_EXPORT_REVIEW", "That earlier review cannot revoke or change the current source state.");
+    }
+    if (entry.state === SOURCE_STATUS_STATES.REVOKED) {
+      return { adapterCleanupRequired: false, entry, state, safeLanguage };
+    }
+    if (!permissionMayRemainActive(entry)) {
+      const now = isoNow(clock);
+      entry.permission.status = "revoked";
+      entry.permission.revokedAt = now;
+      entry.permission.revocationConfirmed = true;
+      entry.state = SOURCE_STATUS_STATES.REVOKED;
+      entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
+      entry.lastSafeError = null;
+      entry.audit.push({ type: "simulated-export-permission-revoked", at: now, reviewId, sourceBodiesRead: false });
+      records.audit.push({ type: "simulated-export-permission-revoked", at: now, sourceId, reviewId, sourceBodiesRead: false });
+      bumpEntryRevision(entry);
+      await stateStore.save(state);
+      return { adapterCleanupRequired: false, entry, state, safeLanguage };
+    }
     if (!adapter || adapter.isSimulation !== true || typeof adapter.revokeSnapshotPermission !== "function") {
       throw new TypeError("A simulated generic-export adapter with revokeSnapshotPermission() is required to revoke an active or unresolved permission.");
     }
+
     const now = isoNow(clock);
     const grantId = entry.permission.grantId;
     entry.state = SOURCE_STATUS_STATES.NEEDS_ATTENTION;
@@ -1026,59 +1148,99 @@ export async function revokeSimulatedExportPermission({
     entry.audit.push({ type: "simulated-export-revocation-started", at: now, grantId, sourceBodiesRead: false });
     const revocationRevision = bumpEntryRevision(entry);
     await stateStore.save(state);
+    return { adapterCleanupRequired: true, entry, state, safeLanguage, now, grantId, revocationRevision };
+  });
 
-    const revoked = typeof grantId === "string" && OPAQUE_ID.test(grantId)
-      ? await revokeAdapterPermission(adapter, grantId).catch(() => false)
-      : false;
+  if (!staged.adapterCleanupRequired) {
+    return { sourceStatus: publicSourceStatus(staged.entry, staged.safeLanguage) };
+  }
+
+  const revoked = typeof staged.grantId === "string" && OPAQUE_ID.test(staged.grantId)
+    ? await revokeAdapterPermission(adapter, staged.grantId).catch(() => false)
+    : false;
+  const finalized = await withSourceStatusStateLock(stateStore, async () => {
     const refreshed = await loadState(stateStore);
     const refreshedRecords = rootLifecycle(refreshed);
     const refreshedEntry = requireEntry(refreshedRecords, sourceId);
     if (!operationStillCurrent(refreshedEntry, {
-      revision: revocationRevision,
-      grantId,
+      revision: staged.revocationRevision,
+      grantId: staged.grantId,
       state: SOURCE_STATUS_STATES.NEEDS_ATTENTION,
       permissionStatuses: ["revocation-pending"]
     })) {
-      return { sourceStatus: publicSourceStatus(refreshedEntry, languageFor(refreshed, language)) };
+      return { entry: refreshedEntry, state: refreshed, stale: true };
     }
     if (!revoked) {
       refreshedEntry.permission.status = "revocation-unconfirmed";
       refreshedEntry.permission.revocationConfirmed = false;
-      refreshedEntry.lastSafeError = { code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED", stage: "permission-revocation", at: now, sourceBodiesRead: false };
-      refreshedEntry.audit.push({ type: "simulated-export-revocation-unconfirmed", at: now, grantId, sourceBodiesRead: false });
+      refreshedEntry.lastSafeError = { code: "SIMULATED_EXPORT_REVOCATION_UNCONFIRMED", stage: "permission-revocation", at: staged.now, sourceBodiesRead: false };
+      refreshedEntry.audit.push({ type: "simulated-export-revocation-unconfirmed", at: staged.now, grantId: staged.grantId, sourceBodiesRead: false });
       bumpEntryRevision(refreshedEntry);
       await stateStore.save(refreshed);
-      return { sourceStatus: publicSourceStatus(refreshedEntry, languageFor(refreshed, language)) };
+      return { entry: refreshedEntry, state: refreshed, stale: false };
     }
 
     refreshedEntry.permission.status = "revoked";
-    refreshedEntry.permission.revokedAt = now;
+    refreshedEntry.permission.revokedAt = staged.now;
     refreshedEntry.permission.revocationConfirmed = true;
     refreshedEntry.state = SOURCE_STATUS_STATES.REVOKED;
     refreshedEntry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
     refreshedEntry.lastSafeError = null;
-    refreshedEntry.audit.push({ type: "simulated-export-permission-revoked", at: now, reviewId, sourceBodiesRead: false });
-    refreshedRecords.audit.push({ type: "simulated-export-permission-revoked", at: now, sourceId, reviewId, sourceBodiesRead: false });
+    refreshedEntry.audit.push({ type: "simulated-export-permission-revoked", at: staged.now, reviewId, sourceBodiesRead: false });
+    refreshedRecords.audit.push({ type: "simulated-export-permission-revoked", at: staged.now, sourceId, reviewId, sourceBodiesRead: false });
     bumpEntryRevision(refreshedEntry);
     await stateStore.save(refreshed);
-    return { sourceStatus: publicSourceStatus(refreshedEntry, languageFor(refreshed, language)) };
-  }
-  const now = isoNow(clock);
-  entry.permission.status = "revoked";
-  entry.permission.revokedAt = now;
-  entry.permission.revocationConfirmed = true;
-  entry.state = SOURCE_STATUS_STATES.REVOKED;
-  entry.resumeState = SOURCE_STATUS_STATES.NOT_STARTED;
-  entry.lastSafeError = null;
-  entry.audit.push({ type: "simulated-export-permission-revoked", at: now, reviewId, sourceBodiesRead: false });
-  records.audit.push({ type: "simulated-export-permission-revoked", at: now, sourceId, reviewId, sourceBodiesRead: false });
-  bumpEntryRevision(entry);
-  await stateStore.save(state);
-  return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
+    return { entry: refreshedEntry, state: refreshed, stale: false };
+  });
+  return { sourceStatus: publicSourceStatus(finalized.entry, languageFor(finalized.state, language)) };
+}
+
+/**
+ * Reconciles a saved importing state after a process interruption. It never
+ * resumes an unknown in-flight adapter call: it closes the possible one-time
+ * permission first, then requires a fresh metadata-only preview before retry.
+ */
+export async function recoverInterruptedSimulatedExportImport({
+  message,
+  stateStore,
+  adapter,
+  sourceId = "simulated-export",
+  language,
+  clock
+} = {}) {
+  assertNaturalLanguage(message, "revoke");
+  assertSourceId(sourceId);
+  const saved = await withSourceStatusStateLock(stateStore, async () => {
+    const state = await loadState(stateStore);
+    const entry = requireEntry(rootLifecycle(state), sourceId);
+    if (entry.state !== SOURCE_STATUS_STATES.IMPORTING) {
+      throw new SourceStatusError("SIMULATED_IMPORT_NOT_INTERRUPTED", "This source is not waiting on an interrupted simulated import, so there is no import permission to reconcile.");
+    }
+    if (!entry.permission.reviewId) {
+      throw new SourceStatusError("SIMULATED_IMPORT_REVIEW_MISSING", "The interrupted import has no safe saved review reference, so I kept it blocked instead of guessing which permission to revoke.");
+    }
+    return { reviewId: entry.permission.reviewId };
+  });
+  const revoked = await revokeSimulatedExportPermission({
+    message,
+    stateStore,
+    adapter,
+    sourceId,
+    reviewId: saved.reviewId,
+    language,
+    clock
+  });
+  return {
+    ...revoked,
+    recovery: {
+      interruptedImportReconciled: revoked.sourceStatus.granularPermission.revocationConfirmed === true,
+      retryRequiresFreshMetadataPreview: revoked.sourceStatus.state === SOURCE_STATUS_STATES.REVOKED
+    }
+  };
 }
 
 /** Skips an optional source only while it has no active permission. */
-export async function skipOptionalSource({
+async function skipOptionalSourceInternal({
   message,
   stateStore,
   sourceId = "simulated-export",
@@ -1113,8 +1275,13 @@ export async function skipOptionalSource({
   return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
 }
 
+/** Skips only while the shared lifecycle confirms no permission may remain active. */
+export async function skipOptionalSource(args = {}) {
+  return withSourceStatusStateLock(args?.stateStore, () => skipOptionalSourceInternal(args));
+}
+
 /** Restores only the previously saved optional state; it never restores a grant. */
-export async function resumeOptionalSource({
+async function resumeOptionalSourceInternal({
   message,
   stateStore,
   sourceId = "simulated-export",
@@ -1144,8 +1311,12 @@ export async function resumeOptionalSource({
   return { sourceStatus: publicSourceStatus(entry, safeLanguage) };
 }
 
+export async function resumeOptionalSource(args = {}) {
+  return withSourceStatusStateLock(args?.stateStore, () => resumeOptionalSourceInternal(args));
+}
+
 /** Records an honest unsupported state without attempting an adapter connection. */
-export async function explainUnsupportedSource({
+async function explainUnsupportedSourceInternal({
   message,
   stateStore,
   requestedSource,
@@ -1171,6 +1342,10 @@ export async function explainUnsupportedSource({
   return { sourceStatus: publicSourceStatus(records.entries[sourceId], languageFor(state, language)) };
 }
 
+export async function explainUnsupportedSource(args = {}) {
+  return withSourceStatusStateLock(args?.stateStore, () => explainUnsupportedSourceInternal(args));
+}
+
 /** Read-only lookup. It never invokes an adapter. */
 export async function getSourceStatus({ stateStore, sourceId = "simulated-export", language } = {}) {
   assertStateStore(stateStore);
@@ -1185,6 +1360,7 @@ export async function getSourceStatus({ stateStore, sourceId = "simulated-export
 function normalizeAdapterName(adapter) {
   const normalized = typeof adapter === "string" ? adapter.trim().toLowerCase() : "";
   if (["gmail", "gmail-readonly"].includes(normalized)) return SOURCE_ADAPTER_NAMES.GMAIL;
+  if (["calendar", "google-calendar", "google-calendar-readonly"].includes(normalized)) return SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR;
   if (["drive", "google-drive", "google-drive-folder-scope"].includes(normalized)) return SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE;
   if (["imessage", "imessage-beta", "i-message"].includes(normalized)) return SOURCE_ADAPTER_NAMES.IMESSAGE;
   if (["simulated-export", "simulated-generic-export", "generic-export"].includes(normalized)) return SOURCE_ADAPTER_NAMES.GENERIC_EXPORT;
@@ -1235,6 +1411,21 @@ function stateForAdapter(adapter, reported) {
       "authorization-cancelled": SOURCE_STATUS_STATES.NEEDS_ATTENTION,
       "needs-attention": SOURCE_STATUS_STATES.NEEDS_ATTENTION
     },
+    [SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR]: {
+      "metadata-retry-required": SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      "awaiting-grant": SOURCE_STATUS_STATES.AWAITING_GRANT,
+      denied: SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      "grant-retry-required": SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      "ready-to-import": SOURCE_STATUS_STATES.READY_TO_IMPORT,
+      "fetch-retry-required": SOURCE_STATUS_STATES.NEEDS_ATTENTION,
+      imported: SOURCE_STATUS_STATES.IMPORTED,
+      "imported-partially": SOURCE_STATUS_STATES.IMPORTED,
+      empty: SOURCE_STATUS_STATES.IMPORTED,
+      "empty-partial": SOURCE_STATUS_STATES.IMPORTED,
+      "access-revoked": SOURCE_STATUS_STATES.REVOKED,
+      revoked: SOURCE_STATUS_STATES.REVOKED,
+      unavailable: SOURCE_STATUS_STATES.NEEDS_ATTENTION
+    },
     [SOURCE_ADAPTER_NAMES.IMESSAGE]: {
       "awaiting-macos-permission": SOURCE_STATUS_STATES.NOT_STARTED,
       "snapshot-available": SOURCE_STATUS_STATES.NOT_STARTED,
@@ -1253,6 +1444,7 @@ function stateForAdapter(adapter, reported) {
 function isKnownAdapterStatus(adapter, reported) {
   const known = {
     [SOURCE_ADAPTER_NAMES.GMAIL]: ["selected-but-unfinished", "awaiting-privacy-review", "ready-to-verify", "importing", "imported", "skipped", "revoked", "unsupported", "needs-attention", "live-and-verified", "authorization-denied", "authorization-cancelled"],
+    [SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR]: ["metadata-retry-required", "awaiting-grant", "denied", "grant-retry-required", "ready-to-import", "fetch-retry-required", "imported", "imported-partially", "empty", "empty-partial", "access-revoked", "revoked", "unavailable"],
     [SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE]: ["awaiting-authorization", "awaiting-folder-review", "ready-to-fetch", "importing", "imported", "revoked", "authorization-unavailable", "authorization-denied", "authorization-cancelled", "needs-attention"],
     [SOURCE_ADAPTER_NAMES.IMESSAGE]: ["awaiting-macos-permission", "snapshot-available", "awaiting-content-grant", "ready-to-process", "processed", "revoked", "unsupported", "needs-attention"],
     [SOURCE_ADAPTER_NAMES.GENERIC_EXPORT]: Object.values(SOURCE_STATUS_STATES)
@@ -1290,6 +1482,7 @@ export function normalizeAdapterSourceStatus({ sourceId, adapter, adapterStatus,
 function persistedSourceInstanceId(adapter, accountId) {
   const prefix = {
     [SOURCE_ADAPTER_NAMES.GMAIL]: "gmail",
+    [SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR]: "calendar",
     [SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE]: "drive",
     [SOURCE_ADAPTER_NAMES.IMESSAGE]: "imessage"
   }[adapter] ?? "adapter";
@@ -1304,10 +1497,68 @@ function authorizationOutcomeFor(adapter, reported) {
   return null;
 }
 
-function persistedAdapterSourceStatus({ sourceId, adapter, adapterStatus, language }) {
+function safePersistedIso(value) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+/**
+ * A live Gmail handoff is allowed only when the application itself persisted
+ * the full outcome of the official read-only lifecycle. A string status, a
+ * caller-supplied evidence object, or a simulated plugin can never meet these
+ * linked evidence requirements.
+ */
+function trustedPersistedGmailLiveVerification(state, entry) {
+  const accountId = typeof entry?.accountId === "string" && OPAQUE_ID.test(entry.accountId) ? entry.accountId : null;
+  const reviewId = typeof entry?.reviewId === "string" && OPAQUE_ID.test(entry.reviewId) ? entry.reviewId : null;
+  const verifiedAt = safePersistedIso(entry?.connection?.verifiedAt);
+  if (!accountId || !reviewId || !verifiedAt
+    || entry?.status !== "live-and-verified"
+    || entry?.connection?.state !== "live-and-verified"
+    || entry?.connection?.live !== true
+    || entry?.connection?.readOnly !== true
+    || entry?.connection?.simulationOnly !== false
+    || entry?.plugin?.status !== "connected"
+    || entry?.plugin?.simulated !== false) {
+    return null;
+  }
+  const permissionEntry = state?.sourcePermissionLifecycle?.entries?.[`gmail:${encodeURIComponent(accountId)}`];
+  const activeGrant = permissionEntry?.grants?.find((grant) => (
+    grant?.status === "active"
+    && grant?.source === "gmail"
+    && grant?.accountId === accountId
+    && grant?.reviewId === reviewId
+    && grant?.scope
+  ));
+  if (permissionEntry?.status !== "granted" || permissionEntry?.review?.id !== reviewId || permissionEntry?.review?.metadata?.account?.id !== accountId || !activeGrant) {
+    return null;
+  }
+  const readback = (Array.isArray(entry?.audit) ? entry.audit : []).find((event) => (
+    event?.type === "gmail-approved-page-processed"
+    && event?.actualRead === true
+    && event?.simulated === false
+    && event?.bodiesExposed === false
+    && safePersistedIso(event?.at)
+  ));
+  if (!readback) return null;
+  return {
+    connectorId: `gmail-readonly:${accountId}`,
+    source: "gmail",
+    accountContext: `gmail:${accountId}`,
+    readOnly: true,
+    independentlyVerified: true,
+    verificationMethod: "persisted-official-read-only-readback",
+    verifiedAt,
+    processingComplete: entry?.import?.complete === true && entry?.import?.status === "complete"
+  };
+}
+
+function persistedAdapterSourceStatus({ sourceId, adapter, adapterStatus, language, trustedLiveVerification = null }) {
   const candidate = reportedStatusValue(adapterStatus);
   const reported = isKnownAdapterStatus(adapter, candidate) ? candidate : null;
-  const state = stateForAdapter(adapter, reported);
+  const state = trustedLiveVerification
+    ? trustedLiveVerification.processingComplete ? SOURCE_STATUS_STATES.IMPORTED : SOURCE_STATUS_STATES.IMPORTING
+    : stateForAdapter(adapter, reported);
   const entry = {
     ...defaultEntry(sourceId, "1970-01-01T00:00:00.000Z"),
     adapter,
@@ -1322,16 +1573,33 @@ function persistedAdapterSourceStatus({ sourceId, adapter, adapterStatus, langua
   };
   const authorizationOutcome = authorizationOutcomeFor(adapter, reported);
   const result = publicSourceStatus(entry, language, {
-    adapterReportedState: reported,
-    statusOrigin: "persisted-local-lifecycle",
-    authorizationOutcome
+    adapterReportedState: trustedLiveVerification ? null : reported,
+    statusOrigin: trustedLiveVerification ? "trusted-persisted-gmail-lifecycle" : "persisted-local-lifecycle",
+    authorizationOutcome,
+    trustedLiveVerification
   });
   result.source.kind = "persisted-adapter-lifecycle";
   result.source.label = adapter === SOURCE_ADAPTER_NAMES.GMAIL
     ? "Gmail source status"
+    : adapter === SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR
+      ? "Google Calendar source status"
     : adapter === SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE
       ? "Google Drive source status"
       : "iMessage beta source status";
+  if (trustedLiveVerification) {
+    result.message = language === "es"
+      ? "Gmail confirmó una lectura real y de solo lectura dentro del alcance aprobado. La conexión se muestra como en vivo y verificada."
+      : "Gmail confirmed a real, read-only read within the approved scope. The connection is shown as live and verified.";
+    result.snapshotImport = {
+      status: trustedLiveVerification.processingComplete ? "verified-read-only-lifecycle" : "verified-read-only-checkpoint",
+      snapshotLabel: null,
+      simulated: false,
+      importedAt: trustedLiveVerification.processingComplete ? trustedLiveVerification.verifiedAt : null,
+      recordCount: 0,
+      records: []
+    };
+    result.liveVerification = clone(trustedLiveVerification);
+  }
   if (authorizationOutcome) {
     const isEs = language === "es";
     result.nextAction = {
@@ -1355,6 +1623,17 @@ function persistedAdapterStatuses(state, language) {
       sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GMAIL, gmailEntry.accountId),
       adapter: SOURCE_ADAPTER_NAMES.GMAIL,
       adapterStatus: reported,
+      trustedLiveVerification: trustedPersistedGmailLiveVerification(state, gmailEntry),
+      language
+    }));
+  }
+
+  for (const entry of Object.values(state?.googleCalendarLifecycle?.entries ?? {})) {
+    if (!entry || typeof entry !== "object") continue;
+    statuses.push(persistedAdapterSourceStatus({
+      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, entry.accountId),
+      adapter: SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR,
+      adapterStatus: entry.status,
       language
     }));
   }
@@ -1388,7 +1667,7 @@ function persistedAdapterStatuses(state, language) {
  */
 export function getPersistedAdapterSourceStatus({ state, adapter, accountId, language = "en" } = {}) {
   const normalizedAdapter = normalizeAdapterName(adapter);
-  if (![SOURCE_ADAPTER_NAMES.GMAIL, SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, SOURCE_ADAPTER_NAMES.IMESSAGE].includes(normalizedAdapter)) {
+  if (![SOURCE_ADAPTER_NAMES.GMAIL, SOURCE_ADAPTER_NAMES.GOOGLE_CALENDAR, SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, SOURCE_ADAPTER_NAMES.IMESSAGE].includes(normalizedAdapter)) {
     return null;
   }
   const expectedId = persistedSourceInstanceId(normalizedAdapter, accountId);
@@ -1410,14 +1689,33 @@ function persistedGenericSourceStatuses(state, language) {
   });
 }
 
-function releaseGate(language) {
+function releaseGate(language, adapterStatuses) {
+  const verifiedLiveConnectors = (Array.isArray(adapterStatuses) ? adapterStatuses : [])
+    .filter((status) => (
+      status?.connection?.live === true
+      && status?.connection?.independentlyVerified === true
+      && status?.connection?.readOnly === true
+      && status?.liveVerification?.verificationMethod === "persisted-official-read-only-readback"
+    ))
+    .map((status) => ({
+      connectorId: status.liveVerification.connectorId,
+      source: status.liveVerification.source,
+      accountContext: status.liveVerification.accountContext,
+      readOnly: true,
+      independentlyVerified: true,
+      verificationMethod: status.liveVerification.verificationMethod,
+      verifiedAt: status.liveVerification.verifiedAt
+    }));
+  const satisfied = verifiedLiveConnectors.length > 0;
   return {
     ...LIVE_CONNECTOR_RELEASE_GATE,
-    status: "unsatisfied",
-    satisfied: false,
-    verifiedLiveConnectors: [],
-    message: wording(language).releaseGateUnsatisfied,
-    note: "QWA-149 has no trusted persisted connector, grant, and independent read-verification record. Caller-supplied evidence and adapter status text are ignored; a separately reviewed live-connector lifecycle must satisfy this gate."
+    status: satisfied ? "satisfied" : "unsatisfied",
+    satisfied,
+    verifiedLiveConnectors,
+    message: satisfied ? wording(language).releaseGateSatisfied : wording(language).releaseGateUnsatisfied,
+    note: satisfied
+      ? "The gate is satisfied only by a qualifying Gmail record persisted through the approved read-only lifecycle. Caller-supplied evidence and adapter status text remain ignored."
+      : "QWA-149 has no trusted persisted connector, grant, and independent read-verification record. Caller-supplied evidence and adapter status text are ignored; a separately reviewed live-connector lifecycle must satisfy this gate."
   };
 }
 
@@ -1445,7 +1743,7 @@ export async function getSourceStatusHandoff({ stateStore, language } = {}) {
         finalCategories: Object.values(SOURCE_HANDOFF_CATEGORIES),
         explanation: "A source is never presented as live merely because an adapter reports a connection-like state. Final handoff entries are derived from persisted local lifecycle state only."
       },
-      releaseGate: releaseGate(safeLanguage),
+      releaseGate: releaseGate(safeLanguage, adapters),
       sections,
       sources
     }

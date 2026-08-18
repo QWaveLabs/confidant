@@ -14,7 +14,8 @@ import {
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
   grantSourcePermission,
-  revokeSourcePermission
+  revokeSourcePermission,
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -561,7 +562,7 @@ function validateConnectionResult(result) {
  * function it gives exactly one in-app fallback action and performs no source
  * access. A successful plugin connection still is not a live verification.
  */
-export async function beginGmailConnection({ message, stateStore, plugin, language, clock } = {}) {
+async function beginGmailConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
   assertNaturalLanguage(message, "start");
   const state = await loadState(stateStore);
   const entry = prepareFreshEntry(state, clock);
@@ -616,8 +617,12 @@ export async function beginGmailConnection({ message, stateStore, plugin, langua
   return { gmail: publicView(entry, locale) };
 }
 
+export async function beginGmailConnection(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginGmailConnectionInternal(args));
+}
+
 /** Runs the QWA-139 metadata-only preflight after a saved Gmail plugin connection. */
-export async function beginGmailPrivacyReview({ message, stateStore, plugin, language, clock, reviewIdFactory } = {}) {
+async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, language, clock, reviewIdFactory } = {}) {
   assertNaturalLanguage(message, "start");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -669,8 +674,12 @@ export async function beginGmailPrivacyReview({ message, stateStore, plugin, lan
   }
 }
 
+export async function beginGmailPrivacyReview(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginGmailPrivacyReviewInternal(args));
+}
+
 /** Saves a granular QWA-139 grant; it does not read Gmail itself. */
-export async function grantGmailReadOnlyScope({ message, stateStore, plugin, scope, language, clock, grantIdFactory } = {}) {
+async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, scope, language, clock, grantIdFactory } = {}) {
   assertNaturalLanguage(message, "grant");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -711,8 +720,12 @@ export async function grantGmailReadOnlyScope({ message, stateStore, plugin, sco
   }
 }
 
+export async function grantGmailReadOnlyScope(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => grantGmailReadOnlyScopeInternal(args));
+}
+
 /** Cancels the saved review without reading mail; a later retry must start a fresh metadata review. */
-export async function cancelGmailReadOnlyScope({ message, stateStore, language, clock } = {}) {
+async function cancelGmailReadOnlyScopeInternal({ message, stateStore, language, clock } = {}) {
   assertNaturalLanguage(message, "cancel");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -738,6 +751,10 @@ export async function cancelGmailReadOnlyScope({ message, stateStore, language, 
   updated.audit.push({ type: "gmail-permission-cancelled", at: isoNow(clock), reviewId: updated.reviewId, bodiesExposed: false });
   await stateStore.save(state);
   return { gmail: publicView(updated, locale, denied.permissionReview), message: copy(locale).permissionCancelled };
+}
+
+export async function cancelGmailReadOnlyScope(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => cancelGmailReadOnlyScopeInternal(args));
 }
 
 function pageBudget(value) {
@@ -816,7 +833,7 @@ async function synchronizeExternalRevocation({ stateStore, plugin, entry, langua
  * Each page is committed as a checkpoint, so a later interruption resumes from
  * the exact next opaque page token instead of restarting a large account.
  */
-export async function fetchApprovedGmailReferences({ message, stateStore, plugin, language, clock, maxPages } = {}) {
+async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugin, language, clock, maxPages } = {}) {
   assertNaturalLanguage(message, "fetch");
   const budget = pageBudget(maxPages);
   let state = await loadState(stateStore);
@@ -924,8 +941,12 @@ export async function fetchApprovedGmailReferences({ message, stateStore, plugin
   };
 }
 
+export async function fetchApprovedGmailReferences(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedGmailReferencesInternal(args));
+}
+
 /** Revokes only the persisted local grant; it cannot change any Gmail message. */
-export async function revokeGmailReadOnlyConnection({ message, stateStore, plugin, language, clock } = {}) {
+async function revokeGmailReadOnlyConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
   assertNaturalLanguage(message, "revoke");
   const initial = await loadState(stateStore);
   const entry = requireEntry(initial);
@@ -965,12 +986,77 @@ export async function revokeGmailReadOnlyConnection({ message, stateStore, plugi
   }
 }
 
-/** Skipping Gmail is non-destructive and keeps the rest of setup resumable. */
-export async function skipGmailConnection({ message, stateStore, language, clock } = {}) {
+export async function revokeGmailReadOnlyConnection(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeGmailReadOnlyConnectionInternal(args));
+}
+
+/**
+ * Skipping Gmail is non-destructive only after an existing granular permission
+ * is closed. A skip must never turn an active local/plugin grant into a
+ * customer-visible "skipped" state.
+ */
+async function skipGmailConnectionInternal({ message, stateStore, plugin, language, clock } = {}) {
   assertNaturalLanguage(message, "skip");
-  const state = await loadState(stateStore);
-  const entry = prepareFreshEntry(state, clock);
+  let state = await loadState(stateStore);
+  let entry = getEntry(state);
+  if (!entry) {
+    entry = newEntry(isoNow(clock));
+    rootLifecycle(state).entry = entry;
+  }
   const locale = languageFor(state, language);
+  const permission = entry.accountId
+    ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
+    : null;
+  const activeGrant = permission?.permissionReview?.activeGrant;
+
+  if (activeGrant) {
+    if (!plugin || !entry.reviewId) {
+      entry.status = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
+      entry.connection.state = GMAIL_CONNECTION_STATES.NEEDS_ATTENTION;
+      entry.connection.live = false;
+      entry.import.status = "paused-after-error";
+      entry.pendingAction = { kind: "revoke-active-gmail-grant-before-skip", message: copy(locale).retrySavedStep };
+      entry.lastSafeError = { code: "GMAIL_SKIP_REVOCATION_REQUIRED", stage: "skip-revocation", at: isoNow(clock) };
+      entry.audit.push({ type: "gmail-skip-blocked-active-grant", at: isoNow(clock), grantId: activeGrant.grantId, bodiesExposed: false });
+      await stateStore.save(state);
+      return { gmail: publicView(entry, locale, permission.permissionReview), recoverable: true };
+    }
+
+    try {
+      const revoked = await revokeSourcePermission({
+        message,
+        stateStore,
+        connector: new GmailReadOnlyConnector({ plugin }),
+        source: SOURCE,
+        accountId: entry.accountId,
+        reviewId: entry.reviewId,
+        language: locale,
+        clock
+      });
+      // Reload after the generic lifecycle confirms revocation so a resumed
+      // FileStateStore never saves the stale pre-revocation Gmail root.
+      state = await loadState(stateStore);
+      entry = requireEntry(state);
+      entry.status = GMAIL_CONNECTION_STATES.SKIPPED;
+      entry.connection.state = GMAIL_CONNECTION_STATES.SKIPPED;
+      entry.connection.live = false;
+      entry.import.status = "skipped";
+      entry.pendingAction = null;
+      entry.audit.push({ type: "gmail-skipped-after-grant-revocation", at: isoNow(clock), grantId: activeGrant.grantId, bodiesExposed: false });
+      await stateStore.save(state);
+      return { gmail: publicView(entry, locale, revoked.permissionReview) };
+    } catch (error) {
+      state = await loadState(stateStore);
+      entry = requireEntry(state);
+      setFailure(state, entry, { code: safeErrorCode(error, "GMAIL_SKIP_REVOCATION_FAILED"), stage: "skip-revocation", clock, language: locale });
+      await stateStore.save(state);
+      const current = entry.accountId
+        ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
+        : null;
+      return { gmail: publicView(entry, locale, current?.permissionReview), recoverable: true };
+    }
+  }
+
   entry.status = GMAIL_CONNECTION_STATES.SKIPPED;
   entry.connection.state = GMAIL_CONNECTION_STATES.SKIPPED;
   entry.connection.live = false;
@@ -979,6 +1065,10 @@ export async function skipGmailConnection({ message, stateStore, language, clock
   entry.audit.push({ type: "gmail-skipped", at: isoNow(clock), bodiesExposed: false });
   await stateStore.save(state);
   return { gmail: publicView(entry, locale) };
+}
+
+export async function skipGmailConnection(args = {}) {
+  return withSourcePermissionStateLock(args?.stateStore, () => skipGmailConnectionInternal(args));
 }
 
 /** Status is local-state-only and never invokes a Gmail plugin or source read. */

@@ -8,7 +8,10 @@
  * connector contract.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 
 export const PERMISSION_SOURCE_KINDS = Object.freeze({
   gmail: "communication",
@@ -58,6 +61,14 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+// Each lifecycle writer saves the complete Setup Session root object. Separate
+// source-specific locks would still allow a stale root from another lifecycle
+// to restore a revoked grant. FileStateStore instances can also be reopened
+// through equivalent lexical paths, so the shared lock identity is based on
+// the canonical backing file when one exists.
+const stateStoreOperationTails = new Map();
+const inMemoryStateStoreOperationKeys = new WeakMap();
+const stateStoreLockContext = new AsyncLocalStorage();
 
 export class PermissionLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -76,6 +87,66 @@ function isoNow(clock) {
 function assertStateStore(stateStore) {
   if (!stateStore || typeof stateStore.load !== "function" || typeof stateStore.save !== "function") {
     throw new TypeError("A persistent stateStore with load() and save() is required.");
+  }
+}
+
+function canonicalStateStorePath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return typeof realpathSync.native === "function" ? realpathSync.native(resolved) : realpathSync(resolved);
+  } catch {
+    // Before bootstrap creates the state file, canonicalize its existing
+    // parent. This still collapses symlinked directories and lexical ../ paths
+    // whenever possible without creating any filesystem state.
+    const parent = path.dirname(resolved);
+    try {
+      const canonicalParent = typeof realpathSync.native === "function"
+        ? realpathSync.native(parent)
+        : realpathSync(parent);
+      return path.join(canonicalParent, path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function stateStoreOperationKey(stateStore) {
+  if (typeof stateStore?.filePath === "string" && stateStore.filePath) {
+    return `file:${canonicalStateStorePath(stateStore.filePath)}`;
+  }
+  let key = inMemoryStateStoreOperationKeys.get(stateStore);
+  if (!key) {
+    key = {};
+    inMemoryStateStoreOperationKeys.set(stateStore, key);
+  }
+  return key;
+}
+
+/**
+ * Serializes full read-modify-write lifecycle operations for one persisted
+ * Setup Session, including distinct FileStateStore instances for the same
+ * file. This is intentionally wider than a source or account: stateStore.save
+ * writes the entire root document, so any concurrent lifecycle writer could
+ * otherwise restore stale entries for a different source.
+ */
+export async function withSourcePermissionStateLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  const inherited = stateStoreLockContext.getStore();
+  if (inherited?.keys?.has(key)) return operation();
+
+  const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
+  await previous.catch(() => undefined);
+  const keys = new Set(inherited?.keys ?? []);
+  keys.add(key);
+  try {
+    return await stateStoreLockContext.run({ keys }, operation);
+  } finally {
+    release();
   }
 }
 

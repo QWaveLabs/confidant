@@ -106,6 +106,7 @@ export {
   grantSimulatedExportPermission,
   importSimulatedExportSnapshot,
   normalizeAdapterSourceStatus,
+  recoverInterruptedSimulatedExportImport,
   resumeOptionalSource,
   revokeSimulatedExportPermission,
   skipOptionalSource
