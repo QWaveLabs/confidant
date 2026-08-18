@@ -108,7 +108,15 @@ become a competing authority.
   zero-link data and path absence before reporting a removal. A hardlinked
   orphan or malformed generation remains in place, is returned as
   needs-attention, and cannot create recovered expired lifecycle truth; safe
-  single-link artifacts are removed only after their absence is verified.
+  single-link artifacts are removed only after their absence is verified. A
+  verified removed orphan, malformed lease, tracked invalid generation, or
+  other non-expiry cleanup persists a bounded discarded status and cause; it
+  is absent from `expiredBatchIds` and is never projected as expired or
+  available. Only the exact tracked `{batchId, leaseId}` generation whose
+  durable cleanup reason is exactly `expired` can enter expired lifecycle and
+  public status. Public restart regressions cover single-link orphan,
+  malformed-lease, and tracked-invalid cleanup, while retaining a legitimate
+  exact-generation expiry control.
 - Successful compilation deletes the protected batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
   `lstat`, then opened without following links and checked with `fstat`; exact
@@ -179,9 +187,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **47/47 passed**.
+- QWA-146 focused suite: **48/48 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **95/95 passed**.
+- Full repository suite: **96/96 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full

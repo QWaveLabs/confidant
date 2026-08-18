@@ -19,6 +19,22 @@ const BATCH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 const POLL_MS = 250;
 const HEARTBEAT_MS = 1_000;
+const MAX_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_REASONS = new Set([
+  "compiled",
+  "discarded",
+  "expired",
+  "explicit-delete",
+  "invalid-generation",
+  "orphaned-generation",
+  "retention-unavailable",
+  "stage-write-failed",
+  "verified-early-absence"
+]);
+
+function boundedCleanupReason(value) {
+  return typeof value === "string" && CLEANUP_REASONS.has(value) ? value : "unknown-cleanup";
+}
 
 function canonicalTimestamp(value) {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return null;
@@ -210,6 +226,7 @@ async function markTombstoneBlocked(job) {
     leaseId: job.leaseId,
     deleteStartedAt,
     dataUnlinkVerified: false,
+    reason: boundedCleanupReason(existing?.reason),
     cleanupBlockedReason: "multiple-links-after-unlink",
     detectedAt: new Date().toISOString()
   });
@@ -285,7 +302,7 @@ function validTombstoneBase(value, job) {
     && canonicalTimestamp(value.deleteStartedAt));
 }
 
-async function ensureTombstone(job) {
+async function ensureTombstone(job, reason) {
   const paths = artifactPaths(job.root, job.batchId, job.leaseId);
   const existing = await readJson(paths.tombstone).catch(() => null);
   if (existing) return validTombstoneBase(existing, job) && existing.cleanupBlockedReason == null
@@ -296,7 +313,8 @@ async function ensureTombstone(job) {
     batchId: job.batchId,
     leaseId: job.leaseId,
     deleteStartedAt: new Date().toISOString(),
-    dataUnlinkVerified: false
+    dataUnlinkVerified: false,
+    reason: boundedCleanupReason(reason)
   };
   try {
     await durableJsonWrite(paths.tombstone, tombstone, { exclusive: true });
@@ -312,7 +330,7 @@ async function removeOwnership(job) {
   try { await unlinkAndSync(paths.owner); } catch {}
 }
 
-async function finalizeGenerationDeletion(job) {
+async function finalizeGenerationDeletion(job, reason) {
   const rootStats = await lstat(job.root).catch(() => null);
   if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) return "superseded";
   const rootReal = await realpath(job.root).catch(() => null);
@@ -320,7 +338,6 @@ async function finalizeGenerationDeletion(job) {
   const paths = artifactPaths(job.root, job.batchId, job.leaseId);
   if (Object.values(paths).some((target) => dirname(target) !== job.root)) return "superseded";
   const existingTombstone = await readJson(paths.tombstone).catch(() => null);
-  const lease = await readJson(paths.lease).catch(() => null);
   const dataAbsentBeforeMarker = await pathAbsent(paths.data).catch(() => false);
   const leaseAbsentBeforeMarker = await pathAbsent(paths.lease).catch(() => false);
   if (dataAbsentBeforeMarker && leaseAbsentBeforeMarker && !existingTombstone) {
@@ -330,7 +347,7 @@ async function finalizeGenerationDeletion(job) {
     await removeOwnership(job);
     return "superseded";
   }
-  const tombstone = await ensureTombstone(job);
+  const tombstone = await ensureTombstone(job, reason);
   if (!tombstone) return "retry";
 
   const dataOutcome = await unlinkSingleLinkData(job, tombstone);
@@ -345,7 +362,8 @@ async function finalizeGenerationDeletion(job) {
       version: STAGING_VERSION,
       batchId: job.batchId,
       leaseId: job.leaseId,
-      deletedAt: new Date().toISOString()
+      deletedAt: new Date().toISOString(),
+      reason: boundedCleanupReason(tombstone.value.reason)
     });
   } catch {
     // Paths are already absent and the durable tombstone is content-free.
@@ -357,18 +375,23 @@ async function finalizeGenerationDeletion(job) {
   return "deleted";
 }
 
-async function shouldDeleteEarly(job) {
+async function cleanupReasonFor(job) {
   const paths = artifactPaths(job.root, job.batchId, job.leaseId);
   const lease = await readJson(paths.lease).catch(() => null);
   const dataAbsent = await pathAbsent(paths.data).catch(() => false);
-  if (!lease) return true;
-  const validLease = lease.version === STAGING_VERSION
+  if (!lease && dataAbsent) return "verified-early-absence";
+  const createdAt = canonicalTimestamp(lease?.createdAt);
+  const expiresAt = canonicalTimestamp(lease?.expiresAt);
+  const validLease = lease?.version === STAGING_VERSION
     && lease.batchId === job.batchId
     && lease.leaseId === job.leaseId
-    && lease.expiresAt === job.expiresAt
+    && expiresAt === job.expiresAt
+    && createdAt
+    && Date.parse(expiresAt) - Date.parse(createdAt) === MAX_STAGING_AGE_MS
     && ["prepared", "ready"].includes(lease.phase);
-  if (!validLease) return Date.now() >= Date.parse(job.expiresAt);
-  return lease.phase === "ready" && dataAbsent;
+  if (!validLease) return Date.now() >= Date.parse(job.expiresAt) ? "invalid-generation" : null;
+  if (Date.now() >= Date.parse(job.expiresAt)) return "expired";
+  return lease.phase === "ready" && dataAbsent ? "verified-early-absence" : null;
 }
 
 async function confirmSchedule(job) {
@@ -405,8 +428,9 @@ async function main() {
       lastHeartbeat = Date.now();
       if (!owner) return;
     }
-    if (Date.now() >= Date.parse(job.expiresAt) || await shouldDeleteEarly(job)) {
-      const outcome = await finalizeGenerationDeletion(job).catch(() => "retry");
+    const cleanupReason = await cleanupReasonFor(job);
+    if (cleanupReason) {
+      const outcome = await finalizeGenerationDeletion(job, cleanupReason).catch(() => "retry");
       if (outcome === "deleted" || outcome === "superseded") return;
     }
     await new Promise((resolvePoll) => setTimeout(resolvePoll, POLL_MS));

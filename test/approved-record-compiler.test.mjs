@@ -1847,6 +1847,9 @@ test("a fresh staging adapter removes an expired durable batch on restart and le
     const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
     assert.equal(status.compilation.status, "expired");
     assert.equal(status.compilation.staging.status, "expired-deleted");
+    assert.equal(status.compilation.staging.cause, null);
+    assert.match(status.compilation.message, /expired/i);
+    assert.doesNotMatch(status.compilation.message, /available/i);
     assert.deepEqual(await readdir(root), []);
   });
 });
@@ -2131,22 +2134,95 @@ test("restart removes single-link orphan and malformed generations only after ve
     await writeFile(malformedDataPath, "SAFE-MALFORMED-CLEANUP\n", "utf8");
     await writeFile(malformedLeasePath, "{not-valid-json\n", "utf8");
 
-    const staging = fixtureStaging(root);
-    await staging.initialize();
-    const cleanup = await staging.cleanupExpired({ now: laterToday });
+    const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+    await startSetupSession({
+      message: "Set up my second brain",
+      answers: { displayName: "Fixture", focus: "verify untracked cleanup truth" },
+      decisions: { vaultName: "Fixture Second Brain", language: "en" },
+      stateStore,
+      adapters: {
+        environment: new SimulatedEnvironmentAdapter(),
+        obsidian: new SimulatedObsidianAdapter(),
+        vault: new SimulatedDesktopVaultAdapter()
+      },
+      clock: clockAt(startedAt),
+      installationIdFactory: () => "fixture-untracked-cleanup-installation"
+    });
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: fixtureStaging(root),
+      clock: clockAt(laterToday)
+    });
 
-    assert.deepEqual(cleanup.removedBatchIds, [malformedBatchId, orphanBatchId].sort());
-    assert.deepEqual(cleanup.cleanupNeedsAttentionBatchIds, []);
-    assert.deepEqual(cleanup.removedBatches.map(({ batchId, reason }) => ({ batchId, reason })).sort((a, b) => a.batchId.localeCompare(b.batchId)), [
-      { batchId: malformedBatchId, reason: "invalid-generation" },
-      { batchId: orphanBatchId, reason: "orphaned-generation" }
-    ].sort((a, b) => a.batchId.localeCompare(b.batchId)));
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
     for (const target of [orphanPath, malformedDataPath, malformedLeasePath]) {
       await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+    for (const [batchId, expectedStatus, expectedCause] of [
+      [orphanBatchId, "discarded-orphaned-generation", "orphaned-generation"],
+      [malformedBatchId, "discarded-invalid-generation", "invalid-generation"]
+    ]) {
+      const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+      assert.equal(status.compilation.status, "discarded");
+      assert.equal(status.compilation.staging.status, expectedStatus);
+      assert.equal(status.compilation.staging.cause, expectedCause);
+      assert.equal(status.compilation.staging.needsAttention, false);
+      assert.equal(status.compilation.retryable, false);
+      assert.equal(typeof status.compilation.staging.deletedAt, "string");
+      assert.doesNotMatch(status.compilation.message, /expired|available/i);
     }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a tracked invalid generation is discarded across restart without public expiry truth", async () => {
+  await withCompilerFixture(async ({ directory, stateStore, staging, gmail }) => {
+    const batchId = "fixture-tracked-invalid-restart";
+    await compileApprovedRecords({
+      message: "Compile my approved notes",
+      stateStore,
+      staging: new FailOnceReadStaging(staging),
+      batchId,
+      approvedRecords: [approvedRecord(gmail, [
+        assertion("knowledge", "knowledge-fixture-tracked-invalid", "Tracked invalid generation", "An invalid tracked generation is discarded without expiry truth.")
+      ])],
+      clock: clockAt(startedAt)
+    });
+
+    const durable = await stateStore.load();
+    const leaseId = durable.knowledgeCompilationLifecycle.batches[batchId].staging.leaseId;
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const artifacts = stagingArtifacts(root, batchId, leaseId);
+    const invalidPayload = JSON.parse(await readFile(artifacts.data, "utf8"));
+    invalidPayload.createdAt = "2026-08-17T11:59:59.000Z";
+    await writeFile(artifacts.data, `${JSON.stringify(invalidPayload)}\n`, "utf8");
+
+    const cleanupProcess = fixtureStaging(root);
+    await cleanupProcess.initialize();
+    for (const target of [artifacts.data, artifacts.lease]) {
+      await assert.rejects(() => lstat(target), (error) => error?.code === "ENOENT");
+    }
+    assert.equal((await lstat(artifacts.receipt)).isFile(), true);
+
+    const cleanup = await cleanupExpiredKnowledgeStaging({
+      stateStore,
+      staging: fixtureStaging(root),
+      clock: clockAt(laterToday)
+    });
+    assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+    const status = await getKnowledgeCompilationStatus({ stateStore, batchId });
+    assert.equal(status.compilation.status, "discarded");
+    assert.equal(status.compilation.staging.status, "discarded-invalid-generation");
+    assert.equal(status.compilation.staging.cause, "invalid-generation");
+    assert.equal(status.compilation.staging.needsAttention, false);
+    assert.equal(status.compilation.retryable, false);
+    assert.equal(typeof status.compilation.staging.deletedAt, "string");
+    assert.doesNotMatch(status.compilation.message, /expired|available/i);
+    assert.deepEqual(await readdir(root), []);
+  });
 });
 
 test("retention arming occurs before a temporary batch write and fails closed when the service is unavailable", async () => {
@@ -2531,7 +2607,7 @@ test("a restart that cannot restore independent retention coverage discards the 
         batchId,
         clock: clockAt("2026-08-17T13:06:00.000Z")
       }),
-      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_EXPIRED"
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_DISCARDED"
     );
   });
 });
