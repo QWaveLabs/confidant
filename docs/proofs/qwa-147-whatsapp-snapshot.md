@@ -40,9 +40,21 @@ The manifest accepts only this metadata shape (values below are illustrative):
       "type": "direct",
       "participantIds": ["person-id"],
       "sensitivity": "general",
-      "media": "none",
+      "media": "present",
+      "mediaInventory": [
+        {
+          "id": "media-id",
+          "segmentId": "segment-id",
+          "messageId": "message-id",
+          "path": "media/item.bin",
+          "sha256": "<64 lowercase hex characters>",
+          "bytes": 123,
+          "mimeType": "application/octet-stream"
+        }
+      ],
       "segments": [
         {
+          "id": "segment-id",
           "path": "segments/chat-1.jsonl",
           "sha256": "<64 lowercase hex characters>",
           "bytes": 123,
@@ -56,9 +68,13 @@ The manifest accepts only this metadata shape (values below are illustrative):
 }
 ```
 
-Manifest, account, person, chat, and segment objects reject unknown fields.
-That means `body`, `content`, `text`, message arrays, media bodies, and similar
-content cannot be smuggled into metadata preflight.
+Manifest, account, person, chat, segment, and media-inventory objects reject
+unknown fields. That means `body`, `content`, `text`, message arrays, media
+bodies, and similar content cannot be smuggled into metadata preflight. The
+inventory is bounded during preflight and binds every opaque media ID to one
+chat, segment, and message plus one relative path, byte size, SHA-256 digest,
+and allowlisted inert MIME type. `media: "none"` requires an empty inventory;
+`media: "present"` requires a non-empty one.
 
 Each JSONL line is opened only after grant and accepts exactly:
 
@@ -107,6 +123,8 @@ Selection is fail-closed:
 - dates must be strict UTC timestamps, remain inside the reviewed window, and
   end no later than capture;
 - media must be an explicit boolean and is immutable in the grant; and
+- the normalized selected media inventory is bound into the snapshot,
+  selection, grant, fetch plan, and unit receipts;
 - unknown access, sensitivity, participants, media state, MIME type, or record
   metadata stops processing.
 
@@ -117,7 +135,7 @@ manifest. Private durable state retains opaque snapshot and selection bindings
 needed for replay defense, but never the raw mapping, raw generation, full
 manifest digest, or per-content-file paths/digests. Public output exposes no
 path or digest; it contains only local aliases such as `wa-account-*`, `wa-person-*`,
-`wa-chat-*`, `wa-message-*`, and `wa-media-*`, generic labels, and an opaque
+`wa-chat-*`, `wa-segment-*`, `wa-message-*`, and `wa-media-*`, generic labels, and an opaque
 snapshot reference. The connector rejects a caller-supplied account reference
 unless it already uses the local `wa-account-*` namespace. The unsupported
 Business status boundary enforces the same account-alias rule.
@@ -171,19 +189,35 @@ Callers may only lower these limits.
   retry resumes the same generation instead of adopting an unrelated review.
 - Review and grant identifiers cannot be reused across generations, and every
   public mutation requires the current numeric generation.
-- The generic permission layer persists an alias-only fetch receipt before the
-  outer lifecycle marks processing complete. An outer final-save failure is
-  reconciled from that receipt without another body read.
+- The connector creates one bounded opaque work plan: every selected segment
+  in deterministic order, followed by media units only when media was
+  explicitly approved. No media unit can open until all segment receipts are
+  durably present and their record media sets exactly match the manifest
+  inventory.
+- Before each segment or media open, the outer lifecycle persists an exact
+  pre-read pending unit. The generic permission layer then persists an
+  alias-only post-read receipt. Only a matching plan/unit receipt advances the
+  outer cursor. The final processed state has an exact completion receipt over
+  every ordered unit receipt.
+- An outer cursor/final-save failure is reconciled from the generic unit
+  receipt. After process restart, completed segments and completed media are
+  never reopened; processing resumes at the first unit without a committed
+  receipt.
 - If the fetch outcome lacks a durable receipt, status becomes
   `fetch-interrupted`; there is no automatic retry. A customer must explicitly
-  confirm retry. Same-process retries use the connector's immutable idempotency
-  cache; after process loss, an explicitly confirmed retry may re-read the same
-  unchanged approved files.
+  confirm retry. Only that unconfirmed unit may be retried; already committed
+  units remain behind the durable cursor. A process death after a raw read but
+  before its post-read receipt is inherently ambiguous, so the implementation
+  blocks instead of claiming that unit completed.
 - Deny, cancel, revoke, repeated revoke, restart, and cleanup are generation
-  safe. Revocation is exactly once and never mutates the source files. The
-  connector must read back the exact local grant as inactive and revoked before
-  the lifecycle confirms removal. A nonthrowing but lying revoke remains
+  safe. Before any adapter revoke, the lifecycle persists and reads back an
+  exact intent bound to generation, review, grant, snapshot, and selection. A
+  pending intent is a one-way gate: fetch, grant restore, grant, resume,
+  restart, cancel, denial, and cleanup cannot run; only exact revocation retry
+  is allowed. After process loss, retry invokes only revoke and confirms exact
+  grant readback before final `revoked`. A nonthrowing but lying revoke remains
   `revoke-unconfirmed`, blocks processing, and exposes only a retry action.
+  Revoke is idempotent in process and never mutates source files.
 - All full-root permission and WhatsApp transactions use the canonical
   process-local re-entrant lock. Internal specialized permission primitives may
   re-enter; descendant state-store and connector callbacks invoking a public
@@ -218,11 +252,11 @@ Final verified commands and exact results:
 
 | Command | Result |
 | --- | ---: |
-| `npm run test:qwa-147` | 46/46 passed |
+| `npm run test:qwa-147` | 62/62 passed |
 | `npm run test:qwa-139` | 10/10 passed |
 | `npm run test:qwa-142` | 8/8 passed |
 | `npm run test:qwa-150` | 6/6 passed |
-| `npm test` | 93/93 passed |
+| `npm test` | 109/109 passed |
 
 The focused suite covers zero-I/O construction, manifest-only lazy preflight,
 raw-value scans of public and persisted state, exact membership/sensitivity,
@@ -232,9 +266,13 @@ file replacement, timestamp/skew/record-capture rules, connector substitution,
 generation replay, all durable save seams, explicit retry, idempotency,
 concurrent fetch/revoke/cross-source writers, same-context callback re-entry,
 terminal revoke recovery, exact-grant revoke readback against a lying adapter,
-media-excluded zero-open behavior, cleanup/restart truth, Spanish behavior, and
-Business forgery rejection. Public and durable-state scans include raw account,
-person, chat, message, media, label, path, manifest-generation, and digest
+pre-adapter revoke-intent save failure, process-loss revoke retry without grant
+restore, manifest media-inventory substitution/extra/missing attacks with zero
+media opens, multi-segment late-failure and process-restart zero-reread proofs,
+ordered completion receipts, duplicate segment membership, media-excluded
+zero-open behavior, cleanup/restart truth, Spanish behavior, and Business
+forgery rejection. Public and durable-state scans include raw account, person,
+chat, segment, message, media, label, path, manifest-generation, and digest
 values.
 
 ## Honest release limitations
@@ -247,5 +285,9 @@ values.
 - The state lock is in-process only. This work does not claim cross-process or
   multi-host atomicity; a future durable state-store transaction contract is
   required for that.
+- A process death between a body read and its durable post-read receipt cannot
+  prove whether that one pending unit completed. It remains blocked and needs
+  an explicit retry; the implementation does not reread any earlier committed
+  unit.
 - Source export files remain customer-owned on disk and are not deleted by the
   application.

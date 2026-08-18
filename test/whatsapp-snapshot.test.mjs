@@ -99,6 +99,7 @@ async function createBundle(root, mutateManifest = (value) => value) {
   };
   for (const [name, bytes] of Object.entries(records)) await writeFile(path.join(root, "segments", `${name}.jsonl`), bytes);
   const segment = (name, from) => ({
+    id: `raw-segment-${name}`,
     path: `segments/${name}.jsonl`,
     sha256: sha256(records[name]),
     bytes: records[name].length,
@@ -117,15 +118,74 @@ async function createBundle(root, mutateManifest = (value) => value) {
       { id: "raw-person-blocked", label: "Morgan Secret", accessLevel: "blocked" }
     ],
     chats: [
-      { id: "raw-chat-allowed", label: "Private weekend", type: "direct", participantIds: ["raw-person-allowed"], sensitivity: "general", media: "none", segments: [segment("allowed", "2026-08-10T12:00:00.000Z")] },
-      { id: "raw-chat-media", label: "Private photos", type: "direct", participantIds: ["raw-person-allowed"], sensitivity: "general", media: "present", segments: [segment("media", "2026-08-11T12:00:00.000Z")] },
-      { id: "raw-chat-legal", label: "Private legal", type: "direct", participantIds: ["raw-person-allowed"], sensitivity: "legal-matters", media: "none", segments: [segment("legal", "2026-08-12T12:00:00.000Z")] },
-      { id: "raw-chat-blocked-group", label: "Private blocked group", type: "group", participantIds: ["raw-person-allowed", "raw-person-blocked"], sensitivity: "general", media: "none", segments: [segment("blocked", "2026-08-13T12:00:00.000Z")] }
+      { id: "raw-chat-allowed", label: "Private weekend", type: "direct", participantIds: ["raw-person-allowed"], sensitivity: "general", media: "none", mediaInventory: [], segments: [segment("allowed", "2026-08-10T12:00:00.000Z")] },
+      {
+        id: "raw-chat-media",
+        label: "Private photos",
+        type: "direct",
+        participantIds: ["raw-person-allowed"],
+        sensitivity: "general",
+        media: "present",
+        mediaInventory: [{
+          id: "raw-media-photo",
+          segmentId: "raw-segment-media",
+          messageId: "raw-message-media",
+          path: "media/photo.bin",
+          sha256: sha256(media),
+          bytes: media.length,
+          mimeType: "application/octet-stream"
+        }],
+        segments: [segment("media", "2026-08-11T12:00:00.000Z")]
+      },
+      { id: "raw-chat-legal", label: "Private legal", type: "direct", participantIds: ["raw-person-allowed"], sensitivity: "legal-matters", media: "none", mediaInventory: [], segments: [segment("legal", "2026-08-12T12:00:00.000Z")] },
+      { id: "raw-chat-blocked-group", label: "Private blocked group", type: "group", participantIds: ["raw-person-allowed", "raw-person-blocked"], sensitivity: "general", media: "none", mediaInventory: [], segments: [segment("blocked", "2026-08-13T12:00:00.000Z")] }
     ]
   });
   const manifestPath = path.join(root, "fixture.qwave-wa.json");
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return { manifest, manifestPath, records, media };
+}
+
+async function rewriteMediaRecord(bundleRoot, bundle, transform) {
+  const [record] = (await readFile(path.join(bundleRoot, "segments", "media.jsonl"), "utf8"))
+    .trimEnd().split("\n").map((line) => JSON.parse(line));
+  const bytes = jsonl([transform(structuredClone(record))]);
+  await writeFile(path.join(bundleRoot, "segments", "media.jsonl"), bytes);
+  const manifest = JSON.parse(await readFile(bundle.manifestPath, "utf8"));
+  const segment = manifest.chats[1].segments.find((candidate) => candidate.id === "raw-segment-media");
+  segment.sha256 = sha256(bytes);
+  segment.bytes = bytes.length;
+  segment.count = 1;
+  await writeFile(bundle.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  bundle.manifest = manifest;
+  bundle.records.media = bytes;
+}
+
+async function addSecondMediaSegment(bundleRoot, bundle) {
+  const record = {
+    id: "raw-message-media-second",
+    chatId: "raw-chat-media",
+    senderId: "raw-person-allowed",
+    sentAt: "2026-08-11T13:00:00.000Z",
+    sensitivity: "general",
+    text: "Synthetic second bounded page",
+    media: []
+  };
+  const bytes = jsonl([record]);
+  await writeFile(path.join(bundleRoot, "segments", "media-second.jsonl"), bytes);
+  const manifest = JSON.parse(await readFile(bundle.manifestPath, "utf8"));
+  manifest.chats[1].segments.push({
+    id: "raw-segment-media-second",
+    path: "segments/media-second.jsonl",
+    sha256: sha256(bytes),
+    bytes: bytes.length,
+    count: 1,
+    from: record.sentAt,
+    to: record.sentAt
+  });
+  await writeFile(bundle.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  bundle.manifest = manifest;
+  bundle.records.mediaSecond = bytes;
 }
 
 async function initializeState(stateStore, language = "en") {
@@ -365,7 +425,7 @@ test("media is immutable in the grant, digest-checked, and read only when explic
       "fixture-generation-1", "raw-account-secret", "Rob private WhatsApp", "raw-person-allowed", "raw-person-restricted", "raw-person-blocked",
       "Avery Secret", "Riley Secret", "Morgan Secret", "raw-chat-allowed", "raw-chat-media", "raw-chat-legal",
       "raw-chat-blocked-group", "Private weekend", "Private photos", "Private legal", "Private blocked group",
-      "raw-message-media", "raw-media-photo", "segments/media.jsonl", "media/photo.bin",
+      "raw-segment-media", "raw-message-media", "raw-media-photo", "segments/media.jsonl", "media/photo.bin",
       bundle.manifest.chats[1].segments[0].sha256, sha256(bundle.media), sha256(await readFile(bundle.manifestPath))
     ];
     for (const privateValue of privateValues) {
@@ -380,13 +440,71 @@ test("media is immutable in the grant, digest-checked, and read only when explic
   });
 });
 
+test("manifest-bound media inventory rejects undeclared, substituted, extra, and missing record media before any media open", async (t) => {
+  const replacement = {
+    id: "raw-media-extra",
+    path: "media/never-opened.bin",
+    sha256: sha256(Buffer.from("x")),
+    bytes: 1,
+    mimeType: "application/octet-stream"
+  };
+  const cases = [
+    ["substituted opaque id", (record) => { record.media[0].id = "raw-media-substitute"; return record; }],
+    ["substituted path", (record) => { record.media[0].path = "media/substitute.bin"; return record; }],
+    ["substituted digest", (record) => { record.media[0].sha256 = sha256(Buffer.from("substitute")); return record; }],
+    ["undeclared extra item", (record) => { record.media.push(replacement); return record; }],
+    ["missing declared item", (record) => { record.media = []; return record; }]
+  ];
+  for (const [name, transform] of cases) {
+    await t.test(name, async () => {
+      await withFixture(async ({ stateStore, connector, bundleRoot, bundle }) => {
+        await rewriteMediaRecord(bundleRoot, bundle, transform);
+        const reviewed = await review({ stateStore, connector, reviewId: `inventory-${name.replaceAll(" ", "-")}` });
+        const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+        const reviewId = `inventory-${name.replaceAll(" ", "-")}`;
+        await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId, chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: `${reviewId}-grant` });
+        const failed = await fetchApprovedWhatsAppSnapshotContent({ message: "Validate exact media inventory", stateStore, connector, accountId, generation: 1, reviewId, clock });
+        assert.equal(failed.explicitRetryRequired, true);
+        assert.equal(failed.whatsAppSnapshot.failure.code, "SNAPSHOT_MEDIA_BINDING_MISMATCH");
+        assert.equal(connector.mediaFileReads, 0);
+        assert.equal(connector.rawMediaBodiesRead, 0);
+      });
+    });
+  }
+
+  await t.test("manifest inventory item missing from its declared message", async () => {
+    await withFixture(async ({ stateStore, connector, bundle }) => {
+      const manifest = JSON.parse(await readFile(bundle.manifestPath, "utf8"));
+      manifest.chats[1].mediaInventory.push({
+        id: "raw-media-manifest-extra",
+        segmentId: "raw-segment-media",
+        messageId: "raw-message-media",
+        path: "media/manifest-extra.bin",
+        sha256: sha256(Buffer.from("y")),
+        bytes: 1,
+        mimeType: "application/octet-stream"
+      });
+      await writeFile(bundle.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const reviewed = await review({ stateStore, connector, reviewId: "inventory-manifest-extra" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "inventory-manifest-extra", chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: "inventory-manifest-extra-grant" });
+      const failed = await fetchApprovedWhatsAppSnapshotContent({ message: "Validate missing manifest media", stateStore, connector, accountId, generation: 1, reviewId: "inventory-manifest-extra", clock });
+      assert.equal(failed.whatsAppSnapshot.failure.code, "SNAPSHOT_MEDIA_BINDING_MISMATCH");
+      assert.equal(connector.mediaFileReads, 0);
+      assert.equal(connector.rawMediaBodiesRead, 0);
+    });
+  });
+});
+
 test("missing or unknown access, sensitivity, participant, media, and manifest body fields fail closed before body access", async (t) => {
   const cases = [
     ["missing access", (m) => { delete m.people[0].accessLevel; return m; }, /explicit Allowed, Restricted, or Blocked/i],
     ["unknown sensitivity", (m) => { m.chats[0].sensitivity = "mystery"; return m; }, /sensitivity classification/i],
     ["unknown participant", (m) => { m.chats[0].participantIds = ["not-listed"]; return m; }, /unknown participants/i],
     ["unknown media", (m) => { m.chats[0].media = "maybe"; return m; }, /declare whether media/i],
-    ["body in manifest", (m) => { m.chats[0].body = "pregrant secret"; return m; }, /unsupported fields/i]
+    ["body in manifest", (m) => { m.chats[0].body = "pregrant secret"; return m; }, /unsupported fields/i],
+    ["body in media inventory", (m) => { m.chats[1].mediaInventory[0].content = "pregrant media body"; return m; }, /unsupported fields/i],
+    ["unsafe media type", (m) => { m.chats[1].mediaInventory[0].mimeType = "text/html"; return m; }, /unsupported safe media type/i]
   ];
   for (const [name, mutateManifest, pattern] of cases) {
     await t.test(name, async () => {
@@ -540,6 +658,7 @@ test("archives, malformed/truncated/oversize files, symlinks, hardlinks, reposit
     }, { mutateManifest: (manifest) => {
       manifest.chats[0].segments.push({
         ...manifest.chats[0].segments[0],
+        id: "raw-segment-overlap",
         path: "segments/overlap.jsonl"
       });
       return manifest;
@@ -726,6 +845,93 @@ test("concurrent fetches and cross-source writers serialize on the canonical roo
     const root = JSON.parse(await readFile(statePath, "utf8"));
     assert.ok(root.sourcePermissionLifecycle.entries["gmail:cross-source-account"]);
     assert.equal(root.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`].status, "processed");
+  });
+});
+
+test("multi-segment durable cursors resume after process loss without rereading completed segments or media", async (t) => {
+  await t.test("a committed first-segment receipt resumes at the second segment", async () => {
+    await withFixture(async ({ stateStore, connector, connectorFactory, statePath, bundleRoot, bundle }) => {
+      await addSecondMediaSegment(bundleRoot, bundle);
+      const reviewed = await review({ stateStore, connector, reviewId: "multi-segment-restart" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "multi-segment-restart", chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: "multi-segment-restart-grant" });
+
+      const failing = new FailingStore(new FileStateStore(statePath));
+      failing.failOn.add(4); // outer cursor save after unit 0 receipt
+      failing.failOn.add(5); // recovery save, simulating process loss
+      await assert.rejects(() => fetchApprovedWhatsAppSnapshotContent({ message: "Process bounded pages", stateStore: failing, connector, accountId, generation: 1, reviewId: "multi-segment-restart", clock }), /synthetic durable save failure/);
+      assert.equal(connector.recordFileReads, 1);
+      assert.equal(connector.mediaFileReads, 0);
+
+      const restartedConnector = connectorFactory();
+      const resumed = await fetchApprovedWhatsAppSnapshotContent({ message: "Resume from durable unit receipt", stateStore: new FileStateStore(statePath), connector: restartedConnector, accountId, generation: 1, reviewId: "multi-segment-restart", clock });
+      assert.equal(resumed.whatsAppSnapshot.status, "processed");
+      assert.equal(resumed.approvedRecords.length, 2);
+      assert.equal(connector.recordFileReads, 1, "the original process read only the first completed segment");
+      assert.equal(restartedConnector.recordFileReads, 1, "the restarted process read only the not-yet-completed second segment");
+      assert.equal(restartedConnector.mediaFileReads, 1);
+
+      const persisted = JSON.parse(await readFile(statePath, "utf8"));
+      const fetchState = persisted.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`].fetch;
+      assert.equal(fetchState.cursor, 3);
+      assert.deepEqual(fetchState.receipts.map((receipt) => receipt.phase), ["segment", "segment", "media"]);
+      assert.deepEqual(fetchState.receipts.map((receipt) => receipt.index), [0, 1, 2]);
+      assert.equal(fetchState.pending, null);
+      assert.equal(fetchState.completionReceipt.unitCount, 3);
+      assert.match(fetchState.completionReceipt.receiptBinding, /^wa-completion-[a-f0-9]{24}$/);
+    });
+  });
+
+  await t.test("a committed final-media receipt completes after restart with zero new body opens", async () => {
+    await withFixture(async ({ stateStore, connector, connectorFactory, statePath, bundleRoot, bundle }) => {
+      await addSecondMediaSegment(bundleRoot, bundle);
+      const reviewed = await review({ stateStore, connector, reviewId: "media-receipt-restart" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "media-receipt-restart", chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: "media-receipt-restart-grant" });
+      const failing = new FailingStore(new FileStateStore(statePath));
+      failing.failOn.add(10); // final outer completion save
+      failing.failOn.add(11); // recovery save, simulating process loss
+      await assert.rejects(() => fetchApprovedWhatsAppSnapshotContent({ message: "Process every bounded unit", stateStore: failing, connector, accountId, generation: 1, reviewId: "media-receipt-restart", clock }), /synthetic durable save failure/);
+      assert.equal(connector.recordFileReads, 2);
+      assert.equal(connector.mediaFileReads, 1);
+
+      const restartedConnector = connectorFactory();
+      const recovered = await fetchApprovedWhatsAppSnapshotContent({ message: "Complete from the durable final receipt", stateStore: new FileStateStore(statePath), connector: restartedConnector, accountId, generation: 1, reviewId: "media-receipt-restart", clock });
+      assert.equal(recovered.whatsAppSnapshot.status, "processed");
+      assert.equal(restartedConnector.recordFileReads, 0);
+      assert.equal(restartedConnector.mediaFileReads, 0);
+      assert.equal(restartedConnector.rawMessageBodiesRead, 0);
+      assert.equal(restartedConnector.rawMediaBodiesRead, 0);
+    });
+  });
+
+  await t.test("duplicate message membership across segments blocks before media", async () => {
+    await withFixture(async ({ stateStore, connector, bundleRoot, bundle }) => {
+      await addSecondMediaSegment(bundleRoot, bundle);
+      const bytes = jsonl([{
+        id: "raw-message-media",
+        chatId: "raw-chat-media",
+        senderId: "raw-person-allowed",
+        sentAt: "2026-08-11T13:00:00.000Z",
+        sensitivity: "general",
+        text: "Duplicate opaque message membership",
+        media: []
+      }]);
+      await writeFile(path.join(bundleRoot, "segments", "media-second.jsonl"), bytes);
+      const manifest = JSON.parse(await readFile(bundle.manifestPath, "utf8"));
+      const second = manifest.chats[1].segments.find((segment) => segment.id === "raw-segment-media-second");
+      second.sha256 = sha256(bytes);
+      second.bytes = bytes.length;
+      await writeFile(bundle.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      const reviewed = await review({ stateStore, connector, reviewId: "duplicate-segment-message" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "duplicate-segment-message", chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: "duplicate-segment-message-grant" });
+      const failed = await fetchApprovedWhatsAppSnapshotContent({ message: "Validate exact segment membership", stateStore, connector, accountId, generation: 1, reviewId: "duplicate-segment-message", clock });
+      assert.equal(failed.whatsAppSnapshot.failure.code, "SNAPSHOT_IDENTIFIER_AMBIGUOUS");
+      assert.equal(connector.recordFileReads, 2);
+      assert.equal(connector.mediaFileReads, 0);
+      assert.equal(connector.rawMediaBodiesRead, 0);
+    });
   });
 });
 
@@ -932,8 +1138,9 @@ test("save failures before preflight/fetch prevent access, durable receipts reco
     await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "failure-review", chats: [ids.allowedChat], people: [ids.allowedPerson], grantId: "failure-grant" });
 
     const fetchStore = new FailingStore(new FileStateStore(statePath));
-    // Fetch performs: pending save, generic receipt save, final outer save.
-    fetchStore.failOn.add(fetchStore.saveCalls + 3);
+    // Fetch performs: plan save, unit-pending save, generic receipt save,
+    // then the outer cursor save. Fail only that last save.
+    fetchStore.failOn.add(fetchStore.saveCalls + 4);
     const recovered = await fetchApprovedWhatsAppSnapshotContent({ message: "Process", stateStore: fetchStore, connector, accountId, generation: 1, reviewId: "failure-review", clock });
     assert.equal(recovered.recoveredFromDurableReceipt, true);
     assert.equal(connector.recordFileReads, 1);
@@ -1058,6 +1265,73 @@ test("deny, cancel, revoke, restart, status reconciliation, and cleanup remain t
   });
 });
 
+test("durable exact revoke intent blocks restore/read and resumes only revocation after save failure or process loss", async (t) => {
+  await t.test("intent save failure invokes no adapter revoke", async () => {
+    await withFixture(async ({ stateStore, connector }) => {
+      const reviewed = await review({ stateStore, connector, reviewId: "revoke-intent-save" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "revoke-intent-save", chats: [ids.allowedChat], people: [ids.allowedPerson], grantId: "revoke-intent-save-grant" });
+      const failing = new FailingStore(stateStore);
+      failing.failNextSave();
+      await assert.rejects(() => revokeWhatsAppSnapshotContent({ message: "Persist exact revoke intent", stateStore: failing, connector, accountId, generation: 1, reviewId: "revoke-intent-save", clock }), /synthetic durable save failure/);
+      assert.equal(connector.grantRevocationCalls, 0);
+      assert.equal(connector.recordFileReads, 0);
+      const status = await getWhatsAppSnapshotStatus({ stateStore, accountId, clock });
+      assert.equal(status.whatsAppSnapshot.status, "ready-to-process");
+      const revoked = await revokeWhatsAppSnapshotContent({ message: "Retry exact revocation", stateStore, connector, accountId, generation: 1, reviewId: "revoke-intent-save", clock });
+      assert.equal(revoked.whatsAppSnapshot.status, "revoked");
+      assert.equal(connector.grantRevocationCalls, 1);
+    });
+  });
+
+  await t.test("post-adapter save failure leaves a durable one-way revoke gate across process restart", async () => {
+    await withFixture(async ({ stateStore, connector, connectorFactory, statePath }) => {
+      const reviewed = await review({ stateStore, connector, reviewId: "revoke-process-loss" });
+      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
+      await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "revoke-process-loss", chats: [ids.allowedChat], people: [ids.allowedPerson], grantId: "revoke-process-loss-grant" });
+      const failing = new FailingStore(new FileStateStore(statePath));
+      failing.failOn.add(2); // generic grant-state save after exact adapter readback
+      const pending = await revokeWhatsAppSnapshotContent({ message: "Revoke with an interrupted durable save", stateStore: failing, connector, accountId, generation: 1, reviewId: "revoke-process-loss", clock });
+      assert.equal(pending.revocationConfirmed, false);
+      assert.equal(pending.whatsAppSnapshot.status, "revoke-unconfirmed");
+      const persisted = JSON.parse(await readFile(statePath, "utf8"));
+      const entry = persisted.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`];
+      assert.equal(entry.revocation.status, "pending");
+      assert.equal(entry.revocation.generation, 1);
+      assert.equal(entry.revocation.reviewId, "revoke-process-loss");
+      assert.equal(entry.revocation.grantId, "revoke-process-loss-grant");
+      assert.match(entry.revocation.snapshotBinding, /^wa-snapshot-binding-[a-f0-9]{24}$/);
+      assert.match(entry.revocation.operationId, /^wa-revoke-[a-f0-9]{24}$/);
+      assert.equal(persisted.sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "granted");
+
+      const restartedConnector = connectorFactory();
+      const blocked = [
+        () => fetchApprovedWhatsAppSnapshotContent({ message: "Do not restore or read", stateStore, connector: restartedConnector, accountId, generation: 1, reviewId: "revoke-process-loss", clock }),
+        () => grantWhatsAppSnapshotContent({ message: "Do not restore the grant", stateStore, connector: restartedConnector, accountId, generation: 1, reviewId: "revoke-process-loss", clock }),
+        () => resumeWhatsAppSnapshotFetch({ message: "Do not resume a read", stateStore, accountId, generation: 1, reviewId: "revoke-process-loss", confirmRetry: true, clock }),
+        () => restartWhatsAppSnapshotReview({ message: "Do not replace the generation", stateStore, accountId, generation: 1, clock }),
+        () => cleanupWhatsAppSnapshotPrivateMemory({ message: "Do not clear revoke evidence", stateStore, connector: restartedConnector, accountId, generation: 1, clock })
+      ];
+      for (const action of blocked) {
+        await assert.rejects(action, (error) => error?.code === "WHATSAPP_REVOCATION_PENDING");
+      }
+      assert.equal(restartedConnector.grantRegistrationCalls, 0, "pending revocation never restores the durable grant");
+      assert.equal(restartedConnector.recordFileReads, 0);
+      assert.equal(restartedConnector.mediaFileReads, 0);
+
+      const revoked = await revokeWhatsAppSnapshotContent({ message: "Retry only the exact pending revocation", stateStore, connector: restartedConnector, accountId, generation: 1, reviewId: "revoke-process-loss", clock });
+      assert.equal(revoked.whatsAppSnapshot.status, "revoked");
+      assert.equal(revoked.revocationConfirmed, undefined);
+      assert.equal(restartedConnector.grantRegistrationCalls, 0);
+      assert.equal(restartedConnector.grantRevocationCalls, 1);
+      assert.equal(restartedConnector.recordFileReads, 0);
+      const finalState = JSON.parse(await readFile(statePath, "utf8"));
+      assert.equal(finalState.whatsAppSnapshotLifecycle.entries[`personal:${accountId}`].revocation.status, "completed");
+      assert.equal(finalState.sourcePermissionLifecycle.entries[`whatsapp:${accountId}`].status, "revoked");
+    });
+  });
+});
+
 test("generation tokens and unique review identifiers reject stale actions even after restart", async () => {
   await withFixture(async ({ stateStore, connector, connectorFactory }) => {
     const first = await review({ stateStore, connector, reviewId: "reused-review-id" });
@@ -1149,10 +1423,14 @@ test("record, media, path, and cumulative byte limits are enforced at their earl
       assert.equal(connector.recordFileReads, 0);
     }, { mutateManifest: (manifest) => { manifest.chats[0].segments[0].path = `${"a".repeat(1_050)}.jsonl`; return manifest; } });
   });
-  await t.test("media count stops before the unapproved extra media file opens", async () => {
+  await t.test("declared media count stops during preflight before any media file opens", async () => {
     await withFixture(async ({ stateStore, connector, bundleRoot, bundle }) => {
       const mediaBytes = bundle.media;
       const recordPath = path.join(bundleRoot, "segments", "media.jsonl");
+      const declaredMedia = [
+        { id: "raw-media-1", path: "media/photo.bin" },
+        { id: "raw-media-2", path: "media/never-opened.bin" }
+      ];
       const record = {
         id: "raw-message-media",
         chatId: "raw-chat-media",
@@ -1160,22 +1438,28 @@ test("record, media, path, and cumulative byte limits are enforced at their earl
         sentAt: "2026-08-11T12:00:00.000Z",
         sensitivity: "general",
         text: "Synthetic photo caption",
-        media: [1, 2].map((number) => ({ id: `raw-media-${number}`, path: "media/photo.bin", sha256: sha256(mediaBytes), bytes: mediaBytes.length, mimeType: "application/octet-stream" }))
+        media: declaredMedia.map((media) => ({ ...media, sha256: sha256(mediaBytes), bytes: mediaBytes.length, mimeType: "application/octet-stream" }))
       };
       const bytes = jsonl([record]);
       await writeFile(recordPath, bytes);
       const manifest = JSON.parse(await readFile(bundle.manifestPath, "utf8"));
       manifest.chats[1].segments[0].sha256 = sha256(bytes);
       manifest.chats[1].segments[0].bytes = bytes.length;
+      manifest.chats[1].mediaInventory = declaredMedia.map((media) => ({
+        ...media,
+        segmentId: "raw-segment-media",
+        messageId: "raw-message-media",
+        sha256: sha256(mediaBytes),
+        bytes: mediaBytes.length,
+        mimeType: "application/octet-stream"
+      }));
       await writeFile(bundle.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-      const limitedConnector = new LocalWhatsAppSnapshotConnector({ manifestPath: bundle.manifestPath, permittedRoot: bundleRoot, limits: { mediaFiles: 1 } });
-      const reviewed = await review({ stateStore, connector: limitedConnector, reviewId: "media-limit-review" });
-      const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
-      await selectAndGrant({ stateStore, connector: limitedConnector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "media-limit-review", chats: [ids.mediaChat], people: [ids.allowedPerson], includeMedia: true, grantId: "media-limit-grant" });
-      const failed = await fetchApprovedWhatsAppSnapshotContent({ message: "Process bounded media", stateStore, connector: limitedConnector, accountId, generation: 1, reviewId: "media-limit-review", clock });
-      assert.equal(failed.fetchUnavailable, true);
-      assert.equal(limitedConnector.mediaFileReads, 0, "declared media limits fail before any media file opens");
-      assert.equal(limitedConnector.rawMediaBodiesRead, 0);
+      const reviewed = await review({ stateStore, connector, reviewId: "media-limit-review" });
+      assert.equal(reviewed.metadataReviewUnavailable, true);
+      assert.equal(reviewed.whatsAppSnapshot.failure.code, "SNAPSHOT_MEDIA_LIMIT_EXCEEDED");
+      assert.equal(connector.recordFileReads, 0, "declared media limits fail during body-free preflight");
+      assert.equal(connector.mediaFileReads, 0, "declared media limits fail before any media file opens");
+      assert.equal(connector.rawMediaBodiesRead, 0);
     }, { limits: { mediaFiles: 1 } });
   });
 });
@@ -1230,7 +1514,7 @@ test("every durable save seam remains fail-closed and resumable without automati
       assert.equal(reconciledGrant.whatsAppSnapshot.status, "ready-to-process");
 
       const revokeFailure = new FailingStore(new FileStateStore(statePath));
-      revokeFailure.failOn.add(2);
+      revokeFailure.failOn.add(3);
       await assert.rejects(() => revokeWhatsAppSnapshotContent({ message: "Revoke", stateStore: revokeFailure, connector, accountId, generation: 1, reviewId: "reconcile-review", clock }), /synthetic durable save failure/);
       const reconciledRevoke = await getWhatsAppSnapshotStatus({ stateStore, accountId, clock });
       assert.equal(reconciledRevoke.whatsAppSnapshot.status, "revoked");
@@ -1250,7 +1534,7 @@ test("every durable save seam remains fail-closed and resumable without automati
       const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
       await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "receipt-save-review", chats: [ids.allowedChat], people: [ids.allowedPerson], grantId: "receipt-save-grant" });
       const failing = new FailingStore(new FileStateStore(statePath));
-      failing.failOn.add(2);
+      failing.failOn.add(3);
       const interrupted = await fetchApprovedWhatsAppSnapshotContent({ message: "Process", stateStore: failing, connector, accountId, generation: 1, reviewId: "receipt-save-review", clock });
       assert.equal(interrupted.explicitRetryRequired, true);
       assert.equal(connector.recordFileReads, 1);
@@ -1305,7 +1589,7 @@ test("every durable save seam remains fail-closed and resumable without automati
       const ids = refs(reviewed.whatsAppSnapshot.permissionReview);
       await selectAndGrant({ stateStore, connector, permissionReview: reviewed.whatsAppSnapshot.permissionReview, reviewId: "revoke-generic-save-review", chats: [ids.allowedChat], people: [ids.allowedPerson], grantId: "revoke-generic-save-grant" });
       const revokeFailure = new FailingStore(new FileStateStore(statePath));
-      revokeFailure.failNextSave();
+      revokeFailure.failOn.add(2);
       const unconfirmed = await revokeWhatsAppSnapshotContent({ message: "Revoke", stateStore: revokeFailure, connector, accountId, generation: 1, reviewId: "revoke-generic-save-review", clock });
       assert.equal(unconfirmed.revocationConfirmed, false);
       assert.equal(unconfirmed.whatsAppSnapshot.status, "revoke-unconfirmed");

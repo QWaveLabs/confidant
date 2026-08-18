@@ -202,7 +202,17 @@ function newEntry(accountId, now, generation = 1, earlierAudit = []) {
     selection: null,
     grantId: null,
     approvedRecords: null,
-    fetch: { status: "not-started", operationId: null, attempts: 0 },
+    fetch: {
+      status: "not-started",
+      operationId: null,
+      attempts: 0,
+      plan: null,
+      cursor: 0,
+      pending: null,
+      receipts: [],
+      completionReceipt: null
+    },
+    revocation: null,
     failure: null,
     audit: [...earlierAudit, { type: "whatsapp-personal-snapshot-offered", at: now, generation, sourceAccessed: false }]
   };
@@ -231,6 +241,189 @@ function safeFailure(error, fallback, at) {
   return { code, at };
 }
 
+function isRevocationPending(entry) {
+  return entry.revocation?.status === "pending";
+}
+
+function assertNoRevocationPending(entry) {
+  if (isRevocationPending(entry)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "The exact local grant has a durable revocation pending. Only retrying that revocation is allowed until exact removal is confirmed.");
+  }
+}
+
+function snapshotBindingDigest(entry) {
+  return `wa-snapshot-binding-${hash(JSON.stringify(entry.snapshotBinding)).slice(0, 24)}`;
+}
+
+function revocationIntentCore(entry) {
+  return {
+    protocol: "qwave.whatsapp-snapshot-revocation/v1",
+    generation: entry.generation,
+    reviewId: entry.reviewId,
+    grantId: entry.grantId,
+    snapshotBinding: snapshotBindingDigest(entry),
+    selectionBinding: entry.selection?.selectionDigest ?? null
+  };
+}
+
+function exactRevocationIntentMatches(entry, intent = entry.revocation) {
+  if (!intent || intent.status !== "pending") return false;
+  const expected = revocationIntentCore(entry);
+  return Object.entries(expected).every(([key, value]) => intent[key] === value)
+    && typeof intent.operationId === "string" && /^wa-revoke-[a-f0-9]{24}$/.test(intent.operationId)
+    && Number.isSafeInteger(intent.attempts) && intent.attempts >= 1;
+}
+
+function assertFetchPlan(plan) {
+  if (!plan || plan.protocol !== "qwave.whatsapp-snapshot-fetch-plan/v1"
+    || !/^wa-fetch-plan-[a-f0-9]{24}$/.test(plan.planBinding)
+    || !/^[a-f0-9]{64}$/.test(plan.selectionDigest)
+    || !/^wa-selected-media-[a-f0-9]{24}$/.test(plan.mediaInventoryBinding)
+    || Object.keys(plan).some((key) => !["protocol", "planBinding", "selectionDigest", "mediaInventoryBinding", "units"].includes(key))
+    || !Array.isArray(plan.units) || plan.units.length < 1
+    || plan.units.some((unit, index) => unit?.index !== index
+      || !["segment", "media"].includes(unit.phase)
+      || !/^wa-(?:segment|media)-[a-f0-9]{20}$/.test(unit.unitRef))) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_INVALID", "The connector did not produce a bounded immutable WhatsApp snapshot fetch plan.");
+  }
+  const firstMedia = plan.units.findIndex((unit) => unit.phase === "media");
+  if (firstMedia >= 0 && plan.units.slice(firstMedia).some((unit) => unit.phase !== "media")) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_INVALID", "The connector plan must durably validate every segment before any media unit.");
+  }
+  const segmentRefs = new Set();
+  const unitRefs = new Set();
+  for (const unit of plan.units) {
+    if (unitRefs.has(unit.unitRef) || !/^wa-chat-[a-f0-9]{20}$/.test(unit.chatRef)
+      || !/^wa-segment-[a-f0-9]{20}$/.test(unit.segmentRef)) {
+      throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_INVALID", "The connector plan contains duplicate or invalid opaque unit bindings.");
+    }
+    unitRefs.add(unit.unitRef);
+    if (unit.phase === "segment") {
+      if (unit.unitRef !== unit.segmentRef
+        || Object.keys(unit).some((key) => !["phase", "unitRef", "chatRef", "segmentRef", "index"].includes(key))) {
+        throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_INVALID", "A segment unit is not exactly bound to its approved opaque segment.");
+      }
+      segmentRefs.add(unit.segmentRef);
+    } else if (unit.unitRef !== unit.mediaRef || !segmentRefs.has(unit.segmentRef)
+      || !/^wa-message-[a-f0-9]{20}$/.test(unit.messageRef)
+      || !/^wa-media-[a-f0-9]{20}$/.test(unit.mediaRef)
+      || Object.keys(unit).some((key) => !["phase", "unitRef", "chatRef", "segmentRef", "messageRef", "mediaRef", "index"].includes(key))) {
+      throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_INVALID", "A media unit is not exactly bound to a previously approved segment and message.");
+    }
+  }
+  return plan;
+}
+
+function assertReceiptAgainstPlan(receipt, plan, index) {
+  const unit = plan.units[index];
+  if (!receipt || !unit || receipt.protocol !== "qwave.whatsapp-snapshot-fetch-receipt/v1"
+    || receipt.planBinding !== plan.planBinding || receipt.index !== index
+    || receipt.unitRef !== unit.unitRef || receipt.phase !== unit.phase
+    || !Array.isArray(receipt.records)
+    || Object.keys(receipt).some((key) => !["protocol", "planBinding", "index", "unitRef", "phase", "records", "receiptBinding"].includes(key))) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_RECEIPT_INVALID", "A durable WhatsApp snapshot receipt does not exactly match its immutable plan.");
+  }
+  for (const record of receipt.records) {
+    const recordKeys = unit.phase === "media" ? ["sourceRecordId", "source", "mediaReferenceIds"] : ["sourceRecordId", "source"];
+    if (!record || record.source !== SOURCE || !/^wa-message-[a-f0-9]{20}$/.test(record.sourceRecordId)
+      || Object.keys(record).some((key) => !recordKeys.includes(key))) {
+      throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_RECEIPT_INVALID", "A durable WhatsApp snapshot receipt contains an invalid opaque record.");
+    }
+    if (unit.phase === "media" && (receipt.records.length !== 1 || record.sourceRecordId !== unit.messageRef
+      || !Array.isArray(record.mediaReferenceIds) || record.mediaReferenceIds.length !== 1
+      || record.mediaReferenceIds[0] !== unit.mediaRef)) {
+      throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_RECEIPT_INVALID", "A durable media receipt does not exactly match its approved message and media unit.");
+    }
+  }
+  const core = {
+    protocol: receipt.protocol,
+    planBinding: receipt.planBinding,
+    index: receipt.index,
+    unitRef: receipt.unitRef,
+    phase: receipt.phase,
+    records: receipt.records
+  };
+  if (receipt.receiptBinding !== `wa-fetch-receipt-${hash(JSON.stringify(core)).slice(0, 24)}`) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_RECEIPT_INVALID", "A durable WhatsApp snapshot receipt binding is invalid.");
+  }
+  return receipt;
+}
+
+function finalApprovedRecords(receipts) {
+  const ordered = [];
+  const byMessage = new Map();
+  for (const receipt of receipts) {
+    for (const record of receipt.records) {
+      let safe = byMessage.get(record.sourceRecordId);
+      if (!safe) {
+        safe = { sourceRecordId: record.sourceRecordId, processingDisposition: "untrusted-inert-reference", source: SOURCE, mediaReferenceIds: [] };
+        byMessage.set(record.sourceRecordId, safe);
+        ordered.push(safe);
+      }
+      for (const mediaRef of record.mediaReferenceIds ?? []) {
+        if (!safe.mediaReferenceIds.includes(mediaRef)) safe.mediaReferenceIds.push(mediaRef);
+      }
+    }
+  }
+  return ordered.map((record) => ({
+    sourceRecordId: record.sourceRecordId,
+    processingDisposition: record.processingDisposition,
+    source: record.source,
+    ...(record.mediaReferenceIds.length ? { mediaReferenceIds: record.mediaReferenceIds } : {})
+  }));
+}
+
+function finalizeFetch(entry, completedAt) {
+  if (!entry.fetch.plan || entry.fetch.cursor !== entry.fetch.plan.units.length || entry.fetch.receipts.length !== entry.fetch.cursor) return false;
+  const plan = assertFetchPlan(entry.fetch.plan);
+  entry.fetch.receipts.forEach((receipt, index) => assertReceiptAgainstPlan(receipt, plan, index));
+  const records = finalApprovedRecords(entry.fetch.receipts);
+  const core = {
+    protocol: "qwave.whatsapp-snapshot-completion/v1",
+    planBinding: entry.fetch.plan.planBinding,
+    unitCount: entry.fetch.cursor,
+    receiptBindings: entry.fetch.receipts.map((receipt) => receipt.receiptBinding),
+    records
+  };
+  entry.fetch.completionReceipt = {
+    ...core,
+    receiptBinding: `wa-completion-${hash(JSON.stringify(core)).slice(0, 24)}`,
+    completedAt
+  };
+  entry.fetch.status = "completed";
+  entry.fetch.pending = null;
+  entry.status = "processed";
+  entry.approvedRecords = clone(records);
+  entry.failure = null;
+  return true;
+}
+
+function assertCompletedFetchState(entry) {
+  const plan = assertFetchPlan(entry.fetch?.plan);
+  if (entry.fetch.cursor !== plan.units.length || entry.fetch.pending !== null
+    || entry.fetch.receipts?.length !== plan.units.length || !entry.fetch.completionReceipt) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_COMPLETION_RECEIPT_INVALID", "The completed WhatsApp snapshot state is missing its exact durable unit receipts.");
+  }
+  entry.fetch.receipts.forEach((receipt, index) => assertReceiptAgainstPlan(receipt, plan, index));
+  const records = finalApprovedRecords(entry.fetch.receipts);
+  const completion = entry.fetch.completionReceipt;
+  const core = {
+    protocol: "qwave.whatsapp-snapshot-completion/v1",
+    planBinding: plan.planBinding,
+    unitCount: plan.units.length,
+    receiptBindings: entry.fetch.receipts.map((receipt) => receipt.receiptBinding),
+    records
+  };
+  if (completion.protocol !== core.protocol || completion.planBinding !== core.planBinding
+    || completion.unitCount !== core.unitCount
+    || JSON.stringify(completion.receiptBindings) !== JSON.stringify(core.receiptBindings)
+    || JSON.stringify(completion.records) !== JSON.stringify(core.records)
+    || completion.receiptBinding !== `wa-completion-${hash(JSON.stringify(core)).slice(0, 24)}`
+    || JSON.stringify(entry.approvedRecords) !== JSON.stringify(records)) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_COMPLETION_RECEIPT_INVALID", "The completed WhatsApp snapshot receipt no longer matches the exact approved units.");
+  }
+}
+
 function publicSelection(selection) {
   if (!selection) {
     return {
@@ -253,6 +446,7 @@ function publicSelection(selection) {
 }
 
 function publicView(entry, language, permissionReview = null) {
+  if (entry.status === "processed") assertCompletedFetchState(entry);
   const wording = copy(language);
   const message = {
     "awaiting-guided-export": wording.export,
@@ -379,12 +573,16 @@ async function ensureConnectorBinding(connector, entry) {
   return binding;
 }
 
-function permissionProxy(connector, entry) {
+function permissionProxy(connector, entry, { fetchUnit = null, completedReceipts = [] } = {}) {
   const selection = clone(entry.selection);
   const snapshotBinding = clone(entry.snapshotBinding);
+  const revocation = clone(entry.revocation);
   return {
     discoverMetadata: (request) => connector.discoverMetadata(request),
     registerPermissionGrant: async ({ grant }) => {
+      if (revocation?.status === "pending") {
+        throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "A pending WhatsApp revocation cannot restore or register source access.");
+      }
       const result = await connector.registerPermissionGrant({ grant, snapshotBinding, selection });
       const readback = await connector.readPermissionGrantStatus({ grantId: grant.id, snapshotBinding });
       if (readback?.grantId !== grant.id || readback.active !== true || readback.revoked !== false) {
@@ -393,6 +591,9 @@ function permissionProxy(connector, entry) {
       return result;
     },
     revokePermissionGrant: async ({ grantId }) => {
+      if (!exactRevocationIntentMatches(entry, revocation) || revocation.grantId !== grantId) {
+        throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_INTENT_MISMATCH", "The adapter revoke was blocked because its durable exact intent was missing or changed.");
+      }
       const result = await connector.revokePermissionGrant({ grantId, snapshotBinding });
       const readback = await connector.readPermissionGrantStatus({ grantId, snapshotBinding });
       if (readback?.grantId !== grantId || readback.active !== false || readback.revoked !== true) {
@@ -400,7 +601,20 @@ function permissionProxy(connector, entry) {
       }
       return result;
     },
-    fetchApprovedContent: ({ source, accountId, grant }) => connector.fetchApprovedContent({ source, accountId, grant, snapshotBinding, selection })
+    fetchApprovedContent: ({ source, accountId, grant }) => {
+      if (revocation?.status === "pending") {
+        throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "A pending WhatsApp revocation blocks every content read.");
+      }
+      return connector.fetchApprovedContent({
+        source,
+        accountId,
+        grant,
+        snapshotBinding,
+        selection,
+        fetchUnit: clone(fetchUnit),
+        completedReceipts: clone(completedReceipts)
+      });
+    }
   };
 }
 
@@ -435,12 +649,18 @@ function reconcileEntryFromPermissionState(state, entry, now) {
     && grant.reviewId === entry.reviewId && grant.id === entry.grantId) ?? null;
   let changed = false;
   if (revoked && entry.status !== "revoked") {
+    if (entry.revocation && !exactRevocationIntentMatches(entry)) return false;
     entry.status = "revoked";
     entry.grantId = revoked.id;
-    if (entry.fetch.status === "pending") entry.fetch.status = "revoked";
+    if (entry.fetch.status !== "completed") entry.fetch.status = "revoked";
+    if (entry.revocation) entry.revocation = { ...entry.revocation, status: "completed", completedAt: now };
     entry.failure = null;
     entry.audit.push({ type: "whatsapp-reconciled-revocation", at: now, reviewId: entry.reviewId });
     changed = true;
+  } else if (isRevocationPending(entry)) {
+    // A durable revoke intent is a one-way gate. Active grant and fetch
+    // receipts cannot restore or advance this lifecycle while it is pending.
+    return changed;
   } else if (permission.status === "denied" && !["denied", "cancelled"].includes(entry.status)) {
     entry.status = "denied";
     if (entry.fetch.status === "pending") entry.fetch.status = "denied";
@@ -455,22 +675,54 @@ function reconcileEntryFromPermissionState(state, entry, now) {
     changed = true;
   }
   const receipt = permission.lastApprovedFetch;
-  if (receipt?.reviewId === entry.reviewId && receipt?.grantId === (entry.grantId ?? active?.id)
-    && Array.isArray(receipt.records) && entry.status !== "revoked") {
-    entry.status = "processed";
-    entry.grantId = receipt.grantId;
-    entry.approvedRecords = clone(receipt.records);
-    entry.fetch = { ...entry.fetch, status: "completed", completedAt: receipt.completedAt };
+  const checkpoint = receipt?.fetchCheckpoint;
+  const pending = entry.fetch?.pending;
+  const unit = entry.fetch?.plan?.units?.[entry.fetch?.cursor];
+  const checkpointMatches = receipt?.reviewId === entry.reviewId
+    && receipt?.grantId === (entry.grantId ?? active?.id)
+    && pending && unit && checkpoint
+    && pending.planBinding === entry.fetch.plan.planBinding
+    && pending.index === entry.fetch.cursor
+    && pending.unitRef === unit.unitRef
+    && checkpoint.protocol === "qwave.whatsapp-snapshot-fetch-receipt/v1"
+    && checkpoint.planBinding === entry.fetch.plan.planBinding
+    && checkpoint.index === entry.fetch.cursor
+    && checkpoint.unitRef === unit.unitRef
+    && checkpoint.phase === unit.phase
+    && Array.isArray(checkpoint.records)
+    && /^wa-fetch-receipt-[a-f0-9]{24}$/.test(checkpoint.receiptBinding);
+  if (checkpointMatches && !["revoked", "denied", "cancelled"].includes(entry.status)) {
+    entry.fetch.receipts.push(clone(checkpoint));
+    entry.fetch.cursor += 1;
+    entry.fetch.pending = null;
+    entry.fetch.status = "running";
+    entry.status = "ready-to-process";
     entry.failure = null;
-    if (!entry.audit.some((event) => event.type === "whatsapp-fetch-receipt-reconciled" && event.operationId === entry.fetch.operationId)) {
-      entry.audit.push({ type: "whatsapp-fetch-receipt-reconciled", at: now, operationId: entry.fetch.operationId, recordCount: receipt.records.length });
+    entry.audit.push({
+      type: "whatsapp-fetch-unit-receipt-reconciled",
+      at: now,
+      operationId: entry.fetch.operationId,
+      unitRef: checkpoint.unitRef,
+      unitIndex: checkpoint.index,
+      phase: checkpoint.phase,
+      recordCount: checkpoint.records.length
+    });
+    if (finalizeFetch(entry, receipt.completedAt ?? now)) {
+      entry.audit.push({
+        type: "whatsapp-fetch-completed",
+        at: receipt.completedAt ?? now,
+        operationId: entry.fetch.operationId,
+        unitCount: entry.fetch.cursor,
+        recordCount: entry.approvedRecords.length,
+        rawBodiesReturned: false
+      });
     }
     changed = true;
-  } else if (entry.fetch.status === "pending" && !["processed", "revoked", "denied", "cancelled"].includes(entry.status)) {
+  } else if (pending && !["processed", "revoked", "denied", "cancelled"].includes(entry.status)) {
     entry.status = "fetch-interrupted";
     entry.fetch.status = "interrupted";
-    entry.failure = { stage: "approved-content-read", code: "SNAPSHOT_FETCH_OUTCOME_UNCONFIRMED", at: now };
-    entry.audit.push({ type: "whatsapp-fetch-interrupted", at: now, operationId: entry.fetch.operationId, automaticRetry: false });
+    entry.failure = { stage: "approved-content-unit-read", code: "SNAPSHOT_FETCH_OUTCOME_UNCONFIRMED", at: now };
+    entry.audit.push({ type: "whatsapp-fetch-interrupted", at: now, operationId: entry.fetch.operationId, unitRef: pending.unitRef, unitIndex: pending.index, automaticRetry: false });
     changed = true;
   }
   return changed;
@@ -521,6 +773,7 @@ async function beginImportUnlocked({ message, stateStore, connector, accountId =
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
+  assertNoRevocationPending(entry);
   if (snapshotImportApproved !== true) return { whatsAppSnapshot: publicView(entry, languageFor(state, language)) };
   if (["awaiting-selection", "awaiting-content-grant", "ready-to-process", "processed"].includes(entry.status)) {
     const permission = await currentPermission(stateStore, accountId, language);
@@ -625,6 +878,7 @@ async function selectScopeUnlocked({ message, stateStore, connector, accountId =
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
+  assertNoRevocationPending(entry);
   if (entry.status !== "awaiting-selection" || entry.reviewId !== reviewId) {
     throw new WhatsAppSnapshotError("WHATSAPP_SELECTION_NOT_READY", "Complete the current manifest review before selecting snapshot content.");
   }
@@ -655,6 +909,7 @@ export async function selectWhatsAppSnapshotMedia({ message, stateStore, account
     const state = await loadState(stateStore);
     const entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
+    assertNoRevocationPending(entry);
     if (entry.reviewId !== reviewId || entry.status !== "awaiting-selection") throw new WhatsAppSnapshotError("WHATSAPP_SELECTION_NOT_READY", "Complete the current manifest review first.");
     return {
       whatsAppSnapshot: publicView(entry, languageFor(state, language)),
@@ -701,6 +956,7 @@ async function grantUnlocked({ message, stateStore, connector, accountId = DEFAU
   let entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
   if (reconcileEntryFromPermissionState(state, entry, isoNow(clock))) await stateStore.save(state);
+  assertNoRevocationPending(entry);
   if (entry.status === "ready-to-process" || entry.status === "processed") {
     const permission = await currentPermission(stateStore, accountId, language);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview) };
@@ -754,8 +1010,8 @@ async function fetchUnlocked({ message, stateStore, connector, accountId = DEFAU
   let state = await loadState(stateStore);
   let entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
-  const now = isoNow(clock);
-  if (reconcileEntryFromPermissionState(state, entry, now)) await stateStore.save(state);
+  if (reconcileEntryFromPermissionState(state, entry, isoNow(clock))) await stateStore.save(state);
+  assertNoRevocationPending(entry);
   if (entry.status === "processed" && Array.isArray(entry.approvedRecords)) {
     const permission = await currentPermission(stateStore, accountId, language);
     return { whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview), approvedRecords: clone(entry.approvedRecords), idempotentReplay: true };
@@ -767,53 +1023,112 @@ async function fetchUnlocked({ message, stateStore, connector, accountId = DEFAU
     throw new WhatsAppSnapshotError("WHATSAPP_GRANT_REQUIRED", "An active exact WhatsApp snapshot grant is required before local content is read.");
   }
   await ensureConnectorBinding(connector, entry);
-  entry.fetch = {
-    status: "pending",
-    operationId: `wa-fetch-${hash(`${entry.snapshotBinding.snapshotId}:${entry.generation}:${entry.reviewId}:${entry.grantId}`).slice(0, 24)}`,
-    attempts: entry.fetch.attempts + 1,
-    startedAt: now
-  };
-  entry.audit.push({ type: "whatsapp-fetch-started", at: now, operationId: entry.fetch.operationId, generation: entry.generation });
-  // Persist the operation before opening any selected body. If this save fails,
-  // the connector is never invoked.
+  const connectorPlan = assertFetchPlan(connector.createApprovedFetchPlan({
+    snapshotBinding: clone(entry.snapshotBinding),
+    selection: clone(entry.selection)
+  }));
+  if (entry.fetch.plan && JSON.stringify(entry.fetch.plan) !== JSON.stringify(connectorPlan)) {
+    throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_PLAN_CHANGED", "The immutable WhatsApp snapshot fetch plan changed, so no additional body was read.");
+  }
+  if (!entry.fetch.plan) {
+    const startedAt = isoNow(clock);
+    entry.fetch.plan = clone(connectorPlan);
+    entry.fetch.cursor = 0;
+    entry.fetch.receipts = [];
+    entry.fetch.completionReceipt = null;
+    entry.fetch.operationId = `wa-fetch-${hash(`${entry.snapshotBinding.snapshotId}:${entry.generation}:${entry.reviewId}:${entry.grantId}:${connectorPlan.planBinding}`).slice(0, 24)}`;
+    entry.fetch.startedAt = startedAt;
+    entry.audit.push({ type: "whatsapp-fetch-started", at: startedAt, operationId: entry.fetch.operationId, planBinding: connectorPlan.planBinding, unitCount: connectorPlan.units.length, generation: entry.generation });
+  }
+  entry.fetch.attempts += 1;
+  entry.fetch.status = "running";
   await stateStore.save(state);
-  try {
-    const fetched = await fetchSpecializedWhatsAppContent({
-      message,
-      stateStore,
-      connector: permissionProxy(connector, entry),
-      source: SOURCE,
-      accountId,
-      reviewId,
-      language,
-      clock
-    });
+
+  let recoveredFromDurableReceipt = false;
+  while (true) {
     state = await loadState(stateStore);
     entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
-    entry.status = "processed";
-    entry.approvedRecords = clone(fetched.approvedRecords);
-    entry.fetch = { ...entry.fetch, status: "completed", completedAt: isoNow(clock) };
-    entry.failure = null;
-    entry.audit.push({ type: "whatsapp-fetch-completed", at: entry.fetch.completedAt, operationId: entry.fetch.operationId, recordCount: fetched.approvedRecords.length, rawBodiesReturned: false });
-    await stateStore.save(state);
-    return { whatsAppSnapshot: publicView(entry, languageFor(state, language), fetched.permissionReview), approvedRecords: clone(entry.approvedRecords) };
-  } catch (error) {
-    state = await loadState(stateStore);
-    entry = assertEntry(state, accountId);
-    assertGeneration(entry, generation);
-    // A generic durable receipt means the body read completed and only the
-    // outer save was interrupted. Reconcile it without a duplicate read.
-    if (reconcileEntryFromPermissionState(state, entry, isoNow(clock)) && entry.status === "processed") {
-      await stateStore.save(state);
-      return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), approvedRecords: clone(entry.approvedRecords), recoveredFromDurableReceipt: true };
+    assertNoRevocationPending(entry);
+    if (entry.status === "processed") {
+      const permission = await currentPermission(stateStore, accountId, language);
+      return {
+        whatsAppSnapshot: publicView(entry, languageFor(state, language), permission?.permissionReview),
+        approvedRecords: clone(entry.approvedRecords),
+        ...(recoveredFromDurableReceipt ? { recoveredFromDurableReceipt: true } : {})
+      };
     }
-    entry.status = "fetch-interrupted";
-    entry.fetch.status = "interrupted";
-    entry.failure = { stage: "approved-content-read", ...safeFailure(error, "SNAPSHOT_APPROVED_FETCH_FAILED", isoNow(clock)) };
-    entry.audit.push({ type: "whatsapp-fetch-interrupted", at: entry.failure.at, operationId: entry.fetch.operationId, code: entry.failure.code, automaticRetry: false });
+    const plan = assertFetchPlan(entry.fetch.plan);
+    if (entry.fetch.cursor === plan.units.length) {
+      if (!finalizeFetch(entry, isoNow(clock))) throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_CURSOR_INVALID", "The durable WhatsApp snapshot completion receipt could not be formed safely.");
+      entry.audit.push({ type: "whatsapp-fetch-completed", at: entry.fetch.completionReceipt.completedAt, operationId: entry.fetch.operationId, unitCount: entry.fetch.cursor, recordCount: entry.approvedRecords.length, rawBodiesReturned: false });
+      await stateStore.save(state);
+      continue;
+    }
+    if (entry.fetch.pending) {
+      entry.status = "fetch-interrupted";
+      entry.fetch.status = "interrupted";
+      entry.failure = { stage: "approved-content-unit-read", code: "SNAPSHOT_FETCH_OUTCOME_UNCONFIRMED", at: isoNow(clock) };
+      await stateStore.save(state);
+      return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), fetchUnavailable: true, explicitRetryRequired: true };
+    }
+    const unit = plan.units[entry.fetch.cursor];
+    entry.fetch.pending = {
+      protocol: "qwave.whatsapp-snapshot-pre-read/v1",
+      planBinding: plan.planBinding,
+      index: unit.index,
+      unitRef: unit.unitRef,
+      phase: unit.phase,
+      attempt: entry.fetch.attempts,
+      preparedAt: isoNow(clock)
+    };
+    entry.status = "processing";
+    entry.fetch.status = "pending-unit";
+    entry.audit.push({ type: "whatsapp-fetch-unit-pending", at: entry.fetch.pending.preparedAt, operationId: entry.fetch.operationId, unitRef: unit.unitRef, unitIndex: unit.index, phase: unit.phase });
+    // This is the durable pre-read boundary. A failed save guarantees the
+    // selected segment or media file is never opened.
     await stateStore.save(state);
-    return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), fetchUnavailable: true, explicitRetryRequired: true };
+    try {
+      await fetchSpecializedWhatsAppContent({
+        message,
+        stateStore,
+        connector: permissionProxy(connector, entry, {
+          fetchUnit: { planBinding: plan.planBinding, index: unit.index, unit: clone(unit) },
+          completedReceipts: clone(entry.fetch.receipts)
+        }),
+        source: SOURCE,
+        accountId,
+        reviewId,
+        language,
+        clock
+      });
+      state = await loadState(stateStore);
+      entry = assertEntry(state, accountId);
+      assertGeneration(entry, generation);
+      const cursorBeforeReconcile = entry.fetch.cursor;
+      reconcileEntryFromPermissionState(state, entry, isoNow(clock));
+      if (entry.fetch.cursor !== cursorBeforeReconcile + 1 && entry.status !== "processed") {
+        throw new WhatsAppSnapshotError("SNAPSHOT_FETCH_RECEIPT_MISSING", "The selected body read did not produce a matching durable unit receipt.");
+      }
+      await stateStore.save(state);
+    } catch (error) {
+      state = await loadState(stateStore);
+      entry = assertEntry(state, accountId);
+      assertGeneration(entry, generation);
+      const cursorBeforeRecovery = entry.fetch.cursor;
+      reconcileEntryFromPermissionState(state, entry, isoNow(clock));
+      if (entry.fetch.cursor === cursorBeforeRecovery + 1 || entry.status === "processed") {
+        recoveredFromDurableReceipt = true;
+        await stateStore.save(state);
+        continue;
+      }
+      entry.status = "fetch-interrupted";
+      entry.fetch.status = "interrupted";
+      entry.failure = { stage: "approved-content-unit-read", ...safeFailure(error, "SNAPSHOT_APPROVED_FETCH_FAILED", isoNow(clock)) };
+      entry.audit.push({ type: "whatsapp-fetch-interrupted", at: entry.failure.at, operationId: entry.fetch.operationId, unitRef: entry.fetch.pending?.unitRef, unitIndex: entry.fetch.pending?.index, code: entry.failure.code, automaticRetry: false });
+      await stateStore.save(state);
+      return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), fetchUnavailable: true, explicitRetryRequired: true };
+    }
   }
 }
 
@@ -826,10 +1141,12 @@ async function resumeFetchUnlocked({ message, stateStore, accountId = DEFAULT_WH
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
+  assertNoRevocationPending(entry);
   if (entry.status !== "fetch-interrupted" || entry.reviewId !== reviewId) throw new WhatsAppSnapshotError("WHATSAPP_FETCH_RETRY_NOT_READY", "There is no interrupted current snapshot read to retry.");
   if (confirmRetry !== true) return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), explicitRetryRequired: true };
   entry.status = "ready-to-process";
   entry.fetch.status = "retry-confirmed";
+  entry.fetch.pending = null;
   entry.failure = null;
   entry.audit.push({ type: "whatsapp-fetch-retry-confirmed", at: isoNow(clock), previousOperationId: entry.fetch.operationId });
   await stateStore.save(state);
@@ -852,6 +1169,41 @@ async function revokeUnlocked({ message, stateStore, connector, accountId = DEFA
   }
   if (!entry.grantId || entry.reviewId !== reviewId) throw new WhatsAppSnapshotError("WHATSAPP_ACTIVE_GRANT_NOT_FOUND", "There is no active current WhatsApp snapshot grant to revoke.");
   await ensureConnectorBinding(connector, entry);
+  const intentCore = revocationIntentCore(entry);
+  const intentAt = isoNow(clock);
+  if (entry.revocation && !exactRevocationIntentMatches(entry)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_INTENT_MISMATCH", "The saved revocation intent no longer matches this exact generation, review, grant, and snapshot binding.");
+  }
+  entry.revocation = {
+    ...intentCore,
+    status: "pending",
+    operationId: entry.revocation?.operationId
+      ?? `wa-revoke-${hash(JSON.stringify(intentCore)).slice(0, 24)}`,
+    attempts: (entry.revocation?.attempts ?? 0) + 1,
+    startedAt: entry.revocation?.startedAt ?? intentAt,
+    lastAttemptAt: intentAt,
+    failure: entry.revocation?.failure ?? null
+  };
+  entry.status = "revoke-unconfirmed";
+  entry.audit.push({
+    type: "whatsapp-revocation-intent-pending",
+    at: intentAt,
+    operationId: entry.revocation.operationId,
+    reviewId,
+    grantId: entry.grantId,
+    attempt: entry.revocation.attempts,
+    generation
+  });
+  const expectedIntent = clone(entry.revocation);
+  // The exact intent must be durable before the adapter is invoked.
+  await stateStore.save(state);
+  state = await loadState(stateStore);
+  entry = assertEntry(state, accountId);
+  assertGeneration(entry, generation);
+  if (!exactRevocationIntentMatches(entry)
+    || JSON.stringify(entry.revocation) !== JSON.stringify(expectedIntent)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_INTENT_UNCONFIRMED", "The exact revocation intent could not be read back durably, so the adapter was not invoked.");
+  }
   let revoked;
   try {
     revoked = await revokeSpecializedWhatsAppPermission({
@@ -868,8 +1220,17 @@ async function revokeUnlocked({ message, stateStore, connector, accountId = DEFA
     state = await loadState(stateStore);
     entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
+    if (reconcileEntryFromPermissionState(state, entry, isoNow(clock)) && entry.status === "revoked") {
+      await stateStore.save(state);
+      return {
+        whatsAppSnapshot: publicView(entry, languageFor(state, language)),
+        revocationConfirmed: true,
+        recoveredFromDurableReceipt: true
+      };
+    }
     entry.status = "revoke-unconfirmed";
     entry.failure = { stage: "grant-revocation-readback", ...safeFailure(error, "WHATSAPP_REVOCATION_UNCONFIRMED", isoNow(clock)) };
+    entry.revocation = { ...entry.revocation, status: "pending", failure: clone(entry.failure) };
     entry.audit.push({
       type: "whatsapp-revocation-unconfirmed",
       at: entry.failure.at,
@@ -888,9 +1249,13 @@ async function revokeUnlocked({ message, stateStore, connector, accountId = DEFA
   state = await loadState(stateStore);
   entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
-  entry.status = "revoked";
+  const completedAt = isoNow(clock);
+  if (!reconcileEntryFromPermissionState(state, entry, completedAt) || entry.status !== "revoked") {
+    throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_UNCONFIRMED", "The exact generic grant was not durably confirmed revoked after adapter readback.");
+  }
+  entry.revocation = { ...entry.revocation, status: "completed", completedAt, failure: null };
   entry.failure = null;
-  entry.audit.push({ type: "whatsapp-content-revoked", at: isoNow(clock), reviewId, grantId: entry.grantId, sourceMutation: false });
+  entry.audit.push({ type: "whatsapp-content-revoked", at: completedAt, reviewId, grantId: entry.grantId, sourceMutation: false });
   await stateStore.save(state);
   return { whatsAppSnapshot: publicView(entry, languageFor(state, language), revoked.permissionReview) };
 }
@@ -904,6 +1269,7 @@ async function denyUnlocked({ message, stateStore, accountId = DEFAULT_WHATSAPP_
   let state = await loadState(stateStore);
   let entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
+  assertNoRevocationPending(entry);
   if (!["awaiting-selection", "awaiting-content-grant"].includes(entry.status) || entry.reviewId !== reviewId) {
     if (entry.status === "denied") return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), idempotentReplay: true };
     throw new WhatsAppSnapshotError("WHATSAPP_DENIAL_NOT_READY", "Only the current ungranted snapshot review can be denied.");
@@ -928,6 +1294,9 @@ async function cancelUnlocked({ message, stateStore, connector, accountId = DEFA
   let state = await loadState(stateStore);
   let entry = assertEntry(state, accountId);
   assertGeneration(entry, generation);
+  if (isRevocationPending(entry)) {
+    throw new WhatsAppSnapshotError("WHATSAPP_REVOCATION_PENDING", "Only retrying the pending exact revocation is allowed before this review can be cancelled.");
+  }
   if (entry.status === "cancelled") return { whatsAppSnapshot: publicView(entry, languageFor(state, language)), idempotentReplay: true };
   if (["ready-to-process", "processed", "fetch-interrupted", "revoke-unconfirmed"].includes(entry.status)) {
     if (!connector) throw new WhatsAppSnapshotError("WHATSAPP_REVOKE_REQUIRED", "Cancelling an active snapshot first requires its local grant to be revoked.");
@@ -955,6 +1324,7 @@ async function restartUnlocked({ message, stateStore, accountId = DEFAULT_WHATSA
   const state = await loadState(stateStore);
   const old = assertEntry(state, accountId);
   assertGeneration(old, generation);
+  assertNoRevocationPending(old);
   if (!["denied", "cancelled", "revoked", "snapshot-review-failed"].includes(old.status)) {
     throw new WhatsAppSnapshotError("WHATSAPP_RESTART_NOT_READY", "Finish, deny, cancel, or revoke the current snapshot review before starting a new generation.");
   }
@@ -977,6 +1347,7 @@ export async function cleanupWhatsAppSnapshotPrivateMemory({ message, stateStore
     const state = await loadState(stateStore);
     const entry = assertEntry(state, accountId);
     assertGeneration(entry, generation);
+    assertNoRevocationPending(entry);
     const result = connector.cleanupPrivateMemory();
     entry.audit.push({ type: "whatsapp-private-memory-cleared", at: isoNow(clock), sourceFilesDeleted: false, stagingFilesCreated: false });
     await stateStore.save(state);

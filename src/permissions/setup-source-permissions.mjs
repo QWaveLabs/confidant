@@ -1007,6 +1007,23 @@ async function fetchApprovedSourceContentUnlocked({ message, stateStore, connect
       ...(mediaReferenceIds?.length ? { mediaReferenceIds: [...mediaReferenceIds] } : {})
     };
   });
+  let fetchCheckpoint;
+  if (source === "whatsapp") {
+    const checkpoint = result.fetchCheckpoint;
+    const allowedKeys = ["protocol", "planBinding", "index", "unitRef", "phase", "records", "receiptBinding"];
+    const checkpointKeys = checkpoint && typeof checkpoint === "object" && !Array.isArray(checkpoint) ? Object.keys(checkpoint) : [];
+    if (!checkpoint || checkpoint.protocol !== "qwave.whatsapp-snapshot-fetch-receipt/v1"
+      || !/^wa-fetch-plan-[a-f0-9]{24}$/.test(checkpoint.planBinding)
+      || !Number.isSafeInteger(checkpoint.index) || checkpoint.index < 0
+      || !/^wa-(?:segment|media)-[a-f0-9]{20}$/.test(checkpoint.unitRef)
+      || !["segment", "media"].includes(checkpoint.phase)
+      || !/^wa-fetch-receipt-[a-f0-9]{24}$/.test(checkpoint.receiptBinding)
+      || checkpointKeys.some((key) => !allowedKeys.includes(key))
+      || JSON.stringify(checkpoint.records) !== JSON.stringify(result.records)) {
+      throw new PermissionLifecycleError("CONNECTOR_FETCH_CHECKPOINT_INVALID", "The WhatsApp connector did not return an exact safe unit receipt, so I stopped before advancing its durable cursor.");
+    }
+    fetchCheckpoint = clone(checkpoint);
+  }
   const now = isoNow(clock);
   entry.bodyFetches += 1;
   // Persist only opaque references, never source bodies. Specialized wrappers
@@ -1016,15 +1033,17 @@ async function fetchApprovedSourceContentUnlocked({ message, stateStore, connect
     reviewId,
     grantId: grant.id,
     completedAt: now,
-    records: clone(approvedRecords)
+    records: clone(approvedRecords),
+    ...(fetchCheckpoint ? { fetchCheckpoint } : {})
   };
-  entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length });
-  pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length });
+  entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length, ...(fetchCheckpoint ? { unitRef: fetchCheckpoint.unitRef } : {}) });
+  pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length, ...(fetchCheckpoint ? { unitRef: fetchCheckpoint.unitRef } : {}) });
   await stateStore.save(state);
 
   return {
     permissionReview: publicReview(entry, languageFor(state, language)),
-    approvedRecords
+    approvedRecords,
+    ...(fetchCheckpoint ? { fetchCheckpoint: clone(fetchCheckpoint) } : {})
   };
 }
 

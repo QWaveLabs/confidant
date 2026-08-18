@@ -41,6 +41,22 @@ const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
 const SENSITIVITIES = new Set(["general", ...SENSITIVE_CATEGORIES]);
 const CHAT_TYPES = new Set(["direct", "group"]);
 const MEDIA_STATES = new Set(["none", "present"]);
+const SAFE_MEDIA_MIME_TYPES = new Set([
+  "application/octet-stream",
+  "application/pdf",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "video/mp4",
+  "video/quicktime",
+  "video/webm"
+]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_REF = /^[A-Za-z0-9._:-]{1,160}$/;
 const ACCOUNT_REF = /^wa-account-[a-z0-9._:-]{1,128}$/;
@@ -361,11 +377,15 @@ export class LocalWhatsAppSnapshotConnector {
     const chatsByAlias = new Map();
     const rawChatIds = new Set();
     const recordPaths = new Set();
+    const mediaPaths = new Set();
+    const rawMediaIds = new Set();
     let segmentCount = 0;
     let recordCount = 0;
     let recordBytes = 0;
+    let mediaCount = 0;
+    let mediaBytes = 0;
     manifest.chats.forEach((chat, index) => {
-      assertAllowedKeys(chat, ["id", "label", "type", "participantIds", "sensitivity", "media", "segments"], "chat");
+      assertAllowedKeys(chat, ["id", "label", "type", "participantIds", "sensitivity", "media", "segments", "mediaInventory"], "chat");
       const rawId = requiredString(chat.id, "chat id");
       requiredString(chat.label, "chat label");
       if (rawChatIds.has(rawId)) fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "The snapshot contains a duplicate chat identifier.");
@@ -383,8 +403,12 @@ export class LocalWhatsAppSnapshotConnector {
       if (!Array.isArray(chat.segments) || chat.segments.length < 1) {
         fail("SNAPSHOT_SEGMENTS_REQUIRED", "Every snapshot chat needs at least one bounded JSONL segment.");
       }
+      const rawSegmentIds = new Set();
       const segments = chat.segments.map((segment) => {
-        assertAllowedKeys(segment, ["path", "sha256", "bytes", "count", "from", "to"], "segment");
+        assertAllowedKeys(segment, ["id", "path", "sha256", "bytes", "count", "from", "to"], "segment");
+        const rawSegmentId = requiredString(segment.id, "segment id");
+        if (rawSegmentIds.has(rawSegmentId)) fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "A snapshot chat contains a duplicate segment identifier.");
+        rawSegmentIds.add(rawSegmentId);
         const relativePath = validateRelativeFile(segment.path, this.#limits, ".jsonl");
         if (recordPaths.has(relativePath)) {
           fail("SNAPSHOT_PATH_AMBIGUOUS", "A snapshot record path is reused, so its immutable chat binding is ambiguous.");
@@ -404,13 +428,57 @@ export class LocalWhatsAppSnapshotConnector {
         if (segmentCount > this.#limits.segments || recordCount > this.#limits.records || recordBytes > this.#limits.totalRecordBytes) {
           fail("SNAPSHOT_LIMIT_EXCEEDED", "The snapshot record segments exceed the private import limits.");
         }
-        return { relativePath, sha256: segment.sha256, bytes, count, from, to };
+        return {
+          rawId: rawSegmentId,
+          ref: alias(seed, "segment", `${rawId}:${rawSegmentId}`),
+          relativePath,
+          sha256: segment.sha256,
+          bytes,
+          count,
+          from,
+          to
+        };
       });
       const chronologicalSegments = [...segments].sort((left, right) => Date.parse(left.from) - Date.parse(right.from));
       for (let position = 1; position < chronologicalSegments.length; position += 1) {
         if (Date.parse(chronologicalSegments[position].from) <= Date.parse(chronologicalSegments[position - 1].to)) {
           fail("SNAPSHOT_SEGMENT_OVERLAP", "A snapshot chat contains overlapping segment boundaries, so I stopped before reading content.");
         }
+      }
+      if (!Array.isArray(chat.mediaInventory)) {
+        fail("SNAPSHOT_MEDIA_INVENTORY_REQUIRED", "Every snapshot chat needs an explicit body-free media inventory.");
+      }
+      const segmentByRawId = new Map(segments.map((segment) => [segment.rawId, segment]));
+      const mediaInventory = chat.mediaInventory.map((media) => {
+        assertAllowedKeys(media, ["id", "segmentId", "messageId", "path", "sha256", "bytes", "mimeType"], "media inventory");
+        const rawMediaId = requiredString(media.id, "media id");
+        const rawSegmentId = requiredString(media.segmentId, "media segment id");
+        const rawMessageId = requiredString(media.messageId, "media message id");
+        const segment = segmentByRawId.get(rawSegmentId);
+        if (!segment) fail("SNAPSHOT_MEDIA_BINDING_INVALID", "A media inventory item is not bound to a declared segment.");
+        if (rawMediaIds.has(rawMediaId)) fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "The snapshot contains a duplicate media identifier.");
+        rawMediaIds.add(rawMediaId);
+        const normalized = this.#validateMediaMetadata(media, { inventory: true });
+        if (mediaPaths.has(normalized.relativePath)) {
+          fail("SNAPSHOT_PATH_AMBIGUOUS", "A snapshot media path is reused, so its immutable message binding is ambiguous.");
+        }
+        mediaPaths.add(normalized.relativePath);
+        mediaCount += 1;
+        mediaBytes += normalized.bytes;
+        if (mediaCount > this.#limits.mediaFiles || mediaBytes > this.#limits.totalMediaBytes) {
+          fail("SNAPSHOT_MEDIA_LIMIT_EXCEEDED", "The snapshot media inventory exceeds the private import limits.");
+        }
+        return {
+          ...normalized,
+          rawSegmentId,
+          rawMessageId,
+          segmentRef: segment.ref,
+          messageRef: alias(seed, "message", rawMessageId),
+          ref: alias(seed, "media", `${rawMessageId}:${rawMediaId}`)
+        };
+      });
+      if ((chat.media === "none") !== (mediaInventory.length === 0)) {
+        fail("SNAPSHOT_MEDIA_DECLARATION_MISMATCH", "The chat media declaration does not exactly match its body-free media inventory.");
       }
       const ref = alias(seed, "chat", rawId);
       chatsByAlias.set(ref, {
@@ -422,17 +490,31 @@ export class LocalWhatsAppSnapshotConnector {
         participantRawIds: participantIds,
         sensitivity: chat.sensitivity,
         media: chat.media,
-        segments
+        segments,
+        mediaInventory
       });
     });
 
     const bundleRoot = path.dirname(canonical);
     const snapshotId = `wa-snapshot-${hash(`${canonical}\0${digest}\0${generation}\0${stat.dev}:${stat.ino}`).slice(0, 24)}`;
+    const mediaInventoryBinding = `wa-media-inventory-${hash(JSON.stringify(
+      [...chatsByAlias.values()].flatMap((chat) => chat.mediaInventory.map((media) => ({
+        chatRef: chat.ref,
+        segmentRef: media.segmentRef,
+        messageRef: media.messageRef,
+        mediaRef: media.ref,
+        relativePath: media.relativePath,
+        sha256: media.sha256,
+        bytes: media.bytes,
+        mimeType: media.mimeType
+      })))
+    )).slice(0, 24)}`;
     const binding = Object.freeze({
       protocol: WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL,
       format: WHATSAPP_SNAPSHOT_BUNDLE_FORMAT,
       snapshotId,
       generation: `wa-generation-${hash(generation).slice(0, 20)}`,
+      mediaInventoryBinding,
       capturedAt,
       accountRef: this.#accountRef
     });
@@ -496,7 +578,7 @@ export class LocalWhatsAppSnapshotConnector {
 
   validateSelection(selection) {
     if (!this.#ready) fail("SNAPSHOT_PREFLIGHT_REQUIRED", "Approve the snapshot metadata preflight before continuing.");
-    assertAllowedKeys(selection, ["chatRefs", "personRefs", "from", "to", "includeMedia", "sensitiveCategories", "selectionDigest"], "selection");
+    assertAllowedKeys(selection, ["chatRefs", "personRefs", "from", "to", "includeMedia", "sensitiveCategories", "selectionDigest", "mediaInventoryBinding"], "selection");
     if (!Array.isArray(selection.chatRefs) || selection.chatRefs.length < 1 || !Array.isArray(selection.personRefs) || selection.personRefs.length < 1) {
       fail("WHATSAPP_EXPLICIT_SELECTION_REQUIRED", "Choose at least one reviewed chat and one reviewed Allowed person before approving this snapshot.");
     }
@@ -554,7 +636,26 @@ export class LocalWhatsAppSnapshotConnector {
     if (JSON.stringify([...sensitiveSet].sort()) !== JSON.stringify([...requiredSensitiveCategories].sort())) {
       fail("WHATSAPP_EXACT_SENSITIVITY_REQUIRED", "Sensitive approvals must exactly match the sensitive categories in the selected chats.");
     }
-    const selectionDigest = hash(JSON.stringify({ chatRefs: [...chatRefs].sort(), personRefs: [...personRefs].sort(), from, to, includeMedia: selection.includeMedia, sensitiveCategories: [...sensitiveCategories].sort() }));
+    const selectedSegmentRefs = new Set(selectedSegments.map((segment) => segment.ref));
+    const selectedMediaInventory = [...chatRefs].sort().flatMap((chatRef) => {
+      const chat = this.#ready.chatsByAlias.get(chatRef);
+      return chat.mediaInventory
+        .filter((media) => selectedSegmentRefs.has(media.segmentRef))
+        .map((media) => ({ chatRef, segmentRef: media.segmentRef, messageRef: media.messageRef, mediaRef: media.ref }));
+    }).sort((left, right) => `${left.segmentRef}:${left.messageRef}:${left.mediaRef}`.localeCompare(`${right.segmentRef}:${right.messageRef}:${right.mediaRef}`));
+    const mediaInventoryBinding = `wa-selected-media-${hash(JSON.stringify(selectedMediaInventory)).slice(0, 24)}`;
+    if (selection.mediaInventoryBinding !== undefined && selection.mediaInventoryBinding !== mediaInventoryBinding) {
+      fail("SNAPSHOT_MEDIA_BINDING_MISMATCH", "The saved WhatsApp media inventory no longer matches its immutable review.");
+    }
+    const selectionDigest = hash(JSON.stringify({
+      chatRefs: [...chatRefs].sort(),
+      personRefs: [...personRefs].sort(),
+      from,
+      to,
+      includeMedia: selection.includeMedia,
+      sensitiveCategories: [...sensitiveCategories].sort(),
+      mediaInventoryBinding
+    }));
     if (selection.selectionDigest !== undefined && selection.selectionDigest !== selectionDigest) {
       fail("SNAPSHOT_SELECTION_BINDING_MISMATCH", "The saved WhatsApp selection no longer matches its immutable binding.");
     }
@@ -565,6 +666,7 @@ export class LocalWhatsAppSnapshotConnector {
       to,
       includeMedia: selection.includeMedia,
       sensitiveCategories: Object.freeze([...sensitiveCategories].sort()),
+      mediaInventoryBinding,
       selectionDigest
     });
   }
@@ -591,7 +693,11 @@ export class LocalWhatsAppSnapshotConnector {
     }
     this.#metrics.grantRegistrationCalls += 1;
     const existing = this.#grantBindings.get(grant.id);
-    const next = { snapshotId: snapshotBinding.snapshotId, selectionDigest: normalized.selectionDigest };
+    const next = {
+      snapshotId: snapshotBinding.snapshotId,
+      selectionDigest: normalized.selectionDigest,
+      mediaInventoryBinding: normalized.mediaInventoryBinding
+    };
     if (existing && JSON.stringify(existing) !== JSON.stringify(next)) {
       fail("SNAPSHOT_GRANT_CHANGED", "An existing WhatsApp snapshot grant cannot be widened or rebound.");
     }
@@ -630,64 +736,183 @@ export class LocalWhatsAppSnapshotConnector {
     return candidate;
   }
 
-  #validateMediaMetadata(media) {
-    assertAllowedKeys(media, ["id", "path", "sha256", "bytes", "mimeType"], "media");
+  #validateMediaMetadata(media, { inventory = false } = {}) {
+    assertAllowedKeys(media, inventory
+      ? ["id", "segmentId", "messageId", "path", "sha256", "bytes", "mimeType"]
+      : ["id", "path", "sha256", "bytes", "mimeType"], "media");
     const rawId = requiredString(media.id, "media id");
     const relativePath = validateRelativeFile(media.path, this.#limits, ".bin");
     if (!SHA256.test(media.sha256)) fail("SNAPSHOT_SCHEMA_INVALID", "A media digest is malformed.");
     const bytes = requiredInteger(media.bytes, 1, this.#limits.mediaFileBytes, "media bytes");
     const mimeType = requiredString(media.mimeType, "media type");
-    if (!/^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i.test(mimeType)) {
-      fail("SNAPSHOT_MEDIA_TYPE_UNKNOWN", "A selected media item has a missing or malformed media type.");
+    if (!/^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i.test(mimeType)
+      || !SAFE_MEDIA_MIME_TYPES.has(mimeType.toLowerCase())) {
+      fail("SNAPSHOT_MEDIA_TYPE_UNKNOWN", "A selected media item has a missing, malformed, or unsupported safe media type.");
     }
     return { rawId, relativePath, sha256: media.sha256, bytes, mimeType };
   }
 
-  async #readMedia(media, record, totals) {
-    const normalized = this.#validateMediaMetadata(media);
-    totals.files += 1;
-    totals.bytes += normalized.bytes;
-    if (totals.files > this.#limits.mediaFiles || totals.bytes > this.#limits.totalMediaBytes) {
-      fail("SNAPSHOT_MEDIA_LIMIT_EXCEEDED", "The approved media exceeds the private import limits.");
-    }
+  async #readInventoryMedia(media) {
     await this.#assertManifestUnchanged();
-    const candidate = await this.#resolveBundleFile(normalized.relativePath, ".bin");
+    const candidate = await this.#resolveBundleFile(media.relativePath, ".bin");
     const opened = await this.#openBoundedFile(candidate, {
       maximumBytes: this.#limits.mediaFileBytes,
-      expectedBytes: normalized.bytes,
-      expectedSha256: normalized.sha256,
+      expectedBytes: media.bytes,
+      expectedSha256: media.sha256,
       roots: this.#ready.roots,
       kind: "media"
     });
     this.#metrics.mediaFileReads += 1;
     this.#metrics.rawMediaBodiesRead += 1;
     opened.bytes.fill(0);
-    return alias(this.#ready.generationSeed, "media", `${record.rawId}:${normalized.rawId}`);
+    return media.ref;
   }
 
-  async fetchApprovedContent({ source, accountId, grant, snapshotBinding, selection }) {
+  #approvedPlan(normalized) {
+    const segmentUnits = [];
+    const selectedSegmentRefs = new Set();
+    for (const chatRef of normalized.chatRefs) {
+      const chat = this.#ready.chatsByAlias.get(chatRef);
+      const segments = chat.segments
+        .filter((segment) => Date.parse(segment.from) >= Date.parse(normalized.from) && Date.parse(segment.to) <= Date.parse(normalized.to))
+        .sort((left, right) => Date.parse(left.from) - Date.parse(right.from) || left.ref.localeCompare(right.ref));
+      for (const segment of segments) {
+        selectedSegmentRefs.add(segment.ref);
+        segmentUnits.push({ phase: "segment", unitRef: segment.ref, chatRef, segmentRef: segment.ref });
+      }
+    }
+    const mediaUnits = normalized.includeMedia ? normalized.chatRefs.flatMap((chatRef) => {
+      const chat = this.#ready.chatsByAlias.get(chatRef);
+      return chat.mediaInventory
+        .filter((media) => selectedSegmentRefs.has(media.segmentRef))
+        .sort((left, right) => `${left.segmentRef}:${left.messageRef}:${left.ref}`.localeCompare(`${right.segmentRef}:${right.messageRef}:${right.ref}`))
+        .map((media) => ({
+          phase: "media",
+          unitRef: media.ref,
+          chatRef,
+          segmentRef: media.segmentRef,
+          messageRef: media.messageRef,
+          mediaRef: media.ref
+        }));
+    }) : [];
+    const units = [...segmentUnits, ...mediaUnits].map((unit, index) => Object.freeze({ ...unit, index }));
+    const planBinding = `wa-fetch-plan-${hash(JSON.stringify({
+      snapshotId: this.#ready.binding.snapshotId,
+      selectionDigest: normalized.selectionDigest,
+      mediaInventoryBinding: normalized.mediaInventoryBinding,
+      units
+    })).slice(0, 24)}`;
+    return Object.freeze({
+      protocol: "qwave.whatsapp-snapshot-fetch-plan/v1",
+      planBinding,
+      selectionDigest: normalized.selectionDigest,
+      mediaInventoryBinding: normalized.mediaInventoryBinding,
+      units: Object.freeze(units)
+    });
+  }
+
+  createApprovedFetchPlan({ snapshotBinding, selection } = {}) {
+    this.#assertBinding(snapshotBinding);
+    return clone(this.#approvedPlan(this.validateSelection(selection)));
+  }
+
+  #safeReceipt(plan, unit, records) {
+    const receiptCore = {
+      protocol: "qwave.whatsapp-snapshot-fetch-receipt/v1",
+      planBinding: plan.planBinding,
+      index: unit.index,
+      unitRef: unit.unitRef,
+      phase: unit.phase,
+      records: clone(records)
+    };
+    return Object.freeze({
+      ...receiptCore,
+      receiptBinding: `wa-fetch-receipt-${hash(JSON.stringify(receiptCore)).slice(0, 24)}`
+    });
+  }
+
+  #assertCompletedReceipts(plan, receipts, nextIndex) {
+    if (!Array.isArray(receipts) || receipts.length !== nextIndex) {
+      fail("SNAPSHOT_FETCH_CURSOR_INVALID", "The durable WhatsApp snapshot cursor is incomplete or out of order, so I did not read another body.");
+    }
+    const priorSegmentMessageRefs = new Set();
+    receipts.forEach((receipt, index) => {
+      const unit = plan.units[index];
+      if (!unit || receipt?.protocol !== "qwave.whatsapp-snapshot-fetch-receipt/v1"
+        || receipt.planBinding !== plan.planBinding || receipt.index !== index
+        || receipt.unitRef !== unit.unitRef || receipt.phase !== unit.phase
+        || !Array.isArray(receipt.records)) {
+        fail("SNAPSHOT_FETCH_CURSOR_INVALID", "A durable WhatsApp snapshot receipt does not match the exact approved plan.");
+      }
+      const expected = this.#safeReceipt(plan, unit, receipt.records);
+      if (receipt.receiptBinding !== expected.receiptBinding) {
+        fail("SNAPSHOT_FETCH_CURSOR_INVALID", "A durable WhatsApp snapshot receipt binding is invalid.");
+      }
+      for (const record of receipt.records) {
+        const allowedRecordKeys = unit.phase === "media" ? ["sourceRecordId", "source", "mediaReferenceIds"] : ["sourceRecordId", "source"];
+        if (!record || record.source !== "whatsapp" || !/^wa-message-[a-f0-9]{20}$/.test(record.sourceRecordId)
+          || Object.keys(record).some((key) => !allowedRecordKeys.includes(key))) {
+          fail("SNAPSHOT_FETCH_CURSOR_INVALID", "A durable WhatsApp snapshot receipt contains an invalid record reference.");
+        }
+        if (unit.phase === "segment") {
+          if (priorSegmentMessageRefs.has(record.sourceRecordId)) {
+            fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "The selected snapshot contains a duplicate message identifier across segments.");
+          }
+          priorSegmentMessageRefs.add(record.sourceRecordId);
+        } else if (receipt.records.length !== 1 || record.sourceRecordId !== unit.messageRef
+          || !Array.isArray(record.mediaReferenceIds) || record.mediaReferenceIds.length !== 1
+          || record.mediaReferenceIds[0] !== unit.mediaRef) {
+          fail("SNAPSHOT_FETCH_CURSOR_INVALID", "A durable media receipt does not exactly match its approved message and media unit.");
+        }
+      }
+    });
+    return priorSegmentMessageRefs;
+  }
+
+  #findPlanUnit(plan, fetchUnit) {
+    if (!fetchUnit || fetchUnit.planBinding !== plan.planBinding || !Number.isSafeInteger(fetchUnit.index)) {
+      fail("SNAPSHOT_FETCH_UNIT_INVALID", "The requested WhatsApp snapshot unit is not bound to the approved fetch plan.");
+    }
+    const unit = plan.units[fetchUnit.index];
+    if (!unit || JSON.stringify(unit) !== JSON.stringify(fetchUnit.unit)) {
+      fail("SNAPSHOT_FETCH_UNIT_INVALID", "The requested WhatsApp snapshot unit does not exactly match the approved fetch plan.");
+    }
+    return unit;
+  }
+
+  async fetchApprovedContent({ source, accountId, grant, snapshotBinding, selection, fetchUnit, completedReceipts = [] }) {
     if (source !== "whatsapp" || accountId !== this.#accountRef) fail("SNAPSHOT_CONNECTOR_SUBSTITUTION", "The approved fetch does not match this WhatsApp snapshot account.");
     this.#assertBinding(snapshotBinding);
     const normalized = this.validateSelection(selection);
     const registeredGrant = this.#grantBindings.get(grant?.id);
     if (!registeredGrant || this.#revokedGrants.has(grant.id)
       || registeredGrant.snapshotId !== snapshotBinding.snapshotId
-      || registeredGrant.selectionDigest !== normalized.selectionDigest) {
+      || registeredGrant.selectionDigest !== normalized.selectionDigest
+      || registeredGrant.mediaInventoryBinding !== normalized.mediaInventoryBinding) {
       fail("SNAPSHOT_DURABLE_GRANT_REQUIRED", "The exact durable WhatsApp grant must be registered before any selected body can be opened.");
     }
-    const cacheKey = `${grant.id}:${snapshotBinding.snapshotId}:${normalized.selectionDigest}`;
+    const plan = this.#approvedPlan(normalized);
+    const unit = this.#findPlanUnit(plan, fetchUnit);
+    const priorSegmentMessageRefs = this.#assertCompletedReceipts(plan, completedReceipts, unit.index);
+    const cacheKey = `${grant.id}:${plan.planBinding}:${unit.index}:${unit.unitRef}`;
+    await this.#assertManifestUnchanged();
     const cached = this.#fetchCache.get(cacheKey);
     if (cached) return clone(cached);
-    await this.#assertManifestUnchanged();
 
     const records = [];
-    const seenMessages = new Set();
-    const mediaTotals = { files: 0, bytes: 0 };
-    const declaredMediaTotals = { files: 0, bytes: 0 };
-    for (const chatRef of normalized.chatRefs) {
-      const chat = this.#ready.chatsByAlias.get(chatRef);
-      const segments = chat.segments.filter((segment) => Date.parse(segment.from) >= Date.parse(normalized.from) && Date.parse(segment.to) <= Date.parse(normalized.to));
-      for (const segment of segments) {
+    if (unit.phase === "segment") {
+      const chat = this.#ready.chatsByAlias.get(unit.chatRef);
+      const segment = chat?.segments.find((candidate) => candidate.ref === unit.segmentRef);
+      if (!chat || !segment) fail("SNAPSHOT_FETCH_UNIT_INVALID", "The selected segment is no longer part of the immutable snapshot plan.");
+      const expectedMediaByMessage = new Map();
+      for (const media of chat.mediaInventory.filter((candidate) => candidate.segmentRef === segment.ref)) {
+        const list = expectedMediaByMessage.get(media.rawMessageId) ?? [];
+        list.push(media);
+        expectedMediaByMessage.set(media.rawMessageId, list);
+      }
+      const seenRawMessages = new Set();
+      const seenSegmentMessageRefs = new Set();
+      try {
         await this.#assertManifestUnchanged();
         const candidate = await this.#resolveBundleFile(segment.relativePath, ".jsonl");
         const opened = await this.#openBoundedFile(candidate, {
@@ -708,8 +933,12 @@ export class LocalWhatsAppSnapshotConnector {
             try { record = JSON.parse(line); } catch { fail("SNAPSHOT_RECORD_MALFORMED", "A selected snapshot record is malformed or truncated."); }
             assertAllowedKeys(record, ["id", "chatId", "senderId", "sentAt", "sensitivity", "text", "media"], "record");
             const rawId = requiredString(record.id, "message id");
-            if (seenMessages.has(rawId)) fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "A selected snapshot contains a duplicate message identifier.");
-            seenMessages.add(rawId);
+            const messageRef = alias(this.#ready.generationSeed, "message", rawId);
+            if (seenRawMessages.has(rawId) || seenSegmentMessageRefs.has(messageRef) || priorSegmentMessageRefs.has(messageRef)) {
+              fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "A selected snapshot contains a duplicate message identifier.");
+            }
+            seenRawMessages.add(rawId);
+            seenSegmentMessageRefs.add(messageRef);
             if (requiredString(record.chatId, "message chat id") !== chat.rawId) fail("SNAPSHOT_RECORD_CHAT_MISMATCH", "A selected record is bound to a different chat.");
             const senderId = requiredString(record.senderId, "message sender id");
             if (!chat.participantRawIds.includes(senderId)) fail("SNAPSHOT_RECORD_PARTICIPANT_MISMATCH", "A selected record has an unknown participant.");
@@ -726,37 +955,70 @@ export class LocalWhatsAppSnapshotConnector {
               fail("SNAPSHOT_RECORD_LIMIT_EXCEEDED", "A selected message body is malformed or exceeds the private import limit.");
             }
             if (!Array.isArray(record.media)) fail("SNAPSHOT_MEDIA_UNKNOWN", "A selected record is missing its explicit media list.");
-            if (chat.media === "none" && record.media.length > 0) {
-              fail("SNAPSHOT_MEDIA_DECLARATION_MISMATCH", "A selected record contains media that was not declared during metadata review.");
-            }
+            const expectedMedia = expectedMediaByMessage.get(rawId) ?? [];
             const seenMediaIds = new Set();
+            const actualMedia = [];
             for (const media of record.media) {
               const normalizedMedia = this.#validateMediaMetadata(media);
               if (seenMediaIds.has(normalizedMedia.rawId)) fail("SNAPSHOT_IDENTIFIER_AMBIGUOUS", "A selected record contains a duplicate media identifier.");
               seenMediaIds.add(normalizedMedia.rawId);
-              declaredMediaTotals.files += 1;
-              declaredMediaTotals.bytes += normalizedMedia.bytes;
-              if (declaredMediaTotals.files > this.#limits.mediaFiles || declaredMediaTotals.bytes > this.#limits.totalMediaBytes) {
-                fail("SNAPSHOT_MEDIA_LIMIT_EXCEEDED", "The selected snapshot declares more media than the private import limits allow.");
+              actualMedia.push(normalizedMedia);
+            }
+            const canonicalMedia = (media) => ({
+              rawId: media.rawId,
+              relativePath: media.relativePath,
+              sha256: media.sha256,
+              bytes: media.bytes,
+              mimeType: media.mimeType
+            });
+            const actualBinding = actualMedia.map(canonicalMedia).sort((left, right) => left.rawId.localeCompare(right.rawId));
+            const expectedBinding = expectedMedia.map(canonicalMedia).sort((left, right) => left.rawId.localeCompare(right.rawId));
+            if (JSON.stringify(actualBinding) !== JSON.stringify(expectedBinding)) {
+              if (chat.media === "none" && actualBinding.length > 0) {
+                fail("SNAPSHOT_MEDIA_DECLARATION_MISMATCH", "A selected record contains media that was not declared during metadata review.");
               }
+              fail("SNAPSHOT_MEDIA_BINDING_MISMATCH", "A selected record media set does not exactly match its body-free manifest inventory.");
             }
             this.#metrics.rawMessageBodiesRead += 1;
-            const mediaRefs = [];
-            if (normalized.includeMedia) {
-              for (const media of record.media) mediaRefs.push(await this.#readMedia(media, { rawId }, mediaTotals));
-            }
             records.push({
-              sourceRecordId: alias(this.#ready.generationSeed, "message", rawId),
-              source: "whatsapp",
-              mediaReferenceIds: mediaRefs
+              sourceRecordId: messageRef,
+              source: "whatsapp"
             });
+          }
+          for (const rawMessageId of expectedMediaByMessage.keys()) {
+            if (!seenRawMessages.has(rawMessageId)) {
+              fail("SNAPSHOT_MEDIA_BINDING_MISMATCH", "A manifest media item is bound to a message missing from its declared segment.");
+            }
           }
         } finally {
           opened.bytes.fill(0);
         }
+      } catch (error) {
+        throw error;
       }
+    } else if (unit.phase === "media") {
+      const chat = this.#ready.chatsByAlias.get(unit.chatRef);
+      const media = chat?.mediaInventory.find((candidate) => candidate.ref === unit.mediaRef
+        && candidate.segmentRef === unit.segmentRef && candidate.messageRef === unit.messageRef);
+      if (!media) fail("SNAPSHOT_MEDIA_BINDING_MISMATCH", "The selected media unit is no longer bound to its reviewed chat, segment, and message.");
+      const segmentUnits = plan.units.filter((candidate) => candidate.phase === "segment");
+      if (completedReceipts.length < segmentUnits.length) {
+        fail("SNAPSHOT_MEDIA_BEFORE_SEGMENTS", "All selected message segments must be durably validated before any media file can open.");
+      }
+      if (!priorSegmentMessageRefs.has(media.messageRef)) {
+        fail("SNAPSHOT_MEDIA_BINDING_MISMATCH", "The selected media message was not present in the durably validated segment receipts.");
+      }
+      const mediaRef = await this.#readInventoryMedia(media);
+      records.push({ sourceRecordId: media.messageRef, source: "whatsapp", mediaReferenceIds: [mediaRef] });
+    } else {
+      fail("SNAPSHOT_FETCH_UNIT_INVALID", "The approved WhatsApp snapshot unit has an unsupported phase.");
     }
-    const result = Object.freeze({ records: Object.freeze(records.map((record) => Object.freeze(record))), rawBodiesReturned: false });
+    const frozenRecords = Object.freeze(records.map((record) => Object.freeze(record)));
+    const result = Object.freeze({
+      records: frozenRecords,
+      rawBodiesReturned: false,
+      fetchCheckpoint: this.#safeReceipt(plan, unit, frozenRecords)
+    });
     this.#fetchCache.set(cacheKey, result);
     return clone(result);
   }
