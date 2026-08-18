@@ -812,6 +812,14 @@ test("same-root initialization serializes lexical aliases and releases the queue
         }
       }
     });
+    Object.defineProperty(first, "root", {
+      configurable: true,
+      value: path.join(canonicalDirectory, "hostile-first-root")
+    });
+    Object.defineProperty(second, "root", {
+      configurable: true,
+      value: path.join(canonicalDirectory, "hostile-second-root")
+    });
 
     const firstInitialization = first.initialize();
     await entered.promise;
@@ -852,6 +860,14 @@ test("same-root initialization serializes lexical aliases and releases the queue
         }
       }
     });
+    Object.defineProperty(failing, "root", {
+      configurable: true,
+      value: path.join(canonicalFailureParent, "hostile-failing-root")
+    });
+    Object.defineProperty(recovering, "root", {
+      configurable: true,
+      value: path.join(canonicalFailureParent, "hostile-recovering-root")
+    });
 
     const failedInitialization = assert.rejects(
       failing.initialize(),
@@ -865,6 +881,175 @@ test("same-root initialization serializes lexical aliases and releases the queue
     await failedInitialization;
     assert.equal(await recoveredInitialization, failureRoot);
     assert.equal(recoveryEntered, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("exact local staging snapshots authority-critical dependencies and ignores hostile public shadows", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-private-snapshots-"));
+  const batchId = "fixture-private-dependency-snapshots";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    let capturedLstatCalls = 0;
+    let capturedUnlinkCalls = 0;
+    let hostileCalls = 0;
+    const sourceFileSystem = {
+      async lstat(target) {
+        capturedLstatCalls += 1;
+        return lstat(target);
+      },
+      async unlink(target) {
+        capturedUnlinkCalls += 1;
+        return unlink(target);
+      }
+    };
+    const sourceClock = clockAt(startedAt);
+    const retentionService = new FixtureRetentionService();
+    const staging = fixtureStaging(root, {
+      clock: sourceClock,
+      fileSystem: sourceFileSystem,
+      retentionService
+    });
+
+    sourceFileSystem.lstat = async () => {
+      hostileCalls += 1;
+      throw simulatedIoError("A replaced source filesystem must not be consulted.");
+    };
+    sourceFileSystem.unlink = sourceFileSystem.lstat;
+    sourceClock.now = () => {
+      hostileCalls += 1;
+      throw simulatedIoError("A replaced source clock must not be consulted.");
+    };
+    retentionService.arm = async () => {
+      hostileCalls += 1;
+      throw simulatedIoError("A replaced retention arm method must not be consulted.");
+    };
+    retentionService.disarm = async () => {
+      hostileCalls += 1;
+      throw simulatedIoError("A replaced retention disarm method must not be consulted.");
+    };
+    Object.defineProperties(staging, {
+      root: { configurable: true, value: path.join(directory, "hostile-root") },
+      fileSystem: { configurable: true, value: sourceFileSystem },
+      clock: { configurable: true, value: sourceClock },
+      retentionService: { configurable: true, value: retentionService },
+      expiryTimers: { configurable: true, value: new Map([["hostile", setTimeout(() => {}, 1)]]) },
+      startupRemovedBatches: { configurable: true, value: [{ batchId: "fabricated" }] }
+    });
+
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: startedAt
+    });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    assert.equal(await staging.delete({ batchId, leaseId: receipt.leaseId }), true);
+    await assert.rejects(() => lstat(artifacts.data), (error) => error?.code === "ENOENT");
+    await assert.rejects(() => lstat(artifacts.lease), (error) => error?.code === "ENOENT");
+    assert.equal(hostileCalls, 0);
+    assert.equal(capturedLstatCalls > 0, true);
+    assert.equal(capturedUnlinkCalls > 0, true);
+    assert.equal(retentionService.armed.length, 1);
+    assert.equal(retentionService.disarmed.length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("configured filesystem hooks cannot certify deletion while native staging paths still exist", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-native-delete-certifier-"));
+  const batchId = "fixture-native-delete-certifier";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    let artifacts = null;
+    let fabricateAbsence = false;
+    let noOpDeletion = false;
+    let interceptedDeletes = 0;
+    const staging = fixtureStaging(root, {
+      fileSystem: {
+        async lstat(target) {
+          if (
+            fabricateAbsence
+            && artifacts
+            && [artifacts.data, artifacts.lease]
+              .some((candidate) => path.basename(candidate) === path.basename(String(target)))
+          ) {
+            const error = new Error("Fabricated absence from a configured staging hook.");
+            error.code = "ENOENT";
+            throw error;
+          }
+          return lstat(target);
+        },
+        async unlink(target) {
+          if (
+            noOpDeletion
+            && artifacts
+            && [artifacts.data, artifacts.lease]
+              .some((candidate) => path.basename(candidate) === path.basename(String(target)))
+          ) {
+            interceptedDeletes += 1;
+            fabricateAbsence = true;
+            return;
+          }
+          return unlink(target);
+        }
+      }
+    });
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: startedAt
+    });
+    artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    noOpDeletion = true;
+
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError
+        && ["STAGING_DELETE_FAILED", "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION"].includes(error.code)
+    );
+    assert.equal(interceptedDeletes > 0, true);
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    await assert.rejects(() => lstat(artifacts.receipt), (error) => error?.code === "ENOENT");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retention disarm cannot restore a deleted generation behind a terminal result", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-disarm-restoration-"));
+  const batchId = "fixture-disarm-restoration";
+  try {
+    const root = path.join(directory, ".qwave-second-brain-staging");
+    const retentionService = new FixtureRetentionService();
+    const staging = fixtureStaging(root, { retentionService });
+    const receipt = await staging.stage({
+      batchId,
+      records: [inertStagingRecord()],
+      createdAt: startedAt
+    });
+    const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
+    const originalData = await readFile(artifacts.data, "utf8");
+    const originalLease = await readFile(artifacts.lease, "utf8");
+    retentionService.onDisarm = async () => {
+      await writeFile(artifacts.data, originalData, { encoding: "utf8", mode: 0o600 });
+      await writeFile(artifacts.lease, originalLease, { encoding: "utf8", mode: 0o600 });
+    };
+
+    await assert.rejects(
+      () => staging.delete({ batchId, leaseId: receipt.leaseId }),
+      (error) => error instanceof KnowledgeCompilationError && error.code === "STAGING_DELETE_FAILED"
+    );
+    assert.equal((await lstat(artifacts.data)).isFile(), true);
+    assert.equal((await lstat(artifacts.lease)).isFile(), true);
+    assert.deepEqual((await staging.read({ batchId, leaseId: receipt.leaseId })).records, [inertStagingRecord()]);
+
+    retentionService.onDisarm = null;
+    assert.equal(await staging.delete({ batchId, leaseId: receipt.leaseId }), true);
+    await assert.rejects(() => lstat(artifacts.data), (error) => error?.code === "ENOENT");
+    await assert.rejects(() => lstat(artifacts.lease), (error) => error?.code === "ENOENT");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -2465,7 +2650,7 @@ test("an exact generation restored during cleanup readback cannot be persisted a
       clock: clockAt("2026-08-18T12:00:00.000Z")
     });
     assert.deepEqual(cleanup.cleanup.expiredBatchIds, []);
-    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, []);
+    assert.deepEqual(cleanup.cleanup.needsAttentionBatchIds, [batchId]);
     assert.equal(cleanup.cleanup.rawSourceBodiesRetained, true);
     const retainedStatus = await getKnowledgeCompilationStatus({ stateStore, batchId });
     assert.equal(retainedStatus.compilation.status, "staged");
@@ -2871,7 +3056,32 @@ test("public cleanup acknowledgement cannot disarm retention before exact comple
   const batchId = "fixture-premature-cleanup-ack";
   try {
     const root = path.join(directory, ".qwave-second-brain-staging");
-    const staging = new LocalTemporaryStaging({ root, retentionService: new DetachedLocalRetentionService() });
+    let hostileCalls = 0;
+    const retentionService = new DetachedLocalRetentionService();
+    Object.defineProperties(retentionService, {
+      workerPath: { configurable: true, value: path.join(directory, "hostile-missing-worker.mjs") },
+      fileSystem: {
+        configurable: true,
+        value: {
+          async lstat() { hostileCalls += 1; throw simulatedIoError("Hostile public filesystem shadow."); },
+          async open() { hostileCalls += 1; throw simulatedIoError("Hostile public filesystem shadow."); },
+          async rename() { hostileCalls += 1; throw simulatedIoError("Hostile public filesystem shadow."); },
+          async unlink() { hostileCalls += 1; throw simulatedIoError("Hostile public filesystem shadow."); }
+        }
+      },
+      workers: { configurable: true, value: new Map() }
+    });
+    const staging = new LocalTemporaryStaging({ root, retentionService });
+    Object.defineProperties(retentionService, {
+      arm: {
+        configurable: true,
+        value: async () => { hostileCalls += 1; throw simulatedIoError("Replaced retention arm method."); }
+      },
+      disarm: {
+        configurable: true,
+        value: async () => { hostileCalls += 1; throw simulatedIoError("Replaced retention disarm method."); }
+      }
+    });
     const receipt = await staging.stage({
       batchId,
       records: [inertStagingRecord()],
@@ -2879,6 +3089,7 @@ test("public cleanup acknowledgement cannot disarm retention before exact comple
     });
     const artifacts = stagingArtifacts(root, batchId, receipt.leaseId);
     await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 1);
+    assert.equal(hostileCalls, 0);
 
     await assert.rejects(
       () => staging.acknowledgeCleanupReceipt({ batchId, leaseId: receipt.leaseId }),
@@ -2891,6 +3102,7 @@ test("public cleanup acknowledgement cannot disarm retention before exact comple
 
     await staging.delete({ batchId, leaseId: receipt.leaseId });
     await waitFor(async () => (await retentionWorkerCommands(batchId)).length === 0);
+    assert.equal(hostileCalls, 0);
     assert.deepEqual((await readdir(root)).sort(), [
       path.basename(artifacts.receipt),
       path.basename(artifacts.tombstone)

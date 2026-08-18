@@ -152,6 +152,14 @@ become a competing authority.
   a generation tag. If a result supplies a tag, it must match the lease-derived
   tag; a missing lease can reconcile only through that exact generation tag.
   Batch ID alone never changes lifecycle truth.
+- Every authority-critical dependency of that exact engine is captured at
+  construction behind private fields: the normalized root, limits, clock,
+  filesystem method table, retention operations, expiry timers, and startup
+  evidence. Replacing either the engine's public-looking properties or the
+  source objects' methods afterward is inert. The detached retention service
+  likewise keeps its worker path, filesystem methods, and worker registry in
+  private captured state, so a retained caller reference cannot redirect or
+  suppress cleanup after authority has been assigned.
 - With the exact local engine, successful compilation deletes the protected
   batch. Deletion first persists
   a content-free generation-bound tombstone. The record path is checked with
@@ -166,10 +174,21 @@ become a competing authority.
   supports it. Receipt rename/write or parent-fsync interruption remains
   cleanup-pending and resumes from the verified tombstone without losing a
   durable compiled result.
+- Configurable filesystem hooks are failure-injection seams, not deletion
+  authorities. Native no-follow open/stat witnesses independently certify both
+  the data and lease paths around unlink, and native path checks run after the
+  last retention callback and again before cleanup evidence leaves the exact
+  engine. A hook that fabricates `ENOENT`, performs a no-op unlink, or a
+  retention callback that restores the exact bytes and lease therefore cannot
+  produce a completion receipt or terminal lifecycle truth. Unexpected native
+  I/O errors propagate and restored bytes remain nonterminal and retryable.
 - Cleanup acknowledgement is an internal lifecycle capability. It rejects a
-  public or premature call, and it disarms coverage only after an exact-version,
-  exact-lease, canonical non-future receipt or verified tombstone is present and
-  both the data and lease paths are confirmed absent.
+  public or premature call and retires content-free evidence only after an
+  exact-version, exact-lease, canonical non-future receipt or verified tombstone
+  is present and both the data and lease paths are natively confirmed absent.
+  The exact deletion operation itself disarms retention before it returns
+  certified success; acknowledgement never invokes caller-supplied retention
+  code after terminal lifecycle truth has been durably saved.
 - On a running host, interrupted staging has an independently scheduled fixed
   24-hour deletion attempt. Transient unlink failures are retried until absence
   is verified, and later lifecycle resume fails closed after deletion. Expiry
@@ -229,9 +248,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **56/56 passed**.
+- QWA-146 focused suite: **59/59 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **104/104 passed**.
+- Full repository suite: **107/107 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full

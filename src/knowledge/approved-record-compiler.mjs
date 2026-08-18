@@ -489,6 +489,63 @@ async function pathIsAbsent(fileSystem, target) {
   }
 }
 
+async function assertNativePathsAbsent(targets, customerMessage) {
+  for (const target of targets) {
+    if (!await pathIsAbsent(DEFAULT_STAGING_FILE_SYSTEM, target)) {
+      throw new KnowledgeCompilationError(
+        "STAGING_DELETE_FAILED",
+        customerMessage
+      );
+    }
+  }
+}
+
+async function nativeDeletionWitness(target, multipleLinksCode = "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION") {
+  const before = await lstat(target);
+  if (before.isSymbolicLink?.()) return { handle: null, symbolicLink: true };
+  assertSingleLinkRegularFile(before, multipleLinksCode);
+  let handle;
+  try {
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    assertSingleLinkRegularFile(opened, multipleLinksCode);
+    if (!sameFileIdentity(before, opened)) {
+      throw new KnowledgeCompilationError(
+        "STAGING_FILE_IDENTITY_CHANGED",
+        "The protected generation changed immediately before deletion. Cleanup remains armed and needs a safe retry."
+      );
+    }
+    return { handle, symbolicLink: false };
+  } catch (error) {
+    try { await handle?.close(); } catch {}
+    throw error;
+  }
+}
+
+async function closeNativeDeletionWitness(witness) {
+  if (!witness?.handle) return;
+  const handle = witness.handle;
+  witness.handle = null;
+  await handle.close();
+}
+
+async function finishNativeDeletionWitness(witness, target, customerMessage) {
+  let linksAfterUnlink = null;
+  let failure = null;
+  if (witness.handle) {
+    try { linksAfterUnlink = (await witness.handle.stat()).nlink; } catch (error) { failure = error; }
+    try { await closeNativeDeletionWitness(witness); } catch (error) { failure ??= error; }
+  }
+  if (failure) throw failure;
+  if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
+    throw new KnowledgeCompilationError(
+      "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+      customerMessage
+    );
+  }
+  await assertNativePathsAbsent([target], customerMessage);
+}
+
 function sameFileIdentity(left, right) {
   return left?.dev === right?.dev && left?.ino === right?.ino;
 }
@@ -609,25 +666,28 @@ function retentionWorkerKey(root, batchId, leaseId) {
  * destinations — and remains alive if the creating compiler process exits.
  */
 export class DetachedLocalRetentionService {
+  #workerPath;
+  #fileSystem;
+  #workers = new Map();
+
   constructor({ workerPath = RETENTION_WORKER_PATH, fileSystem = {} } = {}) {
-    this.workerPath = workerPath;
-    this.fileSystem = { ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem };
-    this.workers = new Map();
+    this.#workerPath = workerPath;
+    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem });
   }
 
   async #removeOwnerIfMatches({ root, batchId, leaseId, workerId = null }) {
     const ownerPath = join(root, stagingOwnerFileName(batchId, leaseId));
     let owner;
-    try { owner = await readSmallJson(this.fileSystem, ownerPath); } catch { return false; }
+    try { owner = await readSmallJson(this.#fileSystem, ownerPath); } catch { return false; }
     if (owner?.batchId !== batchId || owner?.leaseId !== leaseId || (workerId && owner?.workerId !== workerId)) return false;
-    try { await unlinkAndSync(this.fileSystem, ownerPath); } catch { return false; }
+    try { await unlinkAndSync(this.#fileSystem, ownerPath); } catch { return false; }
     return true;
   }
 
   async #confirmWorkerProtocol({ root, batchId, leaseId, expiresAt, workerId, claimNonce, message }) {
     const ownerPath = join(root, stagingOwnerFileName(batchId, leaseId));
     const owner = validatedRetentionOwner(
-      await readSmallJson(this.fileSystem, ownerPath),
+      await readSmallJson(this.#fileSystem, ownerPath),
       { batchId, leaseId, expiresAt }
     );
     if (
@@ -645,16 +705,16 @@ export class DetachedLocalRetentionService {
   async #ownerShowsLiveProtocol({ ownerPath, owner, batchId, leaseId, expiresAt }) {
     if (!owner) return false;
     let before;
-    try { before = await this.fileSystem.lstat(ownerPath); } catch { return false; }
+    try { before = await this.#fileSystem.lstat(ownerPath); } catch { return false; }
     await new Promise((resolveProbe) => setTimeout(resolveProbe, RETENTION_OWNER_PROBE_MS));
     let current;
     let after;
     try {
       current = validatedRetentionOwner(
-        await readSmallJson(this.fileSystem, ownerPath),
+        await readSmallJson(this.#fileSystem, ownerPath),
         { batchId, leaseId, expiresAt }
       );
-      after = await this.fileSystem.lstat(ownerPath);
+      after = await this.#fileSystem.lstat(ownerPath);
     } catch {
       return false;
     }
@@ -692,7 +752,7 @@ export class DetachedLocalRetentionService {
         heartbeatAt: now
       };
       try {
-        await durableJsonWrite(this.fileSystem, ownerPath, owner, { exclusive: true });
+        await durableJsonWrite(this.#fileSystem, ownerPath, owner, { exclusive: true });
         return { adopted: false, owner };
       } catch (error) {
         if (error?.code !== "EEXIST") throw error;
@@ -700,7 +760,7 @@ export class DetachedLocalRetentionService {
 
       let existing = null;
       try {
-        existing = validatedRetentionOwner(await readSmallJson(this.fileSystem, ownerPath), { batchId, leaseId, expiresAt });
+        existing = validatedRetentionOwner(await readSmallJson(this.#fileSystem, ownerPath), { batchId, leaseId, expiresAt });
       } catch {}
       if (await this.#ownerShowsLiveProtocol({ ownerPath, owner: existing, batchId, leaseId, expiresAt })) {
         return { adopted: true, owner: existing };
@@ -708,9 +768,9 @@ export class DetachedLocalRetentionService {
 
       const stalePath = `${ownerPath}.${randomUUID()}.stale`;
       try {
-        await this.fileSystem.rename(ownerPath, stalePath);
-        await syncDirectoryEntry(this.fileSystem, root);
-        try { await unlinkAndSync(this.fileSystem, stalePath); } catch {}
+        await this.#fileSystem.rename(ownerPath, stalePath);
+        await syncDirectoryEntry(this.#fileSystem, root);
+        try { await unlinkAndSync(this.#fileSystem, stalePath); } catch {}
       } catch (error) {
         if (error?.code !== "ENOENT") continue;
       }
@@ -727,7 +787,7 @@ export class DetachedLocalRetentionService {
     const safeExpiresAt = canonicalTimestamp(expiresAt, "STAGING_TIMESTAMP_INVALID");
     const safeLeaseId = assertOpaqueId(leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     const key = retentionWorkerKey(safeRoot, safeBatchId, safeLeaseId);
-    const local = this.workers.get(key);
+    const local = this.#workers.get(key);
     if (local && local.exitCode === null && !local.killed) return { armed: true, adopted: true };
 
     const ownership = await this.#claimOrAdoptOwner({
@@ -785,15 +845,15 @@ export class DetachedLocalRetentionService {
           settled = true;
           cleanupPreArmListeners();
           child.once("exit", () => {
-            if (this.workers.get(key) === child) this.workers.delete(key);
+            if (this.#workers.get(key) === child) this.#workers.delete(key);
           });
           child.unref();
-          this.workers.set(key, child);
+          this.#workers.set(key, child);
           resolveArm({ armed: true, adopted: false });
         }, () => { void failBeforeArm(); });
       };
       try {
-        child = spawn(process.execPath, [this.workerPath, safeRoot, safeBatchId, safeExpiresAt, safeLeaseId, workerId, claimNonce], {
+        child = spawn(process.execPath, [this.#workerPath, safeRoot, safeBatchId, safeExpiresAt, safeLeaseId, workerId, claimNonce], {
           detached: true,
           stdio: ["ignore", "ignore", "ignore", "ipc"],
           windowsHide: true,
@@ -816,8 +876,8 @@ export class DetachedLocalRetentionService {
     const safeBatchId = assertBatchId(batchId);
     const safeLeaseId = assertOpaqueId(leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     const key = retentionWorkerKey(safeRoot, safeBatchId, safeLeaseId);
-    const child = this.workers.get(key);
-    this.workers.delete(key);
+    const child = this.#workers.get(key);
+    this.#workers.delete(key);
     await this.#removeOwnerIfMatches({ root: safeRoot, batchId: safeBatchId, leaseId: safeLeaseId });
     if (child && child.exitCode === null && !child.killed) {
       try {
@@ -840,6 +900,19 @@ export class DetachedLocalRetentionService {
  * use opaque batch IDs so callers cannot select arbitrary paths.
  */
 export class LocalTemporaryStaging {
+  #root;
+  #maxRecords;
+  #maxBytes;
+  #fileSystem;
+  #clock;
+  #retentionService;
+  #realRoot = null;
+  #initialization = null;
+  #expiryTimers = new Map();
+  #startupRemovedBatches = [];
+  #startupCleanupNeedsAttentionBatches = [];
+  #retentionCoverageUnavailableBatches = [];
+
   constructor({
     root,
     maxRecords = MAX_BATCH_RECORDS,
@@ -848,21 +921,20 @@ export class LocalTemporaryStaging {
     fileSystem = {},
     clock = null
   } = {}) {
-    this.root = assertDedicatedStagingRoot(root);
-    this.maxRecords = maxRecords;
-    this.maxBytes = maxBytes;
-    this.fileSystem = { ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem };
-    this.clock = clock;
+    this.#root = assertDedicatedStagingRoot(root);
+    this.#maxRecords = maxRecords;
+    this.#maxBytes = maxBytes;
+    this.#fileSystem = Object.freeze({ ...DEFAULT_STAGING_FILE_SYSTEM, ...fileSystem });
+    this.#clock = clock && typeof clock.now === "function"
+      ? Object.freeze({ now: clock.now.bind(clock) })
+      : null;
     if (!retentionService || typeof retentionService.arm !== "function" || typeof retentionService.disarm !== "function") {
       throw new TypeError("A private retentionService with arm() and disarm() is required for temporary staging.");
     }
-    this.retentionService = retentionService;
-    this.realRoot = null;
-    this.initialization = null;
-    this.expiryTimers = new Map();
-    this.startupRemovedBatches = [];
-    this.startupCleanupNeedsAttentionBatches = [];
-    this.retentionCoverageUnavailableBatches = [];
+    this.#retentionService = Object.freeze({
+      arm: retentionService.arm.bind(retentionService),
+      disarm: retentionService.disarm.bind(retentionService)
+    });
     if (new.target === LocalTemporaryStaging) {
       const instance = this;
       const trusted = Object.freeze({
@@ -890,7 +962,7 @@ export class LocalTemporaryStaging {
       TRUSTED_LOCAL_STAGING_FACADES.add(trusted);
       LOCAL_STAGING_AUTHORITIES.set(this, Object.freeze({
         run(operation) {
-          return runLocalStagingOperation(instance.root, () => operation(trusted));
+          return runLocalStagingOperation(instance.#root, () => operation(trusted));
         }
       }));
     }
@@ -898,19 +970,19 @@ export class LocalTemporaryStaging {
 
   async initialize(operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.initialize.call(this, INTERNAL_LOCAL_STAGING_OPERATION)
       ));
     }
-    if (!this.initialization) this.initialization = this.#initialize();
-    return this.initialization;
+    if (!this.#initialization) this.#initialization = this.#initialize();
+    return this.#initialization;
   }
 
   async #initialize() {
-    const parent = dirname(this.root);
+    const parent = dirname(this.#root);
     let parentStats;
     try {
-      parentStats = await this.fileSystem.lstat(parent);
+      parentStats = await this.#fileSystem.lstat(parent);
     } catch {
       throw new KnowledgeCompilationError(
         "STAGING_PARENT_INVALID",
@@ -923,7 +995,7 @@ export class LocalTemporaryStaging {
         "The private temporary staging parent is not a directory, so no source batch was staged."
       );
     }
-    const parentReal = await this.fileSystem.realpath(parent);
+    const parentReal = await this.#fileSystem.realpath(parent);
     if (await hasGitRepositoryAncestor(parentReal)) {
       throw new KnowledgeCompilationError(
         "STAGING_PUBLIC_REPOSITORY_BLOCKED",
@@ -932,8 +1004,8 @@ export class LocalTemporaryStaging {
     }
 
     try {
-      await this.fileSystem.mkdir(this.root, { mode: 0o700 });
-      await syncDirectoryEntry(this.fileSystem, parent);
+      await this.#fileSystem.mkdir(this.#root, { mode: 0o700 });
+      await syncDirectoryEntry(this.#fileSystem, parent);
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw new KnowledgeCompilationError(
@@ -943,7 +1015,7 @@ export class LocalTemporaryStaging {
       }
     }
 
-    const rootStats = await this.fileSystem.lstat(this.root);
+    const rootStats = await this.#fileSystem.lstat(this.#root);
     if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
       throw new KnowledgeCompilationError(
         "STAGING_SYMLINK_BLOCKED",
@@ -951,7 +1023,7 @@ export class LocalTemporaryStaging {
       );
     }
     try {
-      await this.fileSystem.chmod(this.root, 0o700);
+      await this.#fileSystem.chmod(this.#root, 0o700);
     } catch {
       throw new KnowledgeCompilationError(
         "STAGING_PERMISSIONS_UNSAFE",
@@ -959,19 +1031,19 @@ export class LocalTemporaryStaging {
       );
     }
 
-    const [rootReal, repositoryReal] = await Promise.all([this.fileSystem.realpath(this.root), repositoryRealRoot()]);
+    const [rootReal, repositoryReal] = await Promise.all([this.#fileSystem.realpath(this.#root), repositoryRealRoot()]);
     if (!isWithin(rootReal, parentReal) || isWithin(rootReal, repositoryReal)) {
       throw new KnowledgeCompilationError(
         "STAGING_PUBLIC_REPOSITORY_BLOCKED",
         "Temporary source staging cannot resolve inside this repository."
       );
     }
-    this.realRoot = rootReal;
+    this.#realRoot = rootReal;
     // The expiry is durable in each staged file. Re-check it whenever this
     // adapter starts so a restart does not depend on an old in-memory timer.
-    const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow(this.clock));
-    this.startupRemovedBatches.push(...startupCleanup.removedBatches);
-    this.startupCleanupNeedsAttentionBatches.push(...startupCleanup.cleanupNeedsAttentionBatches);
+    const startupCleanup = await this.#cleanupExpiredInRoot(rootReal, isoNow(this.#clock));
+    this.#startupRemovedBatches.push(...startupCleanup.removedBatches);
+    this.#startupCleanupNeedsAttentionBatches.push(...startupCleanup.cleanupNeedsAttentionBatches);
     return rootReal;
   }
 
@@ -993,14 +1065,14 @@ export class LocalTemporaryStaging {
     const root = await this.initialize(INTERNAL_LOCAL_STAGING_OPERATION);
     let stats;
     try {
-      stats = await this.fileSystem.lstat(root);
+      stats = await this.#fileSystem.lstat(root);
     } catch {
       throw new KnowledgeCompilationError("STAGING_ROOT_UNAVAILABLE", "The protected temporary staging directory is unavailable.");
     }
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw new KnowledgeCompilationError("STAGING_SYMLINK_BLOCKED", "Temporary staging cannot use a symbolic link or non-directory path.");
     }
-    const [resolved, repositoryReal] = await Promise.all([this.fileSystem.realpath(root), repositoryRealRoot()]);
+    const [resolved, repositoryReal] = await Promise.all([this.#fileSystem.realpath(root), repositoryRealRoot()]);
     if (resolved !== root || isWithin(resolved, repositoryReal) || await hasGitRepositoryAncestor(resolved)) {
       throw new KnowledgeCompilationError("STAGING_PUBLIC_REPOSITORY_BLOCKED", "Temporary staging no longer resolves to its dedicated private directory.");
     }
@@ -1009,19 +1081,19 @@ export class LocalTemporaryStaging {
 
   #timerKey(batchId, leaseId) { return `${batchId}\u0000${leaseId}`; }
 
-  #nowMs() { return Date.parse(isoNow(this.clock)); }
+  #nowMs() { return Date.parse(isoNow(this.#clock)); }
 
   #scheduleExpiry(batchId, leaseId, expiresAt) {
     const timerKey = this.#timerKey(batchId, leaseId);
-    const existing = this.expiryTimers.get(timerKey);
+    const existing = this.#expiryTimers.get(timerKey);
     if (existing) clearTimeout(existing);
     const delay = Math.max(0, Date.parse(expiresAt) - this.#nowMs());
     const timer = setTimeout(async () => {
-      this.expiryTimers.delete(timerKey);
+      this.#expiryTimers.delete(timerKey);
       try {
         const staged = await this.read({ batchId, leaseId });
         if (Date.parse(staged.expiresAt) <= this.#nowMs() && await this.delete({ batchId, leaseId, reason: "expired" })) {
-          this.startupRemovedBatches.push({
+          this.#startupRemovedBatches.push({
             batchId,
             generationTag: generationTagForLease(leaseId),
             leaseId,
@@ -1036,13 +1108,13 @@ export class LocalTemporaryStaging {
       }
     }, delay);
     timer.unref?.();
-    this.expiryTimers.set(timerKey, timer);
+    this.#expiryTimers.set(timerKey, timer);
   }
 
   async #armRetention(batchId, expiresAt, leaseId, knownTrustedRoot = null) {
     const root = knownTrustedRoot ?? await this.#trustedRoot();
     try {
-      await this.retentionService.arm({ root, batchId, expiresAt, leaseId });
+      await this.#retentionService.arm({ root, batchId, expiresAt, leaseId });
     } catch (error) {
       if (error instanceof KnowledgeCompilationError) throw error;
       throw new KnowledgeCompilationError(
@@ -1055,7 +1127,7 @@ export class LocalTemporaryStaging {
   async #disarmGenerationRetention(batchId, leaseId, knownTrustedRoot = null) {
     try {
       const root = knownTrustedRoot ?? await this.#trustedRoot();
-      await this.retentionService.disarm({ root, batchId, leaseId });
+      await this.#retentionService.disarm({ root, batchId, leaseId });
     } catch {
       // A completed filesystem deletion remains authoritative. An independently
       // detached worker has no records to expose and exits when its filename is
@@ -1082,7 +1154,7 @@ export class LocalTemporaryStaging {
 
   async #readManifest(root, batchId, leaseId) {
     const paths = this.#paths(root, batchId, leaseId);
-    const value = await readSmallJson(this.fileSystem, paths.lease);
+    const value = await readSmallJson(this.#fileSystem, paths.lease);
     return this.#validatedManifest(value, batchId, leaseId);
   }
 
@@ -1091,7 +1163,7 @@ export class LocalTemporaryStaging {
       const leaseId = assertOpaqueId(expectedLeaseId, "STAGING_LEASE_INVALID", "staging lease identity");
       return { batchId, leaseId, paths: this.#paths(root, batchId, leaseId) };
     }
-    const entries = await this.fileSystem.readdir(root, { withFileTypes: true });
+    const entries = await this.#fileSystem.readdir(root, { withFileTypes: true });
     const generationTags = new Set();
     for (const entry of entries) {
       const leaseArtifact = parseGenerationArtifact(entry.name, STAGING_LEASE_SUFFIX);
@@ -1114,7 +1186,7 @@ export class LocalTemporaryStaging {
       throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected temporary batch has no durable generation marker, so it was not compiled.");
     }
     let raw;
-    try { raw = await readSmallJson(this.fileSystem, join(root, leaseEntry.name)); } catch {
+    try { raw = await readSmallJson(this.#fileSystem, join(root, leaseEntry.name)); } catch {
       throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected temporary batch generation marker was not readable, so it was not compiled.");
     }
     const leaseId = assertOpaqueId(raw?.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
@@ -1127,14 +1199,14 @@ export class LocalTemporaryStaging {
 
   async #readPayloadAt(root, batchId, leaseId) {
     const paths = this.#paths(root, batchId, leaseId);
-    const stats = await this.fileSystem.lstat(paths.data);
+    const stats = await this.#fileSystem.lstat(paths.data);
     assertSingleLinkRegularFile(stats);
-    if (stats.size > this.maxBytes) {
+    if (stats.size > this.#maxBytes) {
       throw new KnowledgeCompilationError("STAGING_SIZE_LIMIT", "The protected temporary batch exceeded its safe size limit and was not compiled.");
     }
     let handle;
     try {
-      handle = await this.fileSystem.open(paths.data, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      handle = await this.#fileSystem.open(paths.data, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       const openStats = await handle.stat();
       assertSingleLinkRegularFile(openStats);
       if (!sameFileIdentity(stats, openStats)) {
@@ -1143,7 +1215,7 @@ export class LocalTemporaryStaging {
           "The protected generation changed while it was being opened, so processing stopped and retention remains armed."
         );
       }
-      if (openStats.size > this.maxBytes) {
+      if (openStats.size > this.#maxBytes) {
         throw new KnowledgeCompilationError("STAGING_SIZE_LIMIT", "The protected temporary batch exceeded its safe size limit and was not compiled.");
       }
       const serialized = await handle.readFile({ encoding: "utf8" });
@@ -1155,11 +1227,11 @@ export class LocalTemporaryStaging {
           "The protected generation changed while it was being read, so processing stopped and retention remains armed."
         );
       }
-      if (afterRead.size > this.maxBytes) {
+      if (afterRead.size > this.#maxBytes) {
         throw new KnowledgeCompilationError("STAGING_SIZE_LIMIT", "The protected temporary batch exceeded its safe size limit and was not compiled.");
       }
       const payload = JSON.parse(serialized);
-      const validated = validatedStagingPayload(payload, batchId, this.maxRecords);
+      const validated = validatedStagingPayload(payload, batchId, this.#maxRecords);
       if (validated.leaseId !== leaseId) {
         throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected batch did not match its immutable generation marker.");
       }
@@ -1174,20 +1246,20 @@ export class LocalTemporaryStaging {
 
   async stage(input, operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.stage.call(this, input, INTERNAL_LOCAL_STAGING_OPERATION)
       ));
     }
     const { batchId, records, createdAt } = input;
     const safeBatchId = assertBatchId(batchId);
-    if (!Array.isArray(records) || records.length === 0 || records.length > this.maxRecords) {
+    if (!Array.isArray(records) || records.length === 0 || records.length > this.#maxRecords) {
       throw new KnowledgeCompilationError(
         "STAGING_RECORD_LIMIT",
-        `A temporary batch must contain between 1 and ${this.maxRecords} approved records.`
+        `A temporary batch must contain between 1 and ${this.#maxRecords} approved records.`
       );
     }
     assertNoRawStagingMaterial(records);
-    const normalizedRecords = normalizeInertStagingRecords(records, { maxRecords: this.maxRecords });
+    const normalizedRecords = normalizeInertStagingRecords(records, { maxRecords: this.#maxRecords });
     const normalizedCreatedAt = canonicalTimestamp(createdAt, "STAGING_TIMESTAMP_INVALID");
     const leaseId = `lease-${randomUUID()}`;
     const payload = {
@@ -1199,7 +1271,7 @@ export class LocalTemporaryStaging {
       records: normalizedRecords
     };
     const serialized = `${JSON.stringify(payload)}\n`;
-    if (Buffer.byteLength(serialized, "utf8") > this.maxBytes) {
+    if (Buffer.byteLength(serialized, "utf8") > this.#maxBytes) {
       throw new KnowledgeCompilationError(
         "STAGING_SIZE_LIMIT",
         "The approved batch is too large for protected temporary staging. Split it into a smaller approved batch."
@@ -1228,7 +1300,7 @@ export class LocalTemporaryStaging {
       expiresAt: payload.expiresAt
     };
     try {
-      await durableJsonWrite(this.fileSystem, paths.lease, manifest, { exclusive: true });
+      await durableJsonWrite(this.#fileSystem, paths.lease, manifest, { exclusive: true });
     } catch (error) {
       if (error?.code === "EEXIST") {
       throw new KnowledgeCompilationError(
@@ -1245,13 +1317,13 @@ export class LocalTemporaryStaging {
     try {
       await this.#armRetention(safeBatchId, payload.expiresAt, leaseId, root);
     } catch (error) {
-      try { await unlinkAndSync(this.fileSystem, paths.lease); } catch {}
+      try { await unlinkAndSync(this.#fileSystem, paths.lease); } catch {}
       throw error;
     }
     let handle;
     let failure = null;
     try {
-      handle = await this.fileSystem.open(
+      handle = await this.#fileSystem.open(
         paths.data,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
         0o600
@@ -1260,8 +1332,8 @@ export class LocalTemporaryStaging {
       await handle.sync();
       await handle.close();
       handle = null;
-      await syncDirectoryEntry(this.fileSystem, root);
-      await durableJsonWrite(this.fileSystem, paths.lease, { ...manifest, phase: "ready" });
+      await syncDirectoryEntry(this.#fileSystem, root);
+      await durableJsonWrite(this.#fileSystem, paths.lease, { ...manifest, phase: "ready" });
     } catch (error) {
       failure = error;
     }
@@ -1300,7 +1372,7 @@ export class LocalTemporaryStaging {
 
   async read(input, operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.read.call(this, input, INTERNAL_LOCAL_STAGING_OPERATION)
       ));
     }
@@ -1314,7 +1386,7 @@ export class LocalTemporaryStaging {
       if (error instanceof KnowledgeCompilationError) throw error;
       throw new KnowledgeCompilationError("STAGING_READ_FAILED", "I could not safely resolve the protected temporary batch generation.");
     }
-    if (!generation || await pathIsAbsent(this.fileSystem, generation.paths.data)) {
+    if (!generation || await pathIsAbsent(this.#fileSystem, generation.paths.data)) {
       throw new KnowledgeCompilationError("STAGING_BATCH_MISSING", "The protected temporary batch is no longer available. Approve a new batch before continuing.");
     }
     const manifest = await this.#readManifest(root, safeBatchId, generation.leaseId);
@@ -1323,7 +1395,7 @@ export class LocalTemporaryStaging {
       throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected batch timestamps did not match its durable generation marker.");
     }
     if (manifest.phase === "prepared") {
-      await durableJsonWrite(this.fileSystem, generation.paths.lease, { ...manifest, phase: "ready" });
+      await durableJsonWrite(this.#fileSystem, generation.paths.lease, { ...manifest, phase: "ready" });
     }
     return validated;
   }
@@ -1355,16 +1427,20 @@ export class LocalTemporaryStaging {
     const paths = this.#paths(root, batchId, leaseId);
     const target = kind === "receipt" ? paths.receipt : paths.tombstone;
     let value;
-    try { value = await readSmallJson(this.fileSystem, target); } catch { return null; }
+    try { value = await readSmallJson(this.#fileSystem, target); } catch { return null; }
     const validated = this.#validatedCompletionArtifact(value, { batchId, leaseId, kind });
     if (!validated) return null;
-    if (!await pathIsAbsent(this.fileSystem, paths.data) || !await pathIsAbsent(this.fileSystem, paths.lease)) return null;
+    if (!await pathIsAbsent(this.#fileSystem, paths.data) || !await pathIsAbsent(this.#fileSystem, paths.lease)) return null;
+    await assertNativePathsAbsent(
+      [paths.data, paths.lease],
+      "The protected generation still exists, so its cleanup artifact cannot certify deletion."
+    );
     return validated;
   }
 
   async #writeCompletionReceipt(root, batchId, leaseId, deletedAt, reason) {
     const paths = this.#paths(root, batchId, leaseId);
-    await durableJsonWrite(this.fileSystem, paths.receipt, {
+    await durableJsonWrite(this.#fileSystem, paths.receipt, {
       version: RETENTION_ARTIFACT_VERSION,
       batchId,
       leaseId,
@@ -1376,7 +1452,7 @@ export class LocalTemporaryStaging {
   async #ensureTombstone(root, batchId, leaseId, deleteStartedAt, reason) {
     const paths = this.#paths(root, batchId, leaseId);
     try {
-      const existing = await readSmallJson(this.fileSystem, paths.tombstone);
+      const existing = await readSmallJson(this.#fileSystem, paths.tombstone);
       if (existing?.cleanupBlockedReason === "multiple-links-after-unlink") {
         throw new KnowledgeCompilationError(
           "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
@@ -1398,7 +1474,7 @@ export class LocalTemporaryStaging {
       if (error instanceof KnowledgeCompilationError) throw error;
       if (error?.code !== "ENOENT") {
         try {
-          const stats = await this.fileSystem.lstat(paths.tombstone);
+          const stats = await this.#fileSystem.lstat(paths.tombstone);
           if (stats) throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "The durable cleanup tombstone was invalid; no generation was removed.");
         } catch (statsError) {
           if (statsError instanceof KnowledgeCompilationError) throw statsError;
@@ -1414,13 +1490,13 @@ export class LocalTemporaryStaging {
       dataUnlinkVerified: false,
       reason: boundedCleanupReason(reason)
     };
-    await durableJsonWrite(this.fileSystem, paths.tombstone, tombstone, { exclusive: true });
+    await durableJsonWrite(this.#fileSystem, paths.tombstone, tombstone, { exclusive: true });
     return { created: true, value: tombstone };
   }
 
   async #markTombstoneUnlinkVerified(root, batchId, leaseId) {
     const paths = this.#paths(root, batchId, leaseId);
-    const existing = await readSmallJson(this.fileSystem, paths.tombstone);
+    const existing = await readSmallJson(this.#fileSystem, paths.tombstone);
     const deleteStartedAt = exactCanonicalTimestamp(existing?.deleteStartedAt);
     if (
       existing?.version !== RETENTION_ARTIFACT_VERSION
@@ -1434,7 +1510,7 @@ export class LocalTemporaryStaging {
         "The cleanup marker could not confirm this exact generation's unlink result."
       );
     }
-    await durableJsonWrite(this.fileSystem, paths.tombstone, {
+    await durableJsonWrite(this.#fileSystem, paths.tombstone, {
       ...existing,
       dataUnlinkVerified: true,
       dataUnlinkVerifiedAt: new Date().toISOString()
@@ -1443,7 +1519,7 @@ export class LocalTemporaryStaging {
 
   async #markTombstoneNeedsAttention(root, batchId, leaseId, deleteStartedAt, reason) {
     const paths = this.#paths(root, batchId, leaseId);
-    await durableJsonWrite(this.fileSystem, paths.tombstone, {
+    await durableJsonWrite(this.#fileSystem, paths.tombstone, {
       version: RETENTION_ARTIFACT_VERSION,
       batchId,
       leaseId,
@@ -1459,9 +1535,13 @@ export class LocalTemporaryStaging {
     const paths = this.#paths(root, batchId, leaseId);
     let before;
     try {
-      before = await this.fileSystem.lstat(paths.data);
+      before = await this.#fileSystem.lstat(paths.data);
     } catch (error) {
       if (error?.code === "ENOENT") {
+        await assertNativePathsAbsent(
+          [paths.data],
+          "The protected generation still exists even though the configured staging adapter reported it absent. Cleanup remains armed and needs local review."
+        );
         if (tombstone.value.dataUnlinkVerified === true) return false;
         if (tombstone.created && allowNewlyAbsentData) {
           await this.#markTombstoneUnlinkVerified(root, batchId, leaseId);
@@ -1474,59 +1554,83 @@ export class LocalTemporaryStaging {
       }
       throw error;
     }
-    if (before.isSymbolicLink?.()) {
-      // This removes only the private-root directory entry. It never follows
-      // the link or treats the linked target as a staged generation.
-      await unlinkAndSync(this.fileSystem, paths.data, { ignoreMissing: false });
-      await this.#markTombstoneUnlinkVerified(root, batchId, leaseId);
-      return true;
+    if (!before.isSymbolicLink?.()) {
+      assertSingleLinkRegularFile(before, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
     }
-    assertSingleLinkRegularFile(before, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
-    let handle;
-    let failure = null;
-    let linksAfterUnlink = null;
+    let nativeWitness = null;
+    let operationFailure = null;
     try {
-      handle = await this.fileSystem.open(paths.data, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      const opened = await handle.stat();
-      assertSingleLinkRegularFile(opened, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
-      if (!sameFileIdentity(before, opened)) {
-        throw new KnowledgeCompilationError(
-          "STAGING_FILE_IDENTITY_CHANGED",
-          "The protected generation changed immediately before deletion. Cleanup remains armed and needs a safe retry."
-        );
+      nativeWitness = await nativeDeletionWitness(paths.data);
+      if (before.isSymbolicLink?.()) {
+        // This removes only the private-root directory entry. It never follows
+        // the link or treats the linked target as a staged generation.
+        await unlinkAndSync(this.#fileSystem, paths.data, { ignoreMissing: false });
+      } else {
+        let handle;
+        let failure = null;
+        let linksAfterUnlink = null;
+        try {
+          handle = await this.#fileSystem.open(paths.data, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+          const opened = await handle.stat();
+          assertSingleLinkRegularFile(opened, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
+          if (!sameFileIdentity(before, opened)) {
+            throw new KnowledgeCompilationError(
+              "STAGING_FILE_IDENTITY_CHANGED",
+              "The protected generation changed immediately before deletion. Cleanup remains armed and needs a safe retry."
+            );
+          }
+          await unlinkAndSync(this.#fileSystem, paths.data, { ignoreMissing: false });
+          linksAfterUnlink = (await handle.stat()).nlink;
+        } catch (error) {
+          failure = error;
+        }
+        if (handle) {
+          try { await handle.close(); } catch (error) { failure ??= error; }
+        }
+        if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
+          throw new KnowledgeCompilationError(
+            "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+            "Another filesystem link retained the generation after its private staging path was removed. Cleanup needs local review and was not reported complete."
+          );
+        }
+        if (failure) throw failure;
       }
-      await unlinkAndSync(this.fileSystem, paths.data, { ignoreMissing: false });
-      linksAfterUnlink = (await handle.stat()).nlink;
-    } catch (error) {
-      failure = error;
-    }
-    if (handle) {
-      try { await handle.close(); } catch (error) { failure ??= error; }
-    }
-    if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
-      try {
-        await this.#markTombstoneNeedsAttention(
-          root,
-          batchId,
-          leaseId,
-          deleteStartedAt,
-          tombstone.value.reason
-        );
-      } catch (error) { failure ??= error; }
-      throw new KnowledgeCompilationError(
-        "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+      await finishNativeDeletionWitness(
+        nativeWitness,
+        paths.data,
         "Another filesystem link retained the generation after its private staging path was removed. Cleanup needs local review and was not reported complete."
       );
+      await this.#markTombstoneUnlinkVerified(root, batchId, leaseId);
+      return true;
+    } catch (error) {
+      operationFailure = error;
+      if (error?.code === "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION") {
+        try {
+          await this.#markTombstoneNeedsAttention(
+            root,
+            batchId,
+            leaseId,
+            deleteStartedAt,
+            tombstone.value.reason
+          );
+        } catch {
+          // Preserve the authoritative multiple-link failure.
+        }
+      }
+      throw error;
+    } finally {
+      try {
+        await closeNativeDeletionWitness(nativeWitness);
+      } catch (error) {
+        if (!operationFailure) throw error;
+      }
     }
-    if (failure) throw failure;
-    await this.#markTombstoneUnlinkVerified(root, batchId, leaseId);
-    return true;
   }
 
   async #unlinkUntrackedDataWithVerification(target) {
     let before;
     try {
-      before = await this.fileSystem.lstat(target);
+      before = await this.#fileSystem.lstat(target);
     } catch (error) {
       if (error?.code === "ENOENT") {
         throw new KnowledgeCompilationError(
@@ -1537,51 +1641,59 @@ export class LocalTemporaryStaging {
       throw error;
     }
 
-    if (before.isSymbolicLink?.()) {
-      await unlinkAndSync(this.fileSystem, target, { ignoreMissing: false });
-      if (!await pathIsAbsent(this.fileSystem, target)) {
-        throw new KnowledgeCompilationError(
-          "STAGING_FILE_IDENTITY_CHANGED",
-          "An untracked staging symlink remained after cleanup. Cleanup needs local review and was not reported complete."
-        );
-      }
-      return;
+    if (!before.isSymbolicLink?.()) {
+      assertSingleLinkRegularFile(before, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
     }
-
-    assertSingleLinkRegularFile(before, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
-    let handle;
-    let failure = null;
-    let linksAfterUnlink = null;
+    let nativeWitness = null;
+    let operationFailure = null;
     try {
-      handle = await this.fileSystem.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      const opened = await handle.stat();
-      assertSingleLinkRegularFile(opened, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
-      if (!sameFileIdentity(before, opened)) {
-        throw new KnowledgeCompilationError(
-          "STAGING_FILE_IDENTITY_CHANGED",
-          "Untracked staging data changed identity immediately before deletion. Cleanup needs local review and was not reported complete."
-        );
+      nativeWitness = await nativeDeletionWitness(target);
+      if (before.isSymbolicLink?.()) {
+        await unlinkAndSync(this.#fileSystem, target, { ignoreMissing: false });
+      } else {
+        let handle;
+        let failure = null;
+        let linksAfterUnlink = null;
+        try {
+          handle = await this.#fileSystem.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+          const opened = await handle.stat();
+          assertSingleLinkRegularFile(opened, "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION");
+          if (!sameFileIdentity(before, opened)) {
+            throw new KnowledgeCompilationError(
+              "STAGING_FILE_IDENTITY_CHANGED",
+              "Untracked staging data changed identity immediately before deletion. Cleanup needs local review and was not reported complete."
+            );
+          }
+          await unlinkAndSync(this.#fileSystem, target, { ignoreMissing: false });
+          linksAfterUnlink = (await handle.stat()).nlink;
+        } catch (error) {
+          failure = error;
+        }
+        if (handle) {
+          try { await handle.close(); } catch (error) { failure ??= error; }
+        }
+        if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
+          throw new KnowledgeCompilationError(
+            "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+            "Another filesystem link retained untracked staging bytes after the private path was removed. Cleanup needs local review and was not reported complete."
+          );
+        }
+        if (failure) throw failure;
       }
-      await unlinkAndSync(this.fileSystem, target, { ignoreMissing: false });
-      linksAfterUnlink = (await handle.stat()).nlink;
-    } catch (error) {
-      failure = error;
-    }
-    if (handle) {
-      try { await handle.close(); } catch (error) { failure ??= error; }
-    }
-    if (linksAfterUnlink !== null && linksAfterUnlink !== 0) {
-      throw new KnowledgeCompilationError(
-        "STAGING_MULTIPLE_LINKS_NEEDS_ATTENTION",
+      await finishNativeDeletionWitness(
+        nativeWitness,
+        target,
         "Another filesystem link retained untracked staging bytes after the private path was removed. Cleanup needs local review and was not reported complete."
       );
-    }
-    if (failure) throw failure;
-    if (!await pathIsAbsent(this.fileSystem, target)) {
-      throw new KnowledgeCompilationError(
-        "STAGING_FILE_IDENTITY_CHANGED",
-        "Untracked staging data remained after cleanup. Cleanup needs local review and was not reported complete."
-      );
+    } catch (error) {
+      operationFailure = error;
+      throw error;
+    } finally {
+      try {
+        await closeNativeDeletionWitness(nativeWitness);
+      } catch (error) {
+        if (!operationFailure) throw error;
+      }
     }
   }
 
@@ -1592,13 +1704,51 @@ export class LocalTemporaryStaging {
     const cleanupReason = boundedCleanupReason(options.reason);
     const tombstone = await this.#ensureTombstone(root, batchId, leaseId, deleteStartedAt, cleanupReason);
     await this.#unlinkSingleLinkData(root, batchId, leaseId, deleteStartedAt, tombstone, options);
-    if (!await pathIsAbsent(this.fileSystem, paths.data)) {
+    if (!await pathIsAbsent(this.#fileSystem, paths.data)) {
       throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "The protected temporary batch still exists; cleanup remains armed and can be retried.");
     }
-    await unlinkAndSync(this.fileSystem, paths.lease);
-    if (!await pathIsAbsent(this.fileSystem, paths.lease)) {
-      throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "The protected generation marker still exists; cleanup remains armed and can be retried.");
+    await assertNativePathsAbsent(
+      [paths.data],
+      "The protected temporary batch still exists on the local filesystem; cleanup remains armed and can be retried."
+    );
+    let leaseWitness = null;
+    let leaseOperationFailure = null;
+    try {
+      try {
+        leaseWitness = await nativeDeletionWitness(paths.lease);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await unlinkAndSync(this.#fileSystem, paths.lease);
+      if (!await pathIsAbsent(this.#fileSystem, paths.lease)) {
+        throw new KnowledgeCompilationError("STAGING_DELETE_FAILED", "The protected generation marker still exists; cleanup remains armed and can be retried.");
+      }
+      if (leaseWitness) {
+        await finishNativeDeletionWitness(
+          leaseWitness,
+          paths.lease,
+          "Another filesystem link retained the protected generation marker. Cleanup needs local review and was not reported complete."
+        );
+      } else {
+        await assertNativePathsAbsent(
+          [paths.lease],
+          "The protected generation marker still exists on the local filesystem; cleanup remains armed and can be retried."
+        );
+      }
+    } catch (error) {
+      leaseOperationFailure = error;
+      throw error;
+    } finally {
+      try {
+        await closeNativeDeletionWitness(leaseWitness);
+      } catch (error) {
+        if (!leaseOperationFailure) throw error;
+      }
     }
+    await assertNativePathsAbsent(
+      [paths.data, paths.lease],
+      "The exact protected generation still exists on the local filesystem, so cleanup was not reported complete."
+    );
     let receiptPersisted = false;
     try {
       await this.#writeCompletionReceipt(
@@ -1616,22 +1766,41 @@ export class LocalTemporaryStaging {
       // consumed by a later locked lifecycle transaction.
     }
     const timerKey = this.#timerKey(batchId, leaseId);
-    const timer = this.expiryTimers.get(timerKey);
+    const timer = this.#expiryTimers.get(timerKey);
     if (timer) clearTimeout(timer);
-    this.expiryTimers.delete(timerKey);
+    this.#expiryTimers.delete(timerKey);
     if (!receiptPersisted) {
       throw new KnowledgeCompilationError(
         "STAGING_DELETE_RECEIPT_PENDING",
         "The private batch is absent, but its durable cleanup receipt is still pending and can be resumed."
       );
     }
-    await this.#disarmGenerationRetention(batchId, leaseId, root);
+    try {
+      await this.#disarmGenerationRetention(batchId, leaseId, root);
+      // Retention is the last authority-adjacent callback. Re-certify after it
+      // so a mutable or hostile dependency cannot restore bytes while public
+      // lifecycle state advances to a terminal deletion status.
+      await assertNativePathsAbsent(
+        [paths.data, paths.lease],
+        "The exact protected generation reappeared while cleanup was being finalized. Cleanup remains pending and retention will be re-armed."
+      );
+    } catch (error) {
+      try {
+        const manifest = await this.#readManifest(root, batchId, leaseId);
+        this.#scheduleExpiry(batchId, leaseId, manifest.expiresAt);
+        await this.#armRetention(batchId, manifest.expiresAt, leaseId, root);
+      } catch {
+        // The caller still receives a nonterminal failure. A durable lease or
+        // cleanup artifact remains available for a later exact-instance retry.
+      }
+      throw error;
+    }
     return true;
   }
 
   async delete(input, operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.delete.call(this, input, INTERNAL_LOCAL_STAGING_OPERATION)
       ));
     }
@@ -1640,7 +1809,10 @@ export class LocalTemporaryStaging {
       const safeBatchId = assertBatchId(batchId);
       const root = await this.#trustedRoot();
       const generation = await this.#activeGeneration(root, safeBatchId, leaseId);
-      if (!generation) return true;
+      // Absence reported by an injected adapter is not deletion authority.
+      // Exact lifecycle callers retain generation-bound completion artifacts
+      // and reconcile those separately under the shared state lock.
+      if (!generation) return false;
       return await this.#deleteGenerationWithVerification(safeBatchId, generation.leaseId, root, { reason });
     } catch (error) {
       if (error instanceof KnowledgeCompilationError && [
@@ -1654,7 +1826,7 @@ export class LocalTemporaryStaging {
 
   async acknowledgeCleanupReceipt(input, internalToken, operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.acknowledgeCleanupReceipt.call(
           this,
           input,
@@ -1682,14 +1854,21 @@ export class LocalTemporaryStaging {
         "The exact generation still lacks verified completion evidence, so retention remains armed."
       );
     }
-    await this.#disarmGenerationRetention(safeBatchId, safeLeaseId, root);
+    // Deletion itself disarms retention before it returns certified success.
+    // Do not invoke caller-supplied retention code after terminal lifecycle
+    // truth has been durably saved; acknowledgement only retires content-free
+    // local evidence after one final native absence check.
+    await assertNativePathsAbsent(
+      [paths.data, paths.lease],
+      "The exact protected generation reappeared before cleanup evidence could be acknowledged."
+    );
     for (const target of [paths.receipt, paths.tombstone]) {
-      try { await unlinkAndSync(this.fileSystem, target); } catch {}
+      try { await unlinkAndSync(this.#fileSystem, target); } catch {}
     }
   }
 
   async #discoverCompletionArtifacts(root) {
-    const entries = await this.fileSystem.readdir(root, { withFileTypes: true });
+    const entries = await this.#fileSystem.readdir(root, { withFileTypes: true });
     const completions = new Map();
     for (const kind of ["tombstone", "receipt"]) {
       const suffix = kind === "receipt" ? STAGING_RECEIPT_SUFFIX : STAGING_TOMBSTONE_SUFFIX;
@@ -1697,7 +1876,7 @@ export class LocalTemporaryStaging {
         const parsed = parseGenerationArtifact(entry.name, suffix);
         if (!parsed) continue;
         let raw;
-        try { raw = await readSmallJson(this.fileSystem, join(root, entry.name)); } catch { continue; }
+        try { raw = await readSmallJson(this.#fileSystem, join(root, entry.name)); } catch { continue; }
         const leaseId = typeof raw?.leaseId === "string" && OPAQUE_ID.test(raw.leaseId) ? raw.leaseId : null;
         if (!leaseId || generationTagForLease(leaseId) !== parsed.generationTag) continue;
         const completion = await this.#completionArtifactAt(root, parsed.batchId, leaseId, kind);
@@ -1713,7 +1892,7 @@ export class LocalTemporaryStaging {
     const current = Date.parse(canonicalTimestamp(now, "STAGING_TIMESTAMP_INVALID"));
     const removedBatches = [];
     const cleanupNeedsAttentionBatches = [];
-    const entries = await this.fileSystem.readdir(root, { withFileTypes: true });
+    const entries = await this.#fileSystem.readdir(root, { withFileTypes: true });
     const descriptors = new Map();
     for (const entry of entries) {
       const leaseArtifact = parseGenerationArtifact(entry.name, STAGING_LEASE_SUFFIX);
@@ -1754,7 +1933,7 @@ export class LocalTemporaryStaging {
       let rawManifest;
       let manifest;
       try {
-        rawManifest = await readSmallJson(this.fileSystem, leasePath);
+        rawManifest = await readSmallJson(this.#fileSystem, leasePath);
         const leaseId = assertOpaqueId(rawManifest?.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
         if (generationTagForLease(leaseId) !== descriptor.generationTag) throw new Error("generation mismatch");
         manifest = this.#validatedManifest(rawManifest, descriptor.batchId, leaseId);
@@ -1771,13 +1950,11 @@ export class LocalTemporaryStaging {
         }
         try {
           await this.#unlinkUntrackedDataWithVerification(dataPath);
-          await unlinkAndSync(this.fileSystem, leasePath, { ignoreMissing: false });
-          if (!await pathIsAbsent(this.fileSystem, dataPath) || !await pathIsAbsent(this.fileSystem, leasePath)) {
-            throw new KnowledgeCompilationError(
-              "STAGING_FILE_IDENTITY_CHANGED",
-              "A malformed staging generation remained after cleanup. Cleanup needs local review and was not reported complete."
-            );
-          }
+          await this.#unlinkUntrackedDataWithVerification(leasePath);
+          await assertNativePathsAbsent(
+            [dataPath, leasePath],
+            "A malformed staging generation remained on the local filesystem after cleanup. Cleanup needs local review and was not reported complete."
+          );
           removedBatches.push({
             batchId: descriptor.batchId,
             generationTag: descriptor.generationTag,
@@ -1795,7 +1972,7 @@ export class LocalTemporaryStaging {
         continue;
       }
       const paths = this.#paths(root, descriptor.batchId, manifest.leaseId);
-      const dataAbsent = await pathIsAbsent(this.fileSystem, paths.data);
+      const dataAbsent = await pathIsAbsent(this.#fileSystem, paths.data);
       let invalidData = false;
       if (!dataAbsent) {
         try {
@@ -1850,7 +2027,7 @@ export class LocalTemporaryStaging {
             leaseId: manifest.leaseId,
             reason: "retention-unavailable"
           };
-          this.retentionCoverageUnavailableBatches.push(removal);
+          this.#retentionCoverageUnavailableBatches.push(removal);
           removedBatches.push(removal);
         } catch (error) {
           const reason = unverifiedCleanupFailureReason(error);
@@ -1880,9 +2057,44 @@ export class LocalTemporaryStaging {
     };
   }
 
+  #removalEvidencePaths(root, entry) {
+    const batchId = assertBatchId(entry?.batchId);
+    const generationTag = typeof entry?.generationTag === "string" && GENERATION_TAG.test(entry.generationTag)
+      ? entry.generationTag
+      : null;
+    if (!generationTag) {
+      throw new KnowledgeCompilationError(
+        "STAGING_CLEANUP_EVIDENCE_REQUIRED",
+        "Cleanup evidence did not identify one exact protected staging generation."
+      );
+    }
+    if (entry?.leaseId) {
+      const leaseId = assertOpaqueId(entry.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
+      if (generationTagForLease(leaseId) !== generationTag) {
+        throw new KnowledgeCompilationError(
+          "STAGING_CLEANUP_EVIDENCE_REQUIRED",
+          "Cleanup evidence did not match the exact protected staging generation."
+        );
+      }
+      return this.#paths(root, batchId, leaseId);
+    }
+    const base = `${STAGING_FILE_PREFIX}${batchId}.${generationTag}`;
+    const paths = {
+      data: resolve(root, `${base}${STAGING_FILE_SUFFIX}`),
+      lease: resolve(root, `${base}${STAGING_LEASE_SUFFIX}`)
+    };
+    if (Object.values(paths).some((candidate) => dirname(candidate) !== root || !isWithin(candidate, root))) {
+      throw new KnowledgeCompilationError(
+        "STAGING_PATH_ESCAPE_BLOCKED",
+        "Cleanup evidence refused a path outside its dedicated staging directory."
+      );
+    }
+    return paths;
+  }
+
   async cleanupExpired(input, operationToken = null) {
     if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
-      return runLocalStagingOperation(this.root, () => (
+      return runLocalStagingOperation(this.#root, () => (
         LOCAL_TEMPORARY_STAGING_METHODS.cleanupExpired.call(this, input, INTERNAL_LOCAL_STAGING_OPERATION)
       ));
     }
@@ -1893,21 +2105,60 @@ export class LocalTemporaryStaging {
     const startupEvidenceIsStillCurrent = (entry) => !observedGenerationKeys.has(
       `${entry.batchId}\u0000${entry.generationTag ?? ""}`
     );
-    const removedBatches = [
-      ...this.startupRemovedBatches.filter(startupEvidenceIsStillCurrent),
+    const candidateRemovedBatches = [
+      ...this.#startupRemovedBatches.filter(startupEvidenceIsStillCurrent),
       ...cleaned.removedBatches
     ];
-    const cleanupNeedsAttentionBatches = [...new Map([
-      ...this.startupCleanupNeedsAttentionBatches.filter(startupEvidenceIsStillCurrent),
+    const candidateCleanupNeedsAttentionBatches = [
+      ...this.#startupCleanupNeedsAttentionBatches.filter(startupEvidenceIsStillCurrent),
       ...cleaned.cleanupNeedsAttentionBatches
-    ].map((entry) => [
+    ];
+    const removedBatches = [];
+    for (const entry of candidateRemovedBatches) {
+      const paths = this.#removalEvidencePaths(root, entry);
+      try {
+        await assertNativePathsAbsent(
+          [paths.data, paths.lease],
+          "The exact protected generation reappeared before cleanup results were finalized. Cleanup was not reported complete."
+        );
+        removedBatches.push(entry);
+      } catch (error) {
+        if (!(error instanceof KnowledgeCompilationError) || error.code !== "STAGING_DELETE_FAILED") throw error;
+        candidateCleanupNeedsAttentionBatches.push({
+          batchId: entry.batchId,
+          generationTag: entry.generationTag,
+          leaseId: entry.leaseId ?? null,
+          reason: "STAGING_FILE_IDENTITY_CHANGED"
+        });
+      }
+    }
+    const completionReceipts = [];
+    for (const receipt of cleaned.completionReceipts) {
+      const paths = this.#paths(root, receipt.batchId, receipt.leaseId);
+      try {
+        await assertNativePathsAbsent(
+          [paths.data, paths.lease],
+          "The exact protected generation reappeared before cleanup evidence was finalized. Its receipt was not reported complete."
+        );
+        completionReceipts.push(receipt);
+      } catch (error) {
+        if (!(error instanceof KnowledgeCompilationError) || error.code !== "STAGING_DELETE_FAILED") throw error;
+        candidateCleanupNeedsAttentionBatches.push({
+          batchId: receipt.batchId,
+          generationTag: generationTagForLease(receipt.leaseId),
+          leaseId: receipt.leaseId,
+          reason: "STAGING_FILE_IDENTITY_CHANGED"
+        });
+      }
+    }
+    const cleanupNeedsAttentionBatches = [...new Map(candidateCleanupNeedsAttentionBatches.map((entry) => [
       `${entry.batchId}\u0000${entry.generationTag ?? ""}\u0000${entry.leaseId ?? ""}\u0000${entry.reason}`,
       entry
     ])).values()];
-    const retentionCoverageUnavailableBatches = [...this.retentionCoverageUnavailableBatches];
-    this.startupRemovedBatches = [];
-    this.startupCleanupNeedsAttentionBatches = [];
-    this.retentionCoverageUnavailableBatches = [];
+    const retentionCoverageUnavailableBatches = [...this.#retentionCoverageUnavailableBatches];
+    this.#startupRemovedBatches = [];
+    this.#startupCleanupNeedsAttentionBatches = [];
+    this.#retentionCoverageUnavailableBatches = [];
     return {
       removedBatches,
       removedBatchIds: [...new Set(removedBatches.map((entry) => entry.batchId))].sort(),
@@ -1915,7 +2166,7 @@ export class LocalTemporaryStaging {
       cleanupNeedsAttentionBatchIds: [...new Set(cleanupNeedsAttentionBatches.map((entry) => entry.batchId))].sort(),
       retentionCoverageUnavailableBatches,
       retentionCoverageUnavailableBatchIds: [...new Set(retentionCoverageUnavailableBatches.map((entry) => entry.batchId))].sort(),
-      completionReceipts: cleaned.completionReceipts
+      completionReceipts
     };
   }
 }
