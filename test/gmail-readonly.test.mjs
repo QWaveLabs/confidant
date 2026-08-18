@@ -15,8 +15,10 @@ import {
   cancelGmailReadOnlyScope,
   fetchApprovedGmailReferences,
   getGmailReadOnlyStatus,
+  getSourceStatusHandoff,
   grantGmailReadOnlyScope,
   revokeGmailReadOnlyConnection,
+  skipGmailConnection,
   startSetupSession
 } from "../src/index.mjs";
 
@@ -184,6 +186,50 @@ test("Gmail stays metadata-first and simulated verification never claims a live 
   });
 });
 
+test("Gmail public, status, reference, and handoff views expose only stable local lifecycle aliases", async () => {
+  await withGmailFixture(async ({ stateStore, plugin, clock }) => {
+    const rawAccountId = "gmail-private-account";
+    plugin.account = { id: rawAccountId, label: "Private adapter label" };
+    const rawReviewId = "gmail-private-review";
+    const rawGrantId = "gmail-private-grant";
+    const { review, granted } = await connectReviewAndGrant({
+      stateStore,
+      plugin,
+      clock,
+      reviewId: rawReviewId,
+      grantId: rawGrantId
+    });
+    const accountAlias = review.gmail.account.context;
+    assert.match(accountAlias, /^local-gmail-account-/);
+    assert.equal(review.gmail.permissionReview.account.id, accountAlias);
+    assert.equal(review.gmail.permissionReview.permissionRequest.account.id, accountAlias);
+    assert.equal(review.gmail.permissionReview.permissionRequest.requestedScope.accountId, accountAlias);
+    assert.match(review.gmail.permissionReview.permissionRequest.reviewId, /^local-gmail-review-/);
+    assert.match(granted.gmail.permissionReview.activeGrant.grantId, /^local-gmail-grant-/);
+    assert.equal(granted.gmail.permissionReview.activeGrant.scope.accountId, accountAlias);
+
+    const fetched = await fetchApprovedGmailReferences({
+      message: "Process one approved Gmail page",
+      stateStore,
+      plugin,
+      clock,
+      maxPages: 1
+    });
+    assert.equal(fetched.approvedReferences[0].accountContext, accountAlias);
+    const status = await getGmailReadOnlyStatus({ stateStore });
+    const handoff = await getSourceStatusHandoff({ stateStore });
+    const persisted = await stateStore.load();
+    const internalPageGenerationId = persisted.gmailReadOnlyLifecycle.entry.audit
+      .find((event) => event.type === "gmail-page-read-started")?.operationId;
+    const internalPageToken = persisted.gmailReadOnlyLifecycle.entry.import.nextPageToken;
+    const publicText = JSON.stringify({ review, granted, fetched, status, handoff });
+    for (const rawIdentifier of [rawAccountId, rawReviewId, rawGrantId, internalPageGenerationId, internalPageToken]) {
+      assert.equal(publicText.includes(rawIdentifier), false, `public Gmail views must not expose ${rawIdentifier}`);
+    }
+    assert.equal(handoff.sourceStatusHandoff.sources.some((source) => source.source.id === `gmail:${accountAlias}`), true);
+  }, { pluginOptions: { account: { id: "gmail-private-account", label: "Private adapter label" } } });
+});
+
 test("an empty simulated Gmail response remains non-live even if the fixture claims an actual read", async () => {
   await withGmailFixture(async ({ stateStore, plugin, clock }) => {
     await connectReviewAndGrant({ stateStore, plugin, clock, reviewId: "empty-review", grantId: "empty-grant" });
@@ -279,9 +325,40 @@ test("metadata interruption remains resumable and does not fetch a mail page", a
       reviewIdFactory: () => "resumed-metadata"
     });
     assert.equal(resumed.recoverable, undefined);
-    assert.equal(resumed.gmail.permissionReview.permissionRequest.reviewId, "resumed-metadata");
+    assert.notEqual(resumed.gmail.permissionReview.permissionRequest.reviewId, "resumed-metadata");
+    assert.match(resumed.gmail.permissionReview.permissionRequest.reviewId, /^local-gmail-review-/);
     assert.equal(plugin.metadataPreflightCalls, 2);
     assert.equal(plugin.approvedPageCalls, 0);
+  });
+});
+
+test("metadata preflight rejects nested singular attachment and message/email body key variants before grant", async () => {
+  await withGmailFixture(async ({ stateStore, plugin, clock }) => {
+    await beginGmailConnection({ message: "Connect Gmail to my second brain", stateStore, plugin, clock });
+    const normalDiscover = plugin.discoverMetadata.bind(plugin);
+    for (const bodyField of ["Attachment", "Message_Body", "EMAIL-body"]) {
+      plugin.discoverMetadata = async (request) => {
+        const metadata = await normalDiscover(request);
+        metadata.account = {
+          ...metadata.account,
+          nested: { deeper: { [bodyField]: `private-${bodyField}` } }
+        };
+        return metadata;
+      };
+      const failed = await beginGmailPrivacyReview({
+        message: "Review Gmail metadata for my second brain",
+        stateStore,
+        plugin,
+        clock
+      });
+      assert.equal(failed.recoverable, true);
+      assert.equal(failed.gmail.status, "needs-attention");
+      assert.equal(failed.gmail.lastSafeError.code, "GMAIL_BODY_BOUNDARY_VIOLATION");
+      assert.equal(JSON.stringify(failed).includes(`private-${bodyField}`), false);
+      assert.equal(plugin.grantRegistrationCalls, 0);
+      assert.equal(plugin.approvedPageCalls, 0);
+    }
+    assert.equal(plugin.writeCalls, 0);
   });
 });
 
@@ -481,6 +558,12 @@ test("a post-fetch outer checkpoint failure persists uncertainty and a normal re
     assert.equal(pending.checkpoint, "initial");
     assert.equal(pending.operationRevision, 1);
     assert.equal(persisted.sourcePermissionLifecycle.entries["gmail:gmail-work"].bodyFetches, 1);
+    const uncertainStatus = await getGmailReadOnlyStatus({ stateStore });
+    const uncertainPublicText = JSON.stringify(uncertainStatus);
+    for (const internalIdentifier of [pending.operationId, pending.reviewId, pending.grantId]) {
+      assert.equal(uncertainPublicText.includes(String(internalIdentifier)), false, "pending page/read generation details stay private");
+    }
+    assert.equal(uncertainStatus.gmail.connection.live, false);
 
     const callsBeforeRetry = plugin.approvedPageCalls;
     const blockedRetry = await fetchApprovedGmailReferences({
@@ -514,7 +597,8 @@ test("a post-fetch outer checkpoint failure persists uncertainty and a normal re
       clock,
       reviewIdFactory: () => "fresh-after-uncertain-read"
     });
-    assert.equal(fresh.gmail.permissionReview.permissionRequest.reviewId, "fresh-after-uncertain-read");
+    assert.notEqual(fresh.gmail.permissionReview.permissionRequest.reviewId, "fresh-after-uncertain-read");
+    assert.match(fresh.gmail.permissionReview.permissionRequest.reviewId, /^local-gmail-review-/);
     assert.equal(plugin.approvedPageCalls, callsBeforeRetry);
   });
 });
@@ -699,6 +783,49 @@ test("a cancelled scope requires a new review, and revoked Gmail is never reused
   });
 });
 
+test("a non-throwing Gmail plugin revoke without exact-grant confirmation remains needs-attention", async () => {
+  await withGmailFixture(async ({ stateStore, plugin, clock }) => {
+    await connectReviewAndGrant({
+      stateStore,
+      plugin,
+      clock,
+      reviewId: "ambiguous-revoke-review",
+      grantId: "ambiguous-revoke-grant"
+    });
+    const normalRevoke = plugin.revokePermissionGrant.bind(plugin);
+    plugin.getPermissionGrantStatus = undefined;
+    plugin.revokePermissionGrant = async ({ grantId }) => {
+      plugin.grantRevocationCalls += 1;
+      plugin.authorizedGrantIds.delete(grantId);
+      // Deliberately no exact-grant result: a non-throw is not verification.
+    };
+
+    const unconfirmed = await skipGmailConnection({
+      message: "Skip Gmail for now",
+      stateStore,
+      plugin,
+      clock
+    });
+    assert.equal(unconfirmed.gmail.status, "needs-attention");
+    assert.equal(unconfirmed.gmail.status === "skipped", false);
+    assert.equal(unconfirmed.gmail.grantLifecycle.status, "revocation-unconfirmed");
+    assert.equal(unconfirmed.gmail.grantLifecycle.revocationConfirmed, false);
+    assert.equal(unconfirmed.gmail.lastSafeError.code, "GMAIL_PLUGIN_REVOCATION_UNCONFIRMED");
+    const persisted = await stateStore.load();
+    assert.equal(persisted.sourcePermissionLifecycle.entries["gmail:gmail-work"].status, "granted");
+
+    plugin.revokePermissionGrant = normalRevoke;
+    const confirmed = await skipGmailConnection({
+      message: "Retry the saved Gmail skip",
+      stateStore,
+      plugin,
+      clock
+    });
+    assert.equal(confirmed.gmail.status, "skipped");
+    assert.equal(confirmed.gmail.grantLifecycle.revocationConfirmed, true);
+  });
+});
+
 test("external revocation and a body-boundary violation fail closed without a live claim", async () => {
   await withGmailFixture(async ({ stateStore, plugin, clock }) => {
     plugin.revokedPageTokens = new Set(["page-2"]);
@@ -743,7 +870,8 @@ test("external revocation and a body-boundary violation fail closed without a li
       clock,
       reviewIdFactory: () => "after-external-revocation"
     });
-    assert.equal(fresh.gmail.permissionReview.permissionRequest.reviewId, "after-external-revocation");
+    assert.notEqual(fresh.gmail.permissionReview.permissionRequest.reviewId, "after-external-revocation");
+    assert.match(fresh.gmail.permissionReview.permissionRequest.reviewId, /^local-gmail-review-/);
     assert.equal(fresh.gmail.permissionReview.activeGrant, null, "an externally revoked grant is not reused after cleanup is explicitly confirmed");
   });
 

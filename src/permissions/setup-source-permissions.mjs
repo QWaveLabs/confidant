@@ -61,11 +61,15 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
-// Each lifecycle writer saves the complete Setup Session root object. Separate
-// source-specific locks would still allow a stale root from another lifecycle
-// to restore a revoked grant. FileStateStore instances can also be reopened
-// through equivalent lexical paths, so the shared lock identity is based on
-// the canonical backing file when one exists.
+// Every lifecycle writer persists the same Setup Session root object. A
+// source/account-scoped lock cannot protect that shared document: an unrelated
+// source could otherwise save an older root and resurrect a revoked grant.
+// FileStateStore instances can also be reconstructed with equivalent lexical
+// paths, so derive one in-process lock identity from the canonical backing
+// file. Public writers are deliberately not re-entrant: a connector or
+// state-store callback must never mutate the root and then let an outer stale
+// snapshot overwrite that mutation. Trusted connector lifecycles use the
+// explicit lock-held primitives below instead of re-entering a public writer.
 const stateStoreOperationTails = new Map();
 const inMemoryStateStoreOperationKeys = new WeakMap();
 const stateStoreLockContext = new AsyncLocalStorage();
@@ -129,25 +133,75 @@ function stateStoreOperationKey(stateStore) {
  * writes the entire root document, so any concurrent lifecycle writer could
  * otherwise restore stale entries for a different source.
  */
-export async function withSourcePermissionStateLock(stateStore, operation) {
+async function withSourcePermissionStateLockMode(stateStore, operation, mode) {
   assertStateStore(stateStore);
   if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
   const key = stateStoreOperationKey(stateStore);
   const inherited = stateStoreLockContext.getStore();
-  if (inherited?.keys?.has(key)) return operation();
+  const inheritedMode = inherited?.modes?.get(key);
+  if (inheritedMode) {
+    if (mode === "read") return operation();
+    if (inheritedMode === "read") {
+      const upgradedModes = new Map(inherited.modes);
+      upgradedModes.set(key, "write");
+      return stateStoreLockContext.run({ modes: upgradedModes }, operation);
+    }
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REENTRANT_OPERATION_BLOCKED",
+      "I stopped a nested Setup Session change so an older saved state could not overwrite a newer permission decision. Retry that action after the current step finishes."
+    );
+  }
 
   const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
   await previous.catch(() => undefined);
-  const keys = new Set(inherited?.keys ?? []);
-  keys.add(key);
+  const modes = new Map(inherited?.modes ?? []);
+  modes.set(key, mode);
   try {
-    return await stateStoreLockContext.run({ keys }, operation);
+    return await stateStoreLockContext.run({ modes }, operation);
   } finally {
     release();
   }
+}
+
+export async function withSourcePermissionStateLock(stateStore, operation) {
+  return withSourcePermissionStateLockMode(stateStore, operation, "write");
+}
+
+// Status views serialize with writers but never save their loaded snapshot.
+// A public writer invoked by a read-only callback may therefore run safely;
+// that nested writer is temporarily upgraded to write mode so any further
+// writer re-entry still fails closed.
+export async function withSourcePermissionStateReadLock(stateStore, operation) {
+  return withSourcePermissionStateLockMode(stateStore, operation, "read");
+}
+
+async function runWithinHeldSourcePermissionStateLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  if (stateStoreLockContext.getStore()?.modes?.get(key) !== "write") {
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REQUIRED",
+      "I stopped an internal Setup Session change because its full-state lock was not active. Retry from the guided source flow."
+    );
+  }
+  return operation();
+}
+
+async function runWithinHeldSourcePermissionStateReadLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  if (!stateStoreLockContext.getStore()?.modes?.has(key)) {
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REQUIRED",
+      "I stopped an internal Setup Session read because its consistent-state lock was not active. Retry from the guided source flow."
+    );
+  }
+  return operation();
 }
 
 function assertConnector(connector) {
@@ -692,7 +746,7 @@ async function loadRootState(stateStore) {
  * granular permission request. This is the only entry point that starts a
  * source review; connector discovery is never a body fetch.
  */
-export async function beginSourcePermissionReview({
+async function beginSourcePermissionReviewInternal({
   message,
   stateStore,
   connector,
@@ -740,12 +794,20 @@ export async function beginSourcePermissionReview({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function beginSourcePermissionReview(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal(args));
+}
+
+export async function beginSourcePermissionReviewWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal(args));
+}
+
 /**
  * Public Setup Session boundary: records one granular immutable grant. A stale
  * review cannot be used after denial or revocation, and a second matching call
  * returns the existing grant rather than widening or duplicating access.
  */
-export async function grantSourcePermission({
+async function grantSourcePermissionInternal({
   message,
   stateStore,
   connector,
@@ -815,8 +877,16 @@ export async function grantSourcePermission({
   return { permissionReview: publicReview(entry, languageFor(state, language)) };
 }
 
+export async function grantSourcePermission(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal(args));
+}
+
+export async function grantSourcePermissionWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal(args));
+}
+
 /** Records an explicit denial without treating it as an error or allowing stale approval UI to revive it. */
-export async function denySourcePermission({ message, stateStore, source, accountId, reviewId, language, clock }) {
+async function denySourcePermissionInternal({ message, stateStore, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "deny");
   assertStateStore(stateStore);
   const state = await loadRootState(stateStore);
@@ -839,8 +909,16 @@ export async function denySourcePermission({ message, stateStore, source, accoun
   };
 }
 
+export async function denySourcePermission(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal(args));
+}
+
+export async function denySourcePermissionWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal(args));
+}
+
 /** Revokes local permission state only; it never writes to a connected source application. */
-export async function revokeSourcePermission({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function revokeSourcePermissionInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "revoke");
   assertStateStore(stateStore);
   if (!connector || typeof connector.revokePermissionGrant !== "function") {
@@ -877,12 +955,20 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
   };
 }
 
+export async function revokeSourcePermission(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal(args));
+}
+
+export async function revokeSourcePermissionWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal(args));
+}
+
 /**
  * Public Setup Session boundary for the first bounded content fetch. It sends
  * only a durable active grant to the adapter and returns opaque source refs;
  * it never returns raw source bodies to the conversation, proof, or tests.
  */
-export async function fetchApprovedSourceContent({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function fetchApprovedSourceContentInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message, "fetch");
   assertStateStore(stateStore);
   assertConnector(connector);
@@ -933,11 +1019,27 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   };
 }
 
+export async function fetchApprovedSourceContent(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal(args));
+}
+
+export async function fetchApprovedSourceContentWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal(args));
+}
+
 /** Read-only public status boundary for reviews, grants, and revocations. */
-export async function getSourcePermissionStatus({ stateStore, source, accountId, language }) {
+async function getSourcePermissionStatusInternal({ stateStore, source, accountId, language }) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   if (!state?.[STATE_KEY]) return null;
   const entry = state[STATE_KEY].entries[sourceKey(source, accountId)];
   return entry ? { permissionReview: publicReview(entry, languageFor(state, language)) } : null;
+}
+
+export async function getSourcePermissionStatus(args) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getSourcePermissionStatusInternal(args));
+}
+
+export async function getSourcePermissionStatusWithinStateLock(args) {
+  return runWithinHeldSourcePermissionStateReadLock(args?.stateStore, () => getSourcePermissionStatusInternal(args));
 }

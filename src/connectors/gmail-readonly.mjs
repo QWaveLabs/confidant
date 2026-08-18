@@ -11,13 +11,14 @@
 import { randomUUID } from "node:crypto";
 
 import {
-  beginSourcePermissionReview,
-  denySourcePermission,
-  fetchApprovedSourceContent,
-  getSourcePermissionStatus,
-  grantSourcePermission,
-  revokeSourcePermission,
-  withSourcePermissionStateLock
+  beginSourcePermissionReviewWithinStateLock,
+  denySourcePermissionWithinStateLock,
+  fetchApprovedSourceContentWithinStateLock,
+  getSourcePermissionStatusWithinStateLock,
+  grantSourcePermissionWithinStateLock,
+  revokeSourcePermissionWithinStateLock,
+  withSourcePermissionStateLock,
+  withSourcePermissionStateReadLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -37,7 +38,10 @@ const BODY_FIELD_NAMES = new Set([
   "payload",
   "headers",
   "mime",
-  "attachments"
+  "attachment",
+  "attachments",
+  "messagebody",
+  "emailbody"
 ]);
 export const GMAIL_CONNECTION_STATES = Object.freeze({
   SELECTED_BUT_UNFINISHED: "selected-but-unfinished",
@@ -193,7 +197,8 @@ function assertNoBodyFields(value, location, seen = new Set()) {
   if (!value || typeof value !== "object" || seen.has(value)) return;
   seen.add(value);
   for (const [key, nested] of Object.entries(value)) {
-    if (BODY_FIELD_NAMES.has(key.toLowerCase())) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (BODY_FIELD_NAMES.has(normalizedKey)) {
       throw new GmailReadOnlyError(
         "GMAIL_BODY_BOUNDARY_VIOLATION",
         `The Gmail ${location} included source-body data, so I stopped before exposing it.`
@@ -273,6 +278,11 @@ function newEntry(now) {
     status: GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED,
     accountId: null,
     reviewId: null,
+    publicAliases: {
+      account: `local-gmail-account-${randomUUID()}`,
+      review: `local-gmail-review-${randomUUID()}`,
+      grant: `local-gmail-grant-${randomUUID()}`
+    },
     plugin: {
       status: "not-started",
       attempts: 0,
@@ -309,6 +319,83 @@ function newEntry(now) {
     lastSafeError: null,
     audit: [{ type: "gmail-selected", at: now }]
   };
+}
+
+function safeLocalAlias(kind, rawValues, current) {
+  const raw = new Set(rawValues.filter((value) => typeof value === "string" && value));
+  if (typeof current === "string" && OPAQUE_IDENTIFIER.test(current) && !raw.has(current)) return current;
+  for (let index = 1; index <= 9; index += 1) {
+    const candidate = `local-gmail-${kind}-${index}`;
+    if (!raw.has(candidate)) return candidate;
+  }
+  throw new GmailReadOnlyError("GMAIL_PUBLIC_ALIAS_UNAVAILABLE", "I could not create a safe local Gmail reference, so I stopped before exposing an adapter identifier.");
+}
+
+function gmailPublicAliases(entry, permissionReview = null) {
+  const rawAccountId = entry?.accountId ?? permissionReview?.account?.id ?? null;
+  const rawReviewId = entry?.reviewId ?? permissionReview?.permissionRequest?.reviewId ?? null;
+  const rawGrantId = grantActivation(entry).grantId ?? permissionReview?.activeGrant?.grantId ?? null;
+  const rawValues = [
+    rawAccountId,
+    permissionReview?.account?.id,
+    rawReviewId,
+    permissionReview?.permissionRequest?.reviewId,
+    rawGrantId,
+    permissionReview?.activeGrant?.grantId
+  ];
+  return {
+    account: safeLocalAlias("account", rawValues, entry?.publicAliases?.account),
+    review: safeLocalAlias("review", rawValues, entry?.publicAliases?.review),
+    grant: safeLocalAlias("grant", rawValues, entry?.publicAliases?.grant)
+  };
+}
+
+function persistGmailPublicAliases(entry, permissionReview = null) {
+  entry.publicAliases = gmailPublicAliases(entry, permissionReview);
+  return entry.publicAliases;
+}
+
+function publicGmailPermissionReview(permissionReview, entry) {
+  if (!permissionReview) return null;
+  const aliases = gmailPublicAliases(entry, permissionReview);
+  const replace = (value, key = null) => {
+    if (typeof value === "string") {
+      if (key === "accountId") return aliases.account;
+      if (key === "reviewId") return aliases.review;
+      if (key === "grantId") return aliases.grant;
+      return value;
+    }
+    if (Array.isArray(value)) {
+      if (key === "accounts") return value.map(() => aliases.account);
+      return value.map((nested) => replace(nested));
+    }
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([nestedKey, nested]) => [nestedKey, replace(nested, nestedKey)]));
+    }
+    return value;
+  };
+  const projected = replace(permissionReview);
+  if (projected.account) projected.account.id = aliases.account;
+  if (projected.permissionRequest?.account) projected.permissionRequest.account.id = aliases.account;
+  return projected;
+}
+
+function internalGmailScope(scope, entry) {
+  const aliases = gmailPublicAliases(entry);
+  const internal = clone(scope);
+  if (!internal || typeof internal !== "object" || internal.accountId !== aliases.account) {
+    throw new GmailReadOnlyError(
+      "GMAIL_PUBLIC_ACCOUNT_REFERENCE_REQUIRED",
+      "The Gmail approval did not match the current local account reference, so I kept content access denied."
+    );
+  }
+  internal.accountId = entry.accountId;
+  if (Array.isArray(internal.exclusions?.accounts)) {
+    internal.exclusions.accounts = internal.exclusions.accounts.map((accountRef) => (
+      accountRef === aliases.account ? entry.accountId : accountRef
+    ));
+  }
+  return internal;
 }
 
 function getEntry(state) {
@@ -497,6 +584,7 @@ function publicView(entry, language, permissionReview = null) {
     : entry.status === GMAIL_CONNECTION_STATES.LIVE_AND_VERIFIED
     ? GMAIL_CONNECTION_STATES.NEEDS_ATTENTION
     : entry.status;
+  const aliases = gmailPublicAliases(entry, permissionReview);
   return {
     source: SOURCE,
     status,
@@ -522,7 +610,7 @@ function publicView(entry, language, permissionReview = null) {
       cleanupRequired: activationMayRemainActive(entry),
       revocationConfirmed: grantActivation(entry).revocationConfirmed === true
     },
-    account: entry.accountId ? { context: `gmail:${entry.accountId}` } : null,
+    account: entry.accountId ? { context: aliases.account } : null,
     import: {
       status: readMayHaveOccurred ? "read-may-have-occurred" : entry.import.status,
       pagesCompleted: entry.import.pagesCompleted,
@@ -536,7 +624,7 @@ function publicView(entry, language, permissionReview = null) {
     },
     nextAction: readMayHaveOccurred ? pendingReadRecoveryAction(language) : entry.pendingAction ? clone(entry.pendingAction) : null,
     lastSafeError: readMayHaveOccurred ? clone(entry.lastSafeError ?? pendingReadError(entry)) : entry.lastSafeError ? clone(entry.lastSafeError) : null,
-    permissionReview: permissionReview ? clone(permissionReview) : null,
+    permissionReview: publicGmailPermissionReview(permissionReview, entry),
     // Review ids, grant ids, pending operation ids/revisions, and raw page
     // checkpoints remain private lifecycle state rather than status output.
     audit: publicAudit(entry.audit)
@@ -554,6 +642,37 @@ function assertPluginMethod(plugin, method, message) {
   if (!plugin || typeof plugin[method] !== "function") {
     throw new GmailReadOnlyError("GMAIL_PLUGIN_CONTRACT_REQUIRED", message);
   }
+}
+
+function exactGrantRevocationConfirmation(value, grantId) {
+  const status = typeof value?.status === "string" ? value.status : null;
+  return Boolean(
+    value
+    && typeof value === "object"
+    && value.grantId === grantId
+    && !["active", "authorized", "granted"].includes(status)
+    && value.active !== true
+    && value.revoked !== false
+    && (
+      value.revoked === true
+      || value.active === false
+      || ["revoked", "not-found", "inactive"].includes(status)
+    )
+  );
+}
+
+async function revokePluginGrantWithExactConfirmation(plugin, grantId) {
+  assertPluginMethod(plugin, "revokePermissionGrant", "A Gmail plugin with grant revocation is required.");
+  const result = await plugin.revokePermissionGrant({ grantId });
+  if (exactGrantRevocationConfirmation(result, grantId)) return true;
+  if (typeof plugin.getPermissionGrantStatus === "function") {
+    const readback = await plugin.getPermissionGrantStatus({ grantId });
+    if (exactGrantRevocationConfirmation(readback, grantId)) return true;
+  }
+  throw new GmailReadOnlyError(
+    "GMAIL_PLUGIN_REVOCATION_UNCONFIRMED",
+    "Gmail did not explicitly confirm that the exact saved permission was revoked, so I kept this source in needs-attention state."
+  );
 }
 
 function pluginIsSimulated() {
@@ -596,7 +715,7 @@ function normalizeMetadataResult(result) {
   };
 }
 
-function normalizePageResult(result, { accountId, grant }) {
+function normalizePageResult(result, { accountId, accountAlias, grant }) {
   if (!result || typeof result !== "object") {
     throw new GmailReadOnlyError("GMAIL_PAGE_INVALID", "Gmail did not return a safe approved page, so I stopped before exposing source data.");
   }
@@ -616,7 +735,7 @@ function normalizePageResult(result, { accountId, grant }) {
     return {
       source: SOURCE,
       sourceRecordId: `gmail:${id}`,
-      accountContext: `gmail:${accountId}`,
+      accountContext: accountAlias,
       threadReference: `gmail-thread:${threadId}`,
       timestamp,
       processingDisposition: "untrusted-inert-reference"
@@ -635,9 +754,10 @@ function normalizePageResult(result, { accountId, grant }) {
  * approved page; lifecycle code persists the checkpoint between pages.
  */
 export class GmailReadOnlyConnector {
-  constructor({ plugin, pageToken = null, pageSize = 50 } = {}) {
+  constructor({ plugin, pageToken = null, pageSize = 50, publicAccountAlias = "local-gmail-account-1" } = {}) {
     this.plugin = plugin;
     this.pageToken = opaqueIdentifier(pageToken, "page checkpoint", { nullable: true });
+    this.publicAccountAlias = opaqueIdentifier(publicAccountAlias, "local account reference");
     this.pageSize = Number.isSafeInteger(pageSize) && pageSize > 0 && pageSize <= 100 ? pageSize : 50;
     this.lastMetadata = null;
     this.lastPage = null;
@@ -663,8 +783,7 @@ export class GmailReadOnlyConnector {
   }
 
   async revokePermissionGrant({ grantId }) {
-    assertPluginMethod(this.plugin, "revokePermissionGrant", "A Gmail plugin with grant revocation is required.");
-    await this.plugin.revokePermissionGrant({ grantId });
+    await revokePluginGrantWithExactConfirmation(this.plugin, grantId);
   }
 
   async fetchApprovedContent({ source, accountId, grant }) {
@@ -680,7 +799,7 @@ export class GmailReadOnlyConnector {
         pageToken: this.pageToken,
         pageSize: this.pageSize
       }),
-      { accountId, grant }
+      { accountId, accountAlias: this.publicAccountAlias, grant }
     );
     this.lastPage = page;
     return {
@@ -730,7 +849,7 @@ async function beginGmailConnectionInternal({ message, stateStore, plugin, langu
   const locale = languageFor(state, language);
 
   if (entry.plugin.status === "connected") {
-    const permission = entry.accountId ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
+    const permission = entry.accountId ? await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
     return { gmail: publicView(entry, locale, permission?.permissionReview) };
   }
 
@@ -798,7 +917,7 @@ async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, la
 
   const connector = new GmailReadOnlyConnector({ plugin });
   try {
-    const review = await beginSourcePermissionReview({
+    const review = await beginSourcePermissionReviewWithinStateLock({
       message,
       stateStore,
       connector,
@@ -811,6 +930,12 @@ async function beginGmailPrivacyReviewInternal({ message, stateStore, plugin, la
     const updated = requireEntry(state);
     updated.accountId = review.permissionReview.account.id;
     updated.reviewId = review.permissionReview.permissionRequest.reviewId;
+    updated.publicAliases = {
+      account: updated.publicAliases?.account,
+      review: `local-gmail-review-${randomUUID()}`,
+      grant: `local-gmail-grant-${randomUUID()}`
+    };
+    persistGmailPublicAliases(updated, review.permissionReview);
     updated.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.connection.state = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.import.estimatedItemCount = connector.lastMetadata?.estimatedItemCount ?? null;
@@ -848,7 +973,8 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
   if (!entry.accountId || !entry.reviewId || entry.status === GMAIL_CONNECTION_STATES.REVOKED) {
     throw new GmailReadOnlyError("GMAIL_REVIEW_REQUIRED", "Complete the saved Gmail metadata review before approving content access.");
   }
-  const existingPermission = await getSourcePermissionStatus({
+  const approvedInternalScope = internalGmailScope(scope, entry);
+  const existingPermission = await getSourcePermissionStatusWithinStateLock({
     stateStore,
     source: SOURCE,
     accountId: entry.accountId,
@@ -938,14 +1064,14 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
   const connector = new GmailReadOnlyConnector({ plugin });
   let cleanupGrantId = durableGrantId;
   try {
-    const granted = await grantSourcePermission({
+    const granted = await grantSourcePermissionWithinStateLock({
       message,
       stateStore,
       connector,
       source: SOURCE,
       accountId: entry.accountId,
       reviewId: entry.reviewId,
-      scope,
+      scope: approvedInternalScope,
       language: locale,
       clock,
       grantIdFactory: () => durableGrantId
@@ -961,6 +1087,7 @@ async function grantGmailReadOnlyScopeInternal({ message, stateStore, plugin, sc
       revocationConfirmed: false,
       updatedAt: isoNow(clock)
     };
+    persistGmailPublicAliases(updated, granted.permissionReview);
     updated.status = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.connection.state = GMAIL_CONNECTION_STATES.SELECTED_BUT_UNFINISHED;
     updated.import.status = "ready-to-verify";
@@ -1020,7 +1147,7 @@ async function cancelGmailReadOnlyScopeInternal({ message, stateStore, language,
   if (!entry.accountId || !entry.reviewId) {
     throw new GmailReadOnlyError("GMAIL_REVIEW_REQUIRED", "There is no saved Gmail review to cancel yet.");
   }
-  const denied = await denySourcePermission({
+  const denied = await denySourcePermissionWithinStateLock({
     message,
     stateStore,
     source: SOURCE,
@@ -1105,7 +1232,7 @@ async function deactivatePersistedGmailGrant({
   }
 
   try {
-    await plugin.revokePermissionGrant({ grantId });
+    await revokePluginGrantWithExactConfirmation(plugin, grantId);
   } catch (error) {
     return {
       confirmed: false,
@@ -1120,7 +1247,7 @@ async function deactivatePersistedGmailGrant({
 
   let current;
   try {
-    current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    current = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
   } catch (error) {
     return {
       confirmed: false,
@@ -1135,9 +1262,7 @@ async function deactivatePersistedGmailGrant({
       // Both identifiers can be real after an interrupted migration. Close
       // the generic generation too; never clear its local record after only
       // revoking the separately checkpointed plugin generation.
-      await plugin.revokePermissionGrant({
-        grantId: current.permissionReview.activeGrant.grantId
-      });
+      await revokePluginGrantWithExactConfirmation(plugin, current.permissionReview.activeGrant.grantId);
     } catch (error) {
       return {
         confirmed: false,
@@ -1149,7 +1274,7 @@ async function deactivatePersistedGmailGrant({
 
   if (current?.permissionReview?.activeGrant) {
     try {
-      await revokeSourcePermission({
+      await revokeSourcePermissionWithinStateLock({
         message: language === "es" ? "Revocar el permiso guardado de Gmail" : "Revoke the saved Gmail permission",
         stateStore,
         connector: LOCAL_GMAIL_GRANT_REVOCATION_CONNECTOR,
@@ -1164,7 +1289,7 @@ async function deactivatePersistedGmailGrant({
       // durable state again rather than inferring success from the exception.
       let afterFailure = null;
       try {
-        afterFailure = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+        afterFailure = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
       } catch {
         // The caller will retain the identifier as revocation-unconfirmed.
       }
@@ -1186,7 +1311,7 @@ async function deactivatePersistedGmailGrant({
   }
 
   try {
-    const after = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    const after = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
     return {
       confirmed: !after?.permissionReview?.activeGrant,
       permissionReview: after?.permissionReview ?? null,
@@ -1205,7 +1330,7 @@ async function synchronizeExternalRevocation({ stateStore, plugin, entry, langua
   if (!entry.accountId || !entry.reviewId) return { confirmed: true, permissionReview: null, grantId: null };
   let permission = null;
   try {
-    permission = await getSourcePermissionStatus({
+    permission = await getSourcePermissionStatusWithinStateLock({
       stateStore,
       source: SOURCE,
       accountId: entry.accountId,
@@ -1263,7 +1388,7 @@ async function persistPendingPageReadFailure({
 async function gmailPermissionReview({ stateStore, entry, language }) {
   if (!entry.accountId) return null;
   try {
-    return await getSourcePermissionStatus({
+    return await getSourcePermissionStatusWithinStateLock({
       stateStore,
       source: SOURCE,
       accountId: entry.accountId,
@@ -1313,7 +1438,7 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
     return pendingReadResult({ entry: failed.entry, language: locale, permissionReview: permission });
   }
   if (entry.import.complete) {
-    const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
+    const permission = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
     return { gmail: publicView(entry, locale, permission?.permissionReview), approvedReferences: [], complete: true, checkpointRequired: false };
   }
 
@@ -1417,10 +1542,14 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
       };
     }
 
-    const connector = new GmailReadOnlyConnector({ plugin, pageToken: entry.import.nextPageToken });
+    const connector = new GmailReadOnlyConnector({
+      plugin,
+      pageToken: entry.import.nextPageToken,
+      publicAccountAlias: gmailPublicAliases(entry).account
+    });
     let fetched;
     try {
-      fetched = await fetchApprovedSourceContent({
+      fetched = await fetchApprovedSourceContentWithinStateLock({
         message,
         stateStore,
         connector,
@@ -1574,7 +1703,7 @@ async function fetchApprovedGmailReferencesInternal({ message, stateStore, plugi
     if (entry.import.complete) break;
   }
 
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
+  const permission = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
   return {
     gmail: publicView(entry, locale, permission?.permissionReview),
     approvedReferences: newlyProcessed,
@@ -1596,7 +1725,7 @@ async function revokeGmailReadOnlyConnectionInternal({ message, stateStore, plug
   if (!entry.accountId || !entry.reviewId) {
     throw new GmailReadOnlyError("GMAIL_REVIEW_REQUIRED", "There is no saved Gmail permission to revoke yet.");
   }
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
+  const permission = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale });
   const activeGrant = permission?.permissionReview?.activeGrant;
   const activation = grantActivation(entry, clock);
   const grantId = (activationMayRemainActive(entry) ? activation.grantId : null) ?? activeGrant?.grantId ?? null;
@@ -1674,7 +1803,7 @@ async function skipGmailConnectionInternal({ message, stateStore, plugin, langua
   }
   const locale = languageFor(state, language);
   const permission = entry.accountId
-    ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
+    ? await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale })
     : null;
   const activeGrant = permission?.permissionReview?.activeGrant;
   const activation = grantActivation(entry, clock);
@@ -1764,14 +1893,18 @@ export async function skipGmailConnection(args = {}) {
 }
 
 /** Status is local-state-only and never invokes a Gmail plugin or source read. */
-export async function getGmailReadOnlyStatus({ stateStore, language } = {}) {
+async function getGmailReadOnlyStatusInternal({ stateStore, language } = {}) {
   const state = await loadState(stateStore);
   const entry = getEntry(state);
   if (!entry) return null;
   const locale = languageFor(state, language);
-  const permission = entry.accountId ? await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
+  const permission = entry.accountId ? await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId: entry.accountId, language: locale }) : null;
   return {
     gmail: publicView(entry, locale, permission?.permissionReview),
-    sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GMAIL, accountId: entry.accountId, language: locale })
+    sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GMAIL, accountId: gmailPublicAliases(entry).account, language: locale })
   };
+}
+
+export async function getGmailReadOnlyStatus(args = {}) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getGmailReadOnlyStatusInternal(args));
 }

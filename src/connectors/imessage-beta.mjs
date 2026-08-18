@@ -9,12 +9,13 @@
  */
 
 import {
-  beginSourcePermissionReview,
-  fetchApprovedSourceContent,
-  getSourcePermissionStatus,
-  grantSourcePermission,
-  revokeSourcePermission,
-  withSourcePermissionStateLock
+  beginSourcePermissionReviewWithinStateLock,
+  fetchApprovedSourceContentWithinStateLock,
+  getSourcePermissionStatusWithinStateLock,
+  grantSourcePermissionWithinStateLock,
+  revokeSourcePermissionWithinStateLock,
+  withSourcePermissionStateLock,
+  withSourcePermissionStateReadLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -212,7 +213,7 @@ async function beginContentPrivacyReview({
 }) {
   let review;
   try {
-    review = await beginSourcePermissionReview({
+    review = await beginSourcePermissionReviewWithinStateLock({
       message: language === "es"
         ? "Quiero conectar iMessage a mi segundo cerebro"
         : "I want to connect iMessage to my second brain",
@@ -309,7 +310,7 @@ async function attemptIMessageLocalAccessInternal({
   const entry = assertEntry(state, accountId);
   const now = isoNow(clock);
   if (entry.status !== "awaiting-macos-permission") {
-    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    const existing = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
     return { iMessageBeta: publicView(entry, languageFor(state, language), existing?.permissionReview) };
   }
   if (macOSPermissionApproved !== true) {
@@ -372,7 +373,7 @@ async function beginIMessageSnapshotImportInternal({
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   if (entry.status === "awaiting-content-grant" && entry.mode === "snapshot") {
-    const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    const current = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
     return { iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview) };
   }
   if (entry.status !== "snapshot-available" && entry.status !== "awaiting-macos-permission") {
@@ -436,7 +437,7 @@ async function approveIMessageSensitiveContentInternal({
     highRiskIdentifiersApproved: highRiskIdentifiers === true
   });
   await stateStore.save(state);
-  const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  const current = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
   return { iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview) };
 }
 
@@ -466,7 +467,7 @@ async function grantIMessageContentInternal({
   if (isHighRiskIncluded(scope) && !entry.sensitiveApprovals.highRiskIdentifiers.approved) {
     throw new IMessageBetaError("HIGH_RISK_APPROVAL_REQUIRED", "High-risk identifiers remain excluded. Review and approve them separately before including that category in this iMessage scope.");
   }
-  const granted = await grantSourcePermission({
+  const granted = await grantSourcePermissionWithinStateLock({
     message,
     stateStore,
     connector,
@@ -518,7 +519,7 @@ async function fetchApprovedIMessageContentInternal({
     attachmentsApproved: entry.sensitiveApprovals.attachments.approved,
     highRiskIdentifiersApproved: entry.sensitiveApprovals.highRiskIdentifiers.approved
   });
-  const fetched = await fetchApprovedSourceContent({
+  const fetched = await fetchApprovedSourceContentWithinStateLock({
     message,
     stateStore,
     connector,
@@ -546,7 +547,7 @@ export async function fetchApprovedIMessageContent(args = {}) {
 /** Revokes the standard read-only grant; it cannot send, alter, or delete an iMessage. */
 async function revokeIMessageContentInternal({ message, stateStore, connector, accountId = "local-imessage", reviewId, language, clock }) {
   assertNaturalLanguage(message);
-  const revoked = await revokeSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
+  const revoked = await revokeSourcePermissionWithinStateLock({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   entry.status = "snapshot-available";
@@ -561,14 +562,18 @@ export async function revokeIMessageContent(args = {}) {
 }
 
 /** Read-only status lookup; it never invokes a local adapter or connector. */
-export async function getIMessageBetaStatus({ stateStore, accountId = "local-imessage", language }) {
+async function getIMessageBetaStatusInternal({ stateStore, accountId = "local-imessage", language }) {
   const state = await loadState(stateStore);
   const entry = lifecycle(state).entries[entryKey(accountId)];
   if (!entry) return null;
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  const permission = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
   const locale = languageFor(state, language);
   return {
     iMessageBeta: publicView(entry, locale, permission?.permissionReview),
     sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.IMESSAGE, accountId, language: locale })
   };
+}
+
+export async function getIMessageBetaStatus(args = {}) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getIMessageBetaStatusInternal(args));
 }

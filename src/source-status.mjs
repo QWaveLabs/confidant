@@ -9,7 +9,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { withSourcePermissionStateLock } from "./permissions/setup-source-permissions.mjs";
+import {
+  withSourcePermissionStateLock,
+  withSourcePermissionStateReadLock
+} from "./permissions/setup-source-permissions.mjs";
 
 const STATE_KEY = "sourceStatusV2";
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -1545,7 +1548,7 @@ export async function explainUnsupportedSource(args = {}) {
 }
 
 /** Read-only lookup. It never invokes an adapter. */
-export async function getSourceStatus({ stateStore, sourceId = "simulated-export", language } = {}) {
+async function getSourceStatusInternal({ stateStore, sourceId = "simulated-export", language } = {}) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   if (!state?.[STATE_KEY]) return null;
@@ -1553,6 +1556,10 @@ export async function getSourceStatus({ stateStore, sourceId = "simulated-export
     ? state[STATE_KEY].entries[sourceId]
     : null;
   return entry ? { sourceStatus: publicSourceStatus(entry, languageFor(state, language)) } : null;
+}
+
+export async function getSourceStatus(args = {}) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getSourceStatusInternal(args));
 }
 
 function normalizeAdapterName(adapter) {
@@ -1689,6 +1696,17 @@ function persistedSourceInstanceId(adapter, accountId) {
     : prefix;
 }
 
+function persistedGmailAccountAlias(entry) {
+  const rawAccountId = typeof entry?.accountId === "string" ? entry.accountId : null;
+  const persisted = entry?.publicAliases?.account;
+  if (typeof persisted === "string" && OPAQUE_ID.test(persisted) && persisted !== rawAccountId) return persisted;
+  for (let index = 1; index <= 9; index += 1) {
+    const candidate = `local-gmail-account-${index}`;
+    if (candidate !== rawAccountId) return candidate;
+  }
+  return "local-gmail-account";
+}
+
 function authorizationOutcomeFor(adapter, reported) {
   if (["authorization-denied", "authorization-cancelled"].includes(reported)) return reported;
   if (adapter === SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE && reported === "authorization-unavailable") return reported;
@@ -1776,7 +1794,7 @@ function persistedAdapterStatuses(state, language) {
         ? "authorization-cancelled"
         : gmailEntry.status;
     statuses.push(persistedAdapterSourceStatus({
-      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GMAIL, gmailEntry.accountId),
+      sourceId: persistedSourceInstanceId(SOURCE_ADAPTER_NAMES.GMAIL, persistedGmailAccountAlias(gmailEntry)),
       adapter: SOURCE_ADAPTER_NAMES.GMAIL,
       adapterStatus: reported,
       trustedLiveVerification: trustedPersistedGmailLiveVerification(),
@@ -1881,7 +1899,7 @@ function releaseGate(language, adapterStatuses) {
  * invokes adapters and deliberately ignores caller-supplied adapter snapshots
  * or claimed live evidence.
  */
-export async function getSourceStatusHandoff({ stateStore, language } = {}) {
+async function getSourceStatusHandoffInternal({ stateStore, language } = {}) {
   assertStateStore(stateStore);
   const state = await stateStore.load();
   const safeLanguage = languageFor(state, language);
@@ -1904,4 +1922,8 @@ export async function getSourceStatusHandoff({ stateStore, language } = {}) {
       sources
     }
   };
+}
+
+export async function getSourceStatusHandoff(args = {}) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getSourceStatusHandoffInternal(args));
 }

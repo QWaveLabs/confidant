@@ -20,6 +20,7 @@ import {
   revokeSourcePermission,
   startSetupSession
 } from "../src/index.mjs";
+import { withSourcePermissionStateLock } from "../src/permissions/setup-source-permissions.mjs";
 
 async function withPermissionFixture(run, { connectorOptions, language = "en" } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa139-"));
@@ -64,6 +65,137 @@ function approvedScope(review) {
   scope.acknowledgements.untrustedSourceMaterial = true;
   return scope;
 }
+
+test("public full-root writers fail closed on same-context re-entry while ordinary status waits for a committed snapshot", async () => {
+  await withPermissionFixture(async ({ stateStore, connector }) => {
+    await assert.rejects(
+      () => withSourcePermissionStateLock(stateStore, () => beginSourcePermissionReview({
+        message: "Review Gmail for my second brain",
+        stateStore,
+        connector,
+        source: "gmail"
+      })),
+      (error) => error?.code === "STATE_LOCK_REENTRANT_OPERATION_BLOCKED"
+    );
+    assert.equal(connector.metadataPreflightCalls, 0);
+
+    let releaseSave;
+    let saveReached;
+    const saveStarted = new Promise((resolve) => { saveReached = resolve; });
+    const saveGate = new Promise((resolve) => { releaseSave = resolve; });
+    const hookedStore = {
+      filePath: stateStore.filePath,
+      load: () => stateStore.load(),
+      async save(value) {
+        saveReached();
+        await saveGate;
+        return stateStore.save(value);
+      }
+    };
+    const reviewPromise = beginSourcePermissionReview({
+      message: "Review Gmail for my second brain",
+      stateStore: hookedStore,
+      connector,
+      source: "gmail",
+      reviewIdFactory: () => "serialized-review"
+    });
+    await saveStarted;
+    let statusSettled = false;
+    const statusPromise = getSourcePermissionStatus({
+      stateStore: new FileStateStore(stateStore.filePath),
+      source: "gmail",
+      accountId: "work-account"
+    }).then((value) => {
+      statusSettled = true;
+      return value;
+    });
+    await Promise.resolve();
+    assert.equal(statusSettled, false, "status must not read the pre-commit root while a writer holds the lock");
+    releaseSave();
+    await reviewPromise;
+    const status = await statusPromise;
+    assert.equal(status.permissionReview.permissionRequest.reviewId, "serialized-review");
+  });
+});
+
+test("state-store and connector callbacks cannot re-enter a public permission writer", async () => {
+  await withPermissionFixture(async ({ stateStore, connector }) => {
+    const driveConnector = new SimulatedReadOnlyConnector({
+      source: "drive",
+      account: { id: "drive-work", label: "Drive" },
+      items: [{ id: "folder-1", kind: "folder", folder: "folder-1", area: "drive", category: "document" }]
+    });
+    let saveHookError = null;
+    let outerSaveCommits = 0;
+    const hookedStore = {
+      filePath: stateStore.filePath,
+      load: () => stateStore.load(),
+      async save(value) {
+        try {
+          await beginSourcePermissionReview({
+            message: "Review Drive for my second brain",
+            stateStore,
+            connector: driveConnector,
+            source: "drive"
+          });
+        } catch (error) {
+          saveHookError = error;
+          throw error;
+        }
+        outerSaveCommits += 1;
+        return stateStore.save(value);
+      }
+    };
+    await assert.rejects(
+      () => beginSourcePermissionReview({
+        message: "Review Gmail for my second brain",
+        stateStore: hookedStore,
+        connector,
+        source: "gmail"
+      }),
+      (error) => error?.code === "STATE_LOCK_REENTRANT_OPERATION_BLOCKED"
+    );
+    assert.equal(saveHookError?.code, "STATE_LOCK_REENTRANT_OPERATION_BLOCKED");
+    assert.equal(outerSaveCommits, 0, "the rejected outer writer must not later commit its stale root snapshot");
+    assert.equal(driveConnector.metadataPreflightCalls, 0);
+    const afterSaveHook = await stateStore.load();
+    assert.equal(afterSaveHook.sourcePermissionLifecycle ?? null, null, "no outer permission entry may persist after callback re-entry is blocked");
+
+    let connectorHookError = null;
+    const connectorWithHook = {
+      async discoverMetadata(request) {
+        try {
+          await beginSourcePermissionReview({
+            message: "Review Drive for my second brain",
+            stateStore,
+            connector: driveConnector,
+            source: "drive"
+          });
+        } catch (error) {
+          connectorHookError = error;
+          throw error;
+        }
+        return connector.discoverMetadata(request);
+      },
+      registerPermissionGrant: (request) => connector.registerPermissionGrant(request),
+      revokePermissionGrant: (request) => connector.revokePermissionGrant(request),
+      fetchApprovedContent: (request) => connector.fetchApprovedContent(request)
+    };
+    await assert.rejects(
+      () => beginSourcePermissionReview({
+        message: "Review Gmail for my second brain",
+        stateStore,
+        connector: connectorWithHook,
+        source: "gmail"
+      }),
+      (error) => error?.code === "STATE_LOCK_REENTRANT_OPERATION_BLOCKED"
+    );
+    assert.equal(connectorHookError?.code, "STATE_LOCK_REENTRANT_OPERATION_BLOCKED");
+    assert.equal(connector.metadataPreflightCalls, 1, "the callback must fail before the outer connector can return metadata");
+    const afterConnectorHook = await stateStore.load();
+    assert.equal(afterConnectorHook.sourcePermissionLifecycle ?? null, null, "the failed connector callback cannot be followed by an outer stale save");
+  });
+});
 
 test("metadata-only preflight never fetches a source body until an explicit granular grant exists", async () => {
   await withPermissionFixture(async ({ stateStore, connector }) => {

@@ -9,13 +9,14 @@
  */
 
 import {
-  beginSourcePermissionReview,
-  fetchApprovedSourceContent,
-  getSourcePermissionStatus,
-  grantSourcePermission,
+  beginSourcePermissionReviewWithinStateLock,
+  fetchApprovedSourceContentWithinStateLock,
+  getSourcePermissionStatusWithinStateLock,
+  grantSourcePermissionWithinStateLock,
   PermissionLifecycleError,
-  revokeSourcePermission,
-  withSourcePermissionStateLock
+  revokeSourcePermissionWithinStateLock,
+  withSourcePermissionStateLock,
+  withSourcePermissionStateReadLock
 } from "../permissions/setup-source-permissions.mjs";
 import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
 
@@ -232,7 +233,7 @@ const LOCAL_GRANT_REVOCATION_CONNECTOR = Object.freeze({
 
 async function revokeLocalDriveGrantAfterFailure({ stateStore, accountId, reviewId, language, clock }) {
   try {
-    return await revokeSourcePermission({
+    return await revokeSourcePermissionWithinStateLock({
       message: language === "es"
         ? "Revoca el permiso local de Drive después de una interrupción de conexión"
         : "Revoke the local Drive permission after a connection interruption",
@@ -419,7 +420,7 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
   const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
   let review;
   try {
-    review = await beginSourcePermissionReview({
+    review = await beginSourcePermissionReviewWithinStateLock({
       message: language === "es" ? "Quiero revisar Google Drive para mi segundo cerebro" : "I want to review Google Drive for my second brain",
       stateStore,
       connector: bounded,
@@ -494,7 +495,7 @@ async function authorizeGoogleDriveReadOnlyInternal({
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
   if (entry.status === "awaiting-folder-review" || entry.status === "ready-to-fetch" || entry.status === "imported") {
-    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+    const existing = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
     return { drive: publicView(entry, languageFor(state, language), existing?.permissionReview) };
   }
   if (authorizationApproved !== true) return { drive: publicView(entry, languageFor(state, language)) };
@@ -565,7 +566,7 @@ async function grantGoogleDriveFolderContentInternal({
     throw new GoogleDriveLifecycleError("DRIVE_FOLDER_REVIEW_NOT_READY", "Continue the saved Drive folder review before approving file content.");
   }
   const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
-  const granted = await grantSourcePermission({
+  const granted = await grantSourcePermissionWithinStateLock({
     message,
     stateStore,
     connector: bounded,
@@ -605,7 +606,7 @@ async function fetchApprovedGoogleDriveContentInternal({ message, stateStore, co
   });
   let fetched;
   try {
-    fetched = await fetchApprovedSourceContent({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
+    fetched = await fetchApprovedSourceContentWithinStateLock({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
   } catch (error) {
     if (!isRecoverableConnectorFailure(error)) throw error;
     const safeLanguage = languageFor(state, language);
@@ -662,11 +663,11 @@ async function revokeGoogleDriveConnectionInternal({ message, stateStore, connec
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const entry = assertEntry(state, accountId);
-  let permissionReview = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  let permissionReview = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
   if (entry.reviewId && permissionReview?.permissionReview?.activeGrant) {
     assertConnector(connector);
     const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
-    permissionReview = await revokeSourcePermission({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
+    permissionReview = await revokeSourcePermissionWithinStateLock({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
   }
   const remoteAuthorizationWasGranted = ["authorized", "partial"].includes(entry.authorization.status);
   let pluginRevoked = false;
@@ -692,14 +693,18 @@ export async function revokeGoogleDriveConnection(args = {}) {
 }
 
 /** Read-only status lookup; never invokes a Drive plugin or connector. */
-export async function getGoogleDriveConnectionStatus({ stateStore, accountId = "google-drive", language }) {
+async function getGoogleDriveConnectionStatusInternal({ stateStore, accountId = "google-drive", language }) {
   const state = await loadState(stateStore);
   const entry = lifecycle(state).entries[entryKey(accountId)];
   if (!entry) return null;
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  const permission = await getSourcePermissionStatusWithinStateLock({ stateStore, source: SOURCE, accountId, language });
   const locale = languageFor(state, language);
   return {
     drive: publicView(entry, locale, permission?.permissionReview),
     sourceStatus: getPersistedAdapterSourceStatus({ state, adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE, accountId, language: locale })
   };
+}
+
+export async function getGoogleDriveConnectionStatus(args = {}) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getGoogleDriveConnectionStatusInternal(args));
 }

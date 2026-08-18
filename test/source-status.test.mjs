@@ -121,6 +121,7 @@ function syntheticNonSimulatedGmailPlugin({ includeSimulationMarkers = true } = 
     },
     async revokePermissionGrant({ grantId }) {
       authorizedGrantIds.delete(grantId);
+      return { status: "revoked", revoked: true, grantId };
     },
     async fetchApprovedPage() {
       return {
@@ -859,7 +860,8 @@ test("skipping Gmail fails closed without its plugin and revokes both generic an
     });
     assert.equal(blocked.gmail.status, "needs-attention");
     assert.equal(blocked.recoverable, true);
-    assert.equal(blocked.gmail.permissionReview.activeGrant.grantId, "gmail-grant");
+    assert.notEqual(blocked.gmail.permissionReview.activeGrant.grantId, "gmail-grant");
+    assert.match(blocked.gmail.permissionReview.activeGrant.grantId, /^local-gmail-grant-/);
     assert.equal(plugin.authorizedGrantIds.has("gmail-grant"), true);
 
     const skipped = await skipGmailConnection({
@@ -1048,13 +1050,14 @@ test("fabricated persisted Gmail lifecycle shapes stay non-live while primary Ca
 
     const directStatus = await getGmailReadOnlyStatus({ stateStore });
     const handoff = await getSourceStatusHandoff({ stateStore });
-    const gmailStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "gmail:gmail-work");
+    const gmailStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.adapter === "gmail-readonly");
     const calendarStatus = handoff.sourceStatusHandoff.sources.find((item) => item.source.id === "calendar:calendar-work");
     assert.equal(gmailStatus.state, SOURCE_STATUS_STATES.NEEDS_ATTENTION);
     assert.equal(gmailStatus.connection.live, false);
     assert.equal(gmailStatus.connection.independentlyVerified, false);
     assert.equal(gmailStatus.connection.readOnly, null);
     assert.equal(gmailStatus.adapterReportedState?.value, "live-and-verified");
+    assert.equal(gmailStatus.source.id.includes("gmail-work"), false);
     assert.equal(directStatus.gmail.status, "needs-attention");
     assert.equal(directStatus.gmail.connection.live, false);
     assert.equal(directStatus.sourceStatus.connection.live, false);
@@ -1330,7 +1333,7 @@ test("final handoff and connector status lookups derive adapter truth only from 
     assert.equal(drive.adapterReportedState.value, "authorization-denied");
     assert.equal(drive.authorizationOutcome, "authorization-denied");
     assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "drive:drive-demo"), false);
-    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.id === "gmail:gmail-demo"), true);
+    assert.equal(handoff.sourceStatusHandoff.sections.skipped.some((source) => source.source.adapter === "gmail-readonly"), true);
     assert.equal(handoff.sourceStatusHandoff.sections.imported.some((source) => source.source.id === "imessage:local-demo"), true);
     assert.equal(handoff.sourceStatusHandoff.sources.some((source) => source.source.id === "forged-status"), false);
 
