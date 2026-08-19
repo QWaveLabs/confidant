@@ -180,6 +180,13 @@ export class KnowledgeCompilationError extends Error {
   }
 }
 
+class UnsafeRetentionArtifactError extends Error {
+  constructor() {
+    super("unsafe retention artifact");
+    this.name = "UnsafeRetentionArtifactError";
+  }
+}
+
 function clone(value) {
   return structuredClone(value);
 }
@@ -244,6 +251,7 @@ function wording(language) {
       compiledCleanupPending: "Las notas canónicas ya están guardadas. La eliminación confirmada del lote privado sigue pendiente; di que continúe para volver a intentar solo la limpieza.",
       cleanupAuthorityRequired: "El lote privado sigue retenido porque solo el almacenamiento temporal local exacto puede confirmar su eliminación. Vuelve a intentar con ese almacenamiento local; un adaptador personalizado o envuelto no puede informar que se eliminó.",
       cleanupNeedsAttention: "La limpieza no pudo verificar la eliminación de este lote privado porque otro enlace del sistema de archivos o una discrepancia de identidad/evidencia podría conservarlo. No se informó como eliminado: solicita una revisión local segura y luego di que continúe.",
+      cleanupFinalizationNeedsAttention: "Los cuerpos privados de la fuente ya se eliminaron, pero la limpieza local todavía necesita atención segura antes de poder informar que el proceso y sus artefactos duraderos terminaron por completo. Di que continúe para volver a intentarlo.",
       discardedCleanupPending: "El lote privado se descartó y sigue pendiente de eliminación confirmada; di que continúe para volver a intentar solo la limpieza.",
       discarded: "El lote temporal se descartó de forma segura y no se puede reanudar.",
       interrupted: "La compilación se interrumpió antes de producir notas. El lote temporal protegido sigue disponible para reanudarlo durante un máximo de 24 horas.",
@@ -281,6 +289,7 @@ function wording(language) {
     compiledCleanupPending: "Canonical notes are already saved. Confirmed deletion of the private batch is still pending; say continue to retry cleanup only.",
     cleanupAuthorityRequired: "The private batch is still retained because only the exact local temporary staging engine can confirm its deletion. Retry with that local staging engine; a custom or wrapped adapter cannot report it deleted.",
     cleanupNeedsAttention: "Cleanup could not verify deletion of this private batch because another filesystem link or an identity/evidence mismatch may retain it. It was not reported deleted: request safe local review, then say continue.",
+    cleanupFinalizationNeedsAttention: "The private source bodies are deleted, but local cleanup still needs safe attention before the worker and durable artifacts can be reported fully finished. Say continue to retry cleanup.",
     discardedCleanupPending: "The private batch was discarded and still awaits confirmed deletion; say continue to retry cleanup only.",
     discarded: "The temporary batch was safely discarded and cannot be resumed.",
     interrupted: "Compilation stopped before notes were produced. The protected temporary batch remains available to resume for no more than 24 hours.",
@@ -395,8 +404,22 @@ function generationTagForLease(leaseId) {
   return createHash("sha256").update(safeLeaseId).digest("hex").slice(0, 24);
 }
 
+function assertGenerationTag(generationTag) {
+  if (typeof generationTag !== "string" || !GENERATION_TAG.test(generationTag)) {
+    throw new KnowledgeCompilationError(
+      "STAGING_CLEANUP_EVIDENCE_REQUIRED",
+      "Cleanup evidence did not identify one exact protected staging generation."
+    );
+  }
+  return generationTag;
+}
+
+function generationArtifactBaseForTag(batchId, generationTag) {
+  return `${STAGING_FILE_PREFIX}${assertBatchId(batchId)}.${assertGenerationTag(generationTag)}`;
+}
+
 function generationArtifactBase(batchId, leaseId) {
-  return `${STAGING_FILE_PREFIX}${assertBatchId(batchId)}.${generationTagForLease(leaseId)}`;
+  return generationArtifactBaseForTag(batchId, generationTagForLease(leaseId));
 }
 
 function stagingFileName(batchId, leaseId) { return `${generationArtifactBase(batchId, leaseId)}${STAGING_FILE_SUFFIX}`; }
@@ -406,10 +429,15 @@ function stagingTombstoneFileName(batchId, leaseId) { return `${generationArtifa
 function stagingOwnerFileName(batchId, leaseId) { return `${generationArtifactBase(batchId, leaseId)}${STAGING_OWNER_SUFFIX}`; }
 
 function generationWorkerArtifactNames(batchId, leaseId) {
+  return generationWorkerArtifactNamesForTag(batchId, generationTagForLease(leaseId));
+}
+
+function generationWorkerArtifactNamesForTag(batchId, generationTag) {
+  const base = generationArtifactBaseForTag(batchId, generationTag);
   return [
-    stagingReceiptFileName(batchId, leaseId),
-    stagingTombstoneFileName(batchId, leaseId),
-    stagingOwnerFileName(batchId, leaseId)
+    `${base}${STAGING_RECEIPT_SUFFIX}`,
+    `${base}${STAGING_TOMBSTONE_SUFFIX}`,
+    `${base}${STAGING_OWNER_SUFFIX}`
   ];
 }
 
@@ -422,13 +450,21 @@ function isGenerationWorkerTemp(name, artifactNames) {
 }
 
 async function nativeGenerationWorkerTempNames(root, batchId, leaseId) {
-  const artifactNames = generationWorkerArtifactNames(batchId, leaseId);
+  return nativeGenerationWorkerTempNamesForTag(root, batchId, generationTagForLease(leaseId));
+}
+
+async function nativeGenerationWorkerTempNamesForTag(root, batchId, generationTag) {
+  const artifactNames = generationWorkerArtifactNamesForTag(batchId, generationTag);
   const entries = await readdir(root);
   return entries.filter((entry) => isGenerationWorkerTemp(entry, artifactNames));
 }
 
 async function assertNativeGenerationWorkerTempsAbsent(root, batchId, leaseId) {
-  if ((await nativeGenerationWorkerTempNames(root, batchId, leaseId)).length > 0) {
+  return assertNativeGenerationWorkerTempsAbsentForTag(root, batchId, generationTagForLease(leaseId));
+}
+
+async function assertNativeGenerationWorkerTempsAbsentForTag(root, batchId, generationTag) {
+  if ((await nativeGenerationWorkerTempNamesForTag(root, batchId, generationTag)).length > 0) {
     throw new KnowledgeCompilationError(
       "RETENTION_SERVICE_UNAVAILABLE",
       "The exact cleanup worker still has an unfinished durable write, so deletion remains pending."
@@ -444,6 +480,25 @@ function parseGenerationArtifact(name, suffix) {
   const batchId = stem.slice(0, separator);
   const generationTag = stem.slice(separator + 1);
   return BATCH_ID.test(batchId) && GENERATION_TAG.test(generationTag) ? { batchId, generationTag } : null;
+}
+
+function parseGenerationWorkerTempArtifact(name) {
+  if (typeof name !== "string" || !name.endsWith(".tmp")) return null;
+  const withoutTemp = name.slice(0, -4);
+  const pidSeparator = withoutTemp.lastIndexOf(".");
+  if (pidSeparator <= 0) return null;
+  const pidText = withoutTemp.slice(pidSeparator + 1);
+  if (!/^[0-9]+$/.test(pidText)) return null;
+  const artifactName = withoutTemp.slice(0, pidSeparator);
+  for (const [kind, suffix] of [
+    ["receipt", STAGING_RECEIPT_SUFFIX],
+    ["tombstone", STAGING_TOMBSTONE_SUFFIX],
+    ["owner", STAGING_OWNER_SUFFIX]
+  ]) {
+    const parsed = parseGenerationArtifact(artifactName, suffix);
+    if (parsed) return { ...parsed, kind, pid: Number(pidText) };
+  }
+  return null;
 }
 
 function exactCanonicalTimestamp(value) {
@@ -513,7 +568,9 @@ async function durableJsonWrite(fileSystem, target, value, options) {
 
 async function readSmallJson(fileSystem, target, maxBytes = 16 * 1024) {
   const stats = await fileSystem.lstat(target);
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > maxBytes) throw new Error("unsafe retention artifact");
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > maxBytes) {
+    throw new UnsafeRetentionArtifactError();
+  }
   let handle;
   try {
     handle = await fileSystem.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -1459,6 +1516,13 @@ export class LocalTemporaryStaging {
         cleanupExpired(input) {
           return LOCAL_TEMPORARY_STAGING_METHODS.cleanupExpired.call(instance, input, INTERNAL_LOCAL_STAGING_OPERATION);
         },
+        rawDeletionEvidence(input) {
+          return LOCAL_TEMPORARY_STAGING_METHODS.rawDeletionEvidence.call(
+            instance,
+            input,
+            INTERNAL_LOCAL_STAGING_OPERATION
+          );
+        },
         acknowledgeCleanupReceipt(input, internalToken) {
           return LOCAL_TEMPORARY_STAGING_METHODS.acknowledgeCleanupReceipt.call(
             instance,
@@ -1556,18 +1620,60 @@ export class LocalTemporaryStaging {
     return rootReal;
   }
 
-  #paths(root, batchId, leaseId) {
+  #pathsForGenerationTag(root, batchId, generationTag) {
+    const base = generationArtifactBaseForTag(batchId, generationTag);
     const paths = {
-      data: resolve(root, stagingFileName(batchId, leaseId)),
-      lease: resolve(root, stagingLeaseFileName(batchId, leaseId)),
-      receipt: resolve(root, stagingReceiptFileName(batchId, leaseId)),
-      tombstone: resolve(root, stagingTombstoneFileName(batchId, leaseId)),
-      owner: resolve(root, stagingOwnerFileName(batchId, leaseId))
+      data: resolve(root, `${base}${STAGING_FILE_SUFFIX}`),
+      lease: resolve(root, `${base}${STAGING_LEASE_SUFFIX}`),
+      receipt: resolve(root, `${base}${STAGING_RECEIPT_SUFFIX}`),
+      tombstone: resolve(root, `${base}${STAGING_TOMBSTONE_SUFFIX}`),
+      owner: resolve(root, `${base}${STAGING_OWNER_SUFFIX}`)
     };
     if (Object.values(paths).some((candidate) => dirname(candidate) !== root || !isWithin(candidate, root))) {
       throw new KnowledgeCompilationError("STAGING_PATH_ESCAPE_BLOCKED", "Temporary staging refused a path outside its dedicated directory.");
     }
     return paths;
+  }
+
+  #paths(root, batchId, leaseId) {
+    return this.#pathsForGenerationTag(root, batchId, generationTagForLease(leaseId));
+  }
+
+  async #retentionLeaseForGeneration(root, batchId, generationTag) {
+    const paths = this.#pathsForGenerationTag(root, batchId, generationTag);
+    let owner;
+    try {
+      owner = await readSmallJson(this.#fileSystem, paths.owner);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "The generation-bound cleanup owner could not be read safely, so cleanup remains pending."
+      );
+    }
+    const leaseId = typeof owner?.leaseId === "string" && OPAQUE_ID.test(owner.leaseId)
+      ? owner.leaseId
+      : null;
+    const expiresAt = exactCanonicalTimestamp(owner?.expiresAt);
+    if (
+      !leaseId
+      || !expiresAt
+      || generationTagForLease(leaseId) !== generationTag
+      || !validatedRetentionOwner(owner, { batchId, leaseId, expiresAt })
+      || owner.phase !== "running"
+    ) {
+      throw new KnowledgeCompilationError(
+        "RETENTION_SERVICE_UNAVAILABLE",
+        "The generation-bound cleanup owner could not prove one exact running worker, so cleanup remains pending."
+      );
+    }
+    return leaseId;
+  }
+
+  async #assertUntrackedGenerationArtifactsAbsent(root, batchId, generationTag, message) {
+    const paths = this.#pathsForGenerationTag(root, batchId, generationTag);
+    await assertNativePathsAbsent(Object.values(paths), message);
+    await assertNativeGenerationWorkerTempsAbsentForTag(root, batchId, generationTag);
   }
 
   async #trustedRoot() {
@@ -1697,8 +1803,13 @@ export class LocalTemporaryStaging {
       throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected temporary batch has no durable generation marker, so it was not compiled.");
     }
     let raw;
-    try { raw = await readSmallJson(this.#fileSystem, join(root, leaseEntry.name)); } catch {
-      throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected temporary batch generation marker was not readable, so it was not compiled.");
+    try {
+      raw = await readSmallJson(this.#fileSystem, join(root, leaseEntry.name));
+    } catch (error) {
+      if (isIntrinsicRetentionArtifactError(error)) {
+        throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected temporary batch generation marker was not readable, so it was not compiled.");
+      }
+      throw error;
     }
     const leaseId = assertOpaqueId(raw?.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
     if (generationTagForLease(leaseId) !== generationTag) {
@@ -1741,7 +1852,18 @@ export class LocalTemporaryStaging {
       if (afterRead.size > this.#maxBytes) {
         throw new KnowledgeCompilationError("STAGING_SIZE_LIMIT", "The protected temporary batch exceeded its safe size limit and was not compiled.");
       }
-      const payload = JSON.parse(serialized);
+      let payload;
+      try {
+        payload = JSON.parse(serialized);
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          throw new KnowledgeCompilationError(
+            "STAGING_PAYLOAD_INVALID",
+            "The protected temporary batch was not valid JSON, so it was not compiled."
+          );
+        }
+        throw error;
+      }
       const validated = validatedStagingPayload(payload, batchId, this.#maxRecords);
       if (validated.leaseId !== leaseId) {
         throw new KnowledgeCompilationError("STAGING_LEASE_INVALID", "The protected batch did not match its immutable generation marker.");
@@ -2407,6 +2529,41 @@ export class LocalTemporaryStaging {
     await assertNativeGenerationWorkerTempsAbsent(root, safeBatchId, safeLeaseId);
   }
 
+  async rawDeletionEvidence(input, operationToken = null) {
+    if (operationToken !== INTERNAL_LOCAL_STAGING_OPERATION) {
+      throw new KnowledgeCompilationError(
+        "STAGING_CLEANUP_EVIDENCE_REQUIRED",
+        "Raw-body deletion evidence is available only to the locked compilation lifecycle."
+      );
+    }
+    const safeBatchId = assertBatchId(input?.batchId);
+    const safeLeaseId = assertOpaqueId(input?.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
+    const root = await this.#trustedRoot();
+    const paths = this.#paths(root, safeBatchId, safeLeaseId);
+    let tombstone;
+    try {
+      tombstone = await readSmallJson(this.#fileSystem, paths.tombstone);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+      throw error;
+    }
+    const rawSourceBodiesDeletedAt = exactCanonicalTimestamp(tombstone?.dataUnlinkVerifiedAt);
+    if (
+      tombstone?.version !== RETENTION_ARTIFACT_VERSION
+      || tombstone.batchId !== safeBatchId
+      || tombstone.leaseId !== safeLeaseId
+      || tombstone.cleanupBlockedReason != null
+      || tombstone.dataUnlinkVerified !== true
+      || !rawSourceBodiesDeletedAt
+      || Date.parse(rawSourceBodiesDeletedAt) > Date.now() + COMPLETION_CLOCK_SKEW_MS
+    ) return null;
+    await assertNativePathsAbsent(
+      [paths.data],
+      "The exact protected raw staging data still exists, so raw-body deletion cannot be reported."
+    );
+    return Object.freeze({ rawSourceBodiesDeletedAt });
+  }
+
   async #discoverCompletionArtifacts(root) {
     const entries = await this.#fileSystem.readdir(root, { withFileTypes: true });
     const completions = new Map();
@@ -2416,10 +2573,24 @@ export class LocalTemporaryStaging {
         const parsed = parseGenerationArtifact(entry.name, suffix);
         if (!parsed) continue;
         let raw;
-        try { raw = await readSmallJson(this.#fileSystem, join(root, entry.name)); } catch { continue; }
+        try {
+          raw = await readSmallJson(this.#fileSystem, join(root, entry.name));
+        } catch (error) {
+          if (error?.code === "ENOENT" || error instanceof SyntaxError) continue;
+          throw error;
+        }
         const leaseId = typeof raw?.leaseId === "string" && OPAQUE_ID.test(raw.leaseId) ? raw.leaseId : null;
         if (!leaseId || generationTagForLease(leaseId) !== parsed.generationTag) continue;
-        const completion = await this.#completionArtifactAt(root, parsed.batchId, leaseId, kind);
+        let completion;
+        try {
+          completion = await this.#completionArtifactAt(root, parsed.batchId, leaseId, kind);
+        } catch (error) {
+          if (error instanceof KnowledgeCompilationError && [
+            "STAGING_DELETE_FAILED",
+            "RETENTION_SERVICE_UNAVAILABLE"
+          ].includes(error.code)) continue;
+          throw error;
+        }
         if (!completion) continue;
         const key = `${parsed.batchId}\u0000${leaseId}`;
         if (kind === "receipt" || !completions.has(key)) completions.set(key, completion);
@@ -2432,27 +2603,138 @@ export class LocalTemporaryStaging {
     const current = Date.parse(canonicalTimestamp(now, "STAGING_TIMESTAMP_INVALID"));
     const removedBatches = [];
     const cleanupNeedsAttentionBatches = [];
+    const completionReceipts = await this.#discoverCompletionArtifacts(root);
+    const completedGenerationKeys = new Set(completionReceipts.map((entry) => (
+      `${entry.batchId}\u0000${generationTagForLease(entry.leaseId)}`
+    )));
     const entries = await this.#fileSystem.readdir(root, { withFileTypes: true });
     const descriptors = new Map();
     for (const entry of entries) {
       const leaseArtifact = parseGenerationArtifact(entry.name, STAGING_LEASE_SUFFIX);
+      const receiptArtifact = parseGenerationArtifact(entry.name, STAGING_RECEIPT_SUFFIX);
+      const tombstoneArtifact = parseGenerationArtifact(entry.name, STAGING_TOMBSTONE_SUFFIX);
+      const ownerArtifact = parseGenerationArtifact(entry.name, STAGING_OWNER_SUFFIX);
+      const workerTempArtifact = parseGenerationWorkerTempArtifact(entry.name);
       const isSpecial = [STAGING_LEASE_SUFFIX, STAGING_RECEIPT_SUFFIX, STAGING_TOMBSTONE_SUFFIX, STAGING_OWNER_SUFFIX]
         .some((suffix) => entry.name.endsWith(suffix));
       const dataArtifact = isSpecial ? null : parseGenerationArtifact(entry.name, STAGING_FILE_SUFFIX);
-      const artifact = leaseArtifact ?? dataArtifact;
+      const artifact = leaseArtifact
+        ?? receiptArtifact
+        ?? tombstoneArtifact
+        ?? ownerArtifact
+        ?? workerTempArtifact
+        ?? dataArtifact;
       if (!artifact) continue;
       const key = `${artifact.batchId}\u0000${artifact.generationTag}`;
-      const descriptor = descriptors.get(key) ?? { ...artifact, hasLease: false, hasData: false };
+      const descriptor = descriptors.get(key) ?? {
+        ...artifact,
+        hasLease: false,
+        hasReceipt: false,
+        hasTombstone: false,
+        hasOwner: false,
+        hasWorkerTemp: false,
+        hasData: false
+      };
       if (leaseArtifact) descriptor.hasLease = true;
+      if (receiptArtifact) descriptor.hasReceipt = true;
+      if (tombstoneArtifact) descriptor.hasTombstone = true;
+      if (ownerArtifact) descriptor.hasOwner = true;
+      if (workerTempArtifact) descriptor.hasWorkerTemp = true;
       if (dataArtifact) descriptor.hasData = true;
       descriptors.set(key, descriptor);
     }
 
     for (const descriptor of descriptors.values()) {
+      const descriptorKey = `${descriptor.batchId}\u0000${descriptor.generationTag}`;
+      if (completedGenerationKeys.has(descriptorKey)) continue;
+      if (descriptor.hasWorkerTemp) {
+        cleanupNeedsAttentionBatches.push({
+          batchId: descriptor.batchId,
+          generationTag: descriptor.generationTag,
+          leaseId: null,
+          reason: "RETENTION_SERVICE_UNAVAILABLE"
+        });
+        continue;
+      }
       if (!descriptor.hasLease) {
+        let retentionLeaseId = null;
+        try {
+          retentionLeaseId = await this.#retentionLeaseForGeneration(
+            root,
+            descriptor.batchId,
+            descriptor.generationTag
+          );
+        } catch (error) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            generationTag: descriptor.generationTag,
+            leaseId: null,
+            reason: unverifiedCleanupFailureReason(error)
+          });
+          continue;
+        }
+        if (retentionLeaseId) {
+          try {
+            await this.#deleteGenerationWithVerification(
+              descriptor.batchId,
+              retentionLeaseId,
+              root,
+              {
+                allowNewlyAbsentData: !descriptor.hasData,
+                reason: "orphaned-generation"
+              }
+            );
+            removedBatches.push({
+              batchId: descriptor.batchId,
+              generationTag: descriptor.generationTag,
+              leaseId: retentionLeaseId,
+              reason: "orphaned-generation"
+            });
+          } catch (error) {
+            const reason = unverifiedCleanupFailureReason(error);
+            if (reason) {
+              cleanupNeedsAttentionBatches.push({
+                batchId: descriptor.batchId,
+                generationTag: descriptor.generationTag,
+                leaseId: retentionLeaseId,
+                reason
+              });
+            }
+          }
+          continue;
+        }
+        if (descriptor.hasReceipt || descriptor.hasTombstone) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            generationTag: descriptor.generationTag,
+            leaseId: null,
+            reason: "STAGING_CLEANUP_EVIDENCE_REQUIRED"
+          });
+          continue;
+        }
+        // An owner observed by this scan must never be downgraded to
+        // lease-less cleanup authority if it changes or disappears while the
+        // scan is running. Preserve nonterminal truth for a safe retry.
+        if (descriptor.hasOwner || !descriptor.hasData) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            generationTag: descriptor.generationTag,
+            leaseId: null,
+            reason: descriptor.hasOwner
+              ? "RETENTION_SERVICE_UNAVAILABLE"
+              : "STAGING_FILE_IDENTITY_CHANGED"
+          });
+          continue;
+        }
         const orphanPath = resolve(root, `${STAGING_FILE_PREFIX}${descriptor.batchId}.${descriptor.generationTag}${STAGING_FILE_SUFFIX}`);
         try {
           await this.#unlinkUntrackedDataWithVerification(orphanPath);
+          await this.#assertUntrackedGenerationArtifactsAbsent(
+            root,
+            descriptor.batchId,
+            descriptor.generationTag,
+            "An untracked staging generation or its cleanup worker remained after orphan cleanup. Cleanup was not reported complete."
+          );
           removedBatches.push({
             batchId: descriptor.batchId,
             generationTag: descriptor.generationTag,
@@ -2475,24 +2757,91 @@ export class LocalTemporaryStaging {
       try {
         rawManifest = await readSmallJson(this.#fileSystem, leasePath);
         const leaseId = assertOpaqueId(rawManifest?.leaseId, "STAGING_LEASE_INVALID", "staging lease identity");
-        if (generationTagForLease(leaseId) !== descriptor.generationTag) throw new Error("generation mismatch");
+        if (generationTagForLease(leaseId) !== descriptor.generationTag) {
+          throw new KnowledgeCompilationError(
+            "STAGING_LEASE_INVALID",
+            "The protected temporary batch generation marker did not match its immutable filename."
+          );
+        }
         manifest = this.#validatedManifest(rawManifest, descriptor.batchId, leaseId);
-      } catch {
+      } catch (error) {
+        if (!isIntrinsicRetentionArtifactError(error) && !isIntrinsicStagingValidationError(error)) {
+          throw error;
+        }
         const dataPath = resolve(root, `${STAGING_FILE_PREFIX}${descriptor.batchId}.${descriptor.generationTag}${STAGING_FILE_SUFFIX}`);
-        if (!descriptor.hasData) {
+        let retentionLeaseId = null;
+        try {
+          retentionLeaseId = await this.#retentionLeaseForGeneration(
+            root,
+            descriptor.batchId,
+            descriptor.generationTag
+          );
+        } catch (error) {
           cleanupNeedsAttentionBatches.push({
             batchId: descriptor.batchId,
             generationTag: descriptor.generationTag,
             leaseId: null,
-            reason: "STAGING_FILE_IDENTITY_CHANGED"
+            reason: unverifiedCleanupFailureReason(error)
+          });
+          continue;
+        }
+        if (retentionLeaseId) {
+          try {
+            await this.#deleteGenerationWithVerification(
+              descriptor.batchId,
+              retentionLeaseId,
+              root,
+              {
+                allowNewlyAbsentData: !descriptor.hasData,
+                reason: "invalid-generation"
+              }
+            );
+            removedBatches.push({
+              batchId: descriptor.batchId,
+              generationTag: descriptor.generationTag,
+              leaseId: retentionLeaseId,
+              reason: "invalid-generation"
+            });
+          } catch (error) {
+            const reason = unverifiedCleanupFailureReason(error);
+            if (reason) {
+              cleanupNeedsAttentionBatches.push({
+                batchId: descriptor.batchId,
+                generationTag: descriptor.generationTag,
+                leaseId: retentionLeaseId,
+                reason
+              });
+            }
+          }
+          continue;
+        }
+        if (descriptor.hasReceipt || descriptor.hasTombstone) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            generationTag: descriptor.generationTag,
+            leaseId: null,
+            reason: "STAGING_CLEANUP_EVIDENCE_REQUIRED"
+          });
+          continue;
+        }
+        if (descriptor.hasOwner || !descriptor.hasData) {
+          cleanupNeedsAttentionBatches.push({
+            batchId: descriptor.batchId,
+            generationTag: descriptor.generationTag,
+            leaseId: null,
+            reason: descriptor.hasOwner
+              ? "RETENTION_SERVICE_UNAVAILABLE"
+              : "STAGING_FILE_IDENTITY_CHANGED"
           });
           continue;
         }
         try {
           await this.#unlinkUntrackedDataWithVerification(dataPath);
           await this.#unlinkUntrackedDataWithVerification(leasePath);
-          await assertNativePathsAbsent(
-            [dataPath, leasePath],
+          await this.#assertUntrackedGenerationArtifactsAbsent(
+            root,
+            descriptor.batchId,
+            descriptor.generationTag,
             "A malformed staging generation remained on the local filesystem after cleanup. Cleanup needs local review and was not reported complete."
           );
           removedBatches.push({
@@ -2514,14 +2863,58 @@ export class LocalTemporaryStaging {
       const paths = this.#paths(root, descriptor.batchId, manifest.leaseId);
       const dataAbsent = await pathIsAbsent(this.#fileSystem, paths.data);
       let invalidData = false;
+      let localAttentionError = null;
       if (!dataAbsent) {
         try {
           const payload = await this.#readPayloadAt(root, descriptor.batchId, manifest.leaseId);
           invalidData = payload.createdAt !== manifest.createdAt || payload.expiresAt !== manifest.expiresAt;
-        } catch { invalidData = true; }
+        } catch (error) {
+          if (cleanupNeedsLocalAttention(error)) {
+            // A local-integrity concern is not proof that the generation is
+            // malformed. If deletion is otherwise due, the verified deletion
+            // path below records bounded attention without deleting blindly.
+            localAttentionError = error;
+          } else {
+            if (!isIntrinsicStagingValidationError(error)) throw error;
+            invalidData = true;
+          }
+        }
       }
       const expiresAt = Date.parse(manifest.expiresAt);
-      if (invalidData || expiresAt <= current || (dataAbsent && manifest.phase === "ready")) {
+      const cleanupRequired = invalidData || expiresAt <= current || (dataAbsent && manifest.phase === "ready");
+      if (localAttentionError && !cleanupRequired) {
+        try {
+          // Preserve a durable, generation-bound marker for local review
+          // without attempting to unlink a still-active protected batch.
+          await this.#ensureTombstone(
+            root,
+            descriptor.batchId,
+            manifest.leaseId,
+            new Date().toISOString(),
+            "unknown-cleanup"
+          );
+        } catch (error) {
+          const reason = unverifiedCleanupFailureReason(error);
+          if (reason) {
+            cleanupNeedsAttentionBatches.push({
+              batchId: descriptor.batchId,
+              generationTag: descriptor.generationTag,
+              leaseId: manifest.leaseId,
+              reason
+            });
+          }
+        }
+        cleanupNeedsAttentionBatches.push({
+          batchId: descriptor.batchId,
+          generationTag: descriptor.generationTag,
+          leaseId: manifest.leaseId,
+          reason: localAttentionError.code
+        });
+        this.#scheduleExpiry(descriptor.batchId, manifest.leaseId, manifest.expiresAt);
+        try { await this.#armRetention(descriptor.batchId, manifest.expiresAt, manifest.leaseId, root); } catch {}
+        continue;
+      }
+      if (cleanupRequired) {
         const reason = invalidData ? "invalid-generation" : expiresAt <= current ? "expired" : "verified-early-absence";
         try {
           // Startup cannot infer that an already-absent path was unlinked by
@@ -2618,18 +3011,7 @@ export class LocalTemporaryStaging {
       }
       return this.#paths(root, batchId, leaseId);
     }
-    const base = `${STAGING_FILE_PREFIX}${batchId}.${generationTag}`;
-    const paths = {
-      data: resolve(root, `${base}${STAGING_FILE_SUFFIX}`),
-      lease: resolve(root, `${base}${STAGING_LEASE_SUFFIX}`)
-    };
-    if (Object.values(paths).some((candidate) => dirname(candidate) !== root || !isWithin(candidate, root))) {
-      throw new KnowledgeCompilationError(
-        "STAGING_PATH_ESCAPE_BLOCKED",
-        "Cleanup evidence refused a path outside its dedicated staging directory."
-      );
-    }
-    return paths;
+    return this.#pathsForGenerationTag(root, batchId, generationTag);
   }
 
   async cleanupExpired(input, operationToken = null) {
@@ -2657,18 +3039,28 @@ export class LocalTemporaryStaging {
     for (const entry of candidateRemovedBatches) {
       const paths = this.#removalEvidencePaths(root, entry);
       try {
-        await assertNativePathsAbsent(
-          [paths.data, paths.lease],
-          "The exact protected generation reappeared before cleanup results were finalized. Cleanup was not reported complete."
-        );
+        if (entry.leaseId) {
+          await assertNativePathsAbsent(
+            [paths.data, paths.lease, paths.owner],
+            "The exact protected generation or its cleanup worker reappeared before cleanup results were finalized. Cleanup was not reported complete."
+          );
+          await assertNativeGenerationWorkerTempsAbsent(root, entry.batchId, entry.leaseId);
+        } else {
+          await this.#assertUntrackedGenerationArtifactsAbsent(
+            root,
+            entry.batchId,
+            entry.generationTag,
+            "An untracked staging generation or its cleanup worker reappeared before cleanup results were finalized. Cleanup was not reported complete."
+          );
+        }
         removedBatches.push(entry);
       } catch (error) {
-        if (!(error instanceof KnowledgeCompilationError) || error.code !== "STAGING_DELETE_FAILED") throw error;
+        if (!(error instanceof KnowledgeCompilationError)) throw error;
         candidateCleanupNeedsAttentionBatches.push({
           batchId: entry.batchId,
           generationTag: entry.generationTag,
           leaseId: entry.leaseId ?? null,
-          reason: "STAGING_FILE_IDENTITY_CHANGED"
+          reason: unverifiedCleanupFailureReason(error)
         });
       }
     }
@@ -2677,17 +3069,18 @@ export class LocalTemporaryStaging {
       const paths = this.#paths(root, receipt.batchId, receipt.leaseId);
       try {
         await assertNativePathsAbsent(
-          [paths.data, paths.lease],
-          "The exact protected generation reappeared before cleanup evidence was finalized. Its receipt was not reported complete."
+          [paths.data, paths.lease, paths.owner],
+          "The exact protected generation or its cleanup worker reappeared before cleanup evidence was finalized. Its receipt was not reported complete."
         );
+        await assertNativeGenerationWorkerTempsAbsent(root, receipt.batchId, receipt.leaseId);
         completionReceipts.push(receipt);
       } catch (error) {
-        if (!(error instanceof KnowledgeCompilationError) || error.code !== "STAGING_DELETE_FAILED") throw error;
+        if (!(error instanceof KnowledgeCompilationError)) throw error;
         candidateCleanupNeedsAttentionBatches.push({
           batchId: receipt.batchId,
           generationTag: generationTagForLease(receipt.leaseId),
           leaseId: receipt.leaseId,
-          reason: "STAGING_FILE_IDENTITY_CHANGED"
+          reason: unverifiedCleanupFailureReason(error)
         });
       }
     }
@@ -2717,6 +3110,7 @@ LOCAL_TEMPORARY_STAGING_METHODS = Object.freeze({
   read: LocalTemporaryStaging.prototype.read,
   delete: LocalTemporaryStaging.prototype.delete,
   cleanupExpired: LocalTemporaryStaging.prototype.cleanupExpired,
+  rawDeletionEvidence: LocalTemporaryStaging.prototype.rawDeletionEvidence,
   acknowledgeCleanupReceipt: LocalTemporaryStaging.prototype.acknowledgeCleanupReceipt
 });
 
@@ -3371,16 +3765,26 @@ async function loadState(stateStore) {
   return state;
 }
 
+function rawSourceBodiesRetainedForStaging(staging) {
+  return Boolean(
+    staging
+    && !exactCanonicalTimestamp(staging.deletedAt)
+    && !exactCanonicalTimestamp(staging.rawSourceBodiesDeletedAt)
+  );
+}
+
 function publicBatch(entry, language) {
   const text = wording(language);
   const cleanupNeedsAttention = Boolean(entry.staging?.cleanupNeedsAttention);
   const cleanupAuthorityRequired = entry.staging?.cleanupNeedsAttention === "STAGING_AUTHORITATIVE_CLEANUP_REQUIRED";
+  const rawSourceBodiesRetained = rawSourceBodiesRetainedForStaging(entry.staging);
+  const cleanupFinalizationNeedsAttention = cleanupNeedsAttention && !rawSourceBodiesRetained;
   const base = {
     batchId: entry.batchId,
     status: entry.status,
     simulated: true,
     live: false,
-    rawSourceBodiesRetained: Boolean(entry.staging && !entry.staging.deletedAt),
+    rawSourceBodiesRetained,
     staging: entry.staging ? {
       createdAt: entry.staging.createdAt,
       expiresAt: entry.staging.expiresAt,
@@ -3388,6 +3792,7 @@ function publicBatch(entry, language) {
       status: entry.staging.status ?? "available",
       cause: entry.staging.cleanupCause ?? null,
       deletedAt: entry.staging.deletedAt ?? null,
+      rawSourceBodiesDeletedAt: exactCanonicalTimestamp(entry.staging.rawSourceBodiesDeletedAt) ?? null,
       needsAttention: cleanupNeedsAttention
     } : null
   };
@@ -3399,6 +3804,8 @@ function publicBatch(entry, language) {
       needsAttention: cleanupNeedsAttention,
       message: cleanupAuthorityRequired
         ? text.cleanupAuthorityRequired
+        : cleanupFinalizationNeedsAttention
+        ? text.cleanupFinalizationNeedsAttention
         : cleanupNeedsAttention
         ? text.cleanupNeedsAttention
         : cleanupPending
@@ -3418,6 +3825,8 @@ function publicBatch(entry, language) {
       needsAttention: cleanupNeedsAttention,
       message: cleanupAuthorityRequired
         ? text.cleanupAuthorityRequired
+        : cleanupFinalizationNeedsAttention
+        ? text.cleanupFinalizationNeedsAttention
         : cleanupNeedsAttention
         ? text.cleanupNeedsAttention
         : cleanupPending
@@ -3432,6 +3841,8 @@ function publicBatch(entry, language) {
       needsAttention: cleanupNeedsAttention,
       message: cleanupAuthorityRequired
         ? text.cleanupAuthorityRequired
+        : cleanupFinalizationNeedsAttention
+        ? text.cleanupFinalizationNeedsAttention
         : cleanupNeedsAttention
         ? text.cleanupNeedsAttention
         : entry.staging?.status === "discarded-pending-deletion"
@@ -3444,7 +3855,11 @@ function publicBatch(entry, language) {
       ...base,
       retryable: true,
       needsAttention: true,
-      message: cleanupAuthorityRequired ? text.cleanupAuthorityRequired : text.cleanupNeedsAttention
+      message: cleanupAuthorityRequired
+        ? text.cleanupAuthorityRequired
+        : cleanupFinalizationNeedsAttention
+        ? text.cleanupFinalizationNeedsAttention
+        : text.cleanupNeedsAttention
     };
   }
   return { ...base, retryable: true, message: text.interrupted };
@@ -3474,6 +3889,45 @@ function cleanupNeedsLocalAttention(error) {
   ].includes(error.code);
 }
 
+const INTRINSIC_STAGING_VALIDATION_CODES = new Set([
+  "STAGING_BATCH_INVALID",
+  "STAGING_PAYLOAD_INVALID",
+  "STAGING_LEASE_INVALID",
+  "STAGING_TIMESTAMP_INVALID",
+  "STAGING_PAYLOAD_TOO_DEEP",
+  "STAGING_SIZE_LIMIT",
+  "STAGING_SYMLINK_BLOCKED",
+  "RAW_SOURCE_FIELD_BLOCKED",
+  "NORMALIZED_RECORD_INVALID",
+  "NORMALIZED_TEXT_INVALID",
+  "NORMALIZED_TEXT_UNSAFE",
+  "SOURCE_REFERENCE_INVALID",
+  "ACCOUNT_REFERENCE_INVALID",
+  "REVIEW_REFERENCE_INVALID",
+  "GRANT_REFERENCE_INVALID",
+  "UNTRUSTED_DISPOSITION_REQUIRED",
+  "SOURCE_TIMESTAMP_REQUIRED",
+  "SOURCE_PROVENANCE_INVALID",
+  "DUPLICATE_SOURCE_RECORD",
+  "VERIFICATION_DATE_INVALID",
+  "ASSERTIONS_REQUIRED",
+  "SUBJECT_TYPE_INVALID",
+  "SUBJECT_ID_INVALID",
+  "CONFIDENCE_INVALID",
+  "UNKNOWN_CONFIDENCE_INVALID",
+  "PRIVACY_RESTRICTION_REQUIRED",
+  "PRIVACY_RESTRICTION_INVALID",
+  "SUBJECT_LABEL_CONFLICT"
+]);
+
+function isIntrinsicRetentionArtifactError(error) {
+  return error instanceof SyntaxError || error instanceof UnsafeRetentionArtifactError;
+}
+
+function isIntrinsicStagingValidationError(error) {
+  return error instanceof KnowledgeCompilationError && INTRINSIC_STAGING_VALIDATION_CODES.has(error.code);
+}
+
 function unverifiedCleanupFailureReason(error) {
   // Exact verified absence can be reconciled from the generation-bound
   // tombstone even when the optional receipt write was interrupted.
@@ -3486,7 +3940,9 @@ function unverifiedCleanupFailureReason(error) {
 function stagingAfterCleanupSuccess(staging, status, deletedAt, { cleanupCause = null } = {}) {
   if (!staging) return null;
   const { cleanupNeedsAttention: _cleanupNeedsAttention, ...withoutAttention } = staging;
-  const next = { ...withoutAttention, status, deletedAt };
+  const rawSourceBodiesDeletedAt = exactCanonicalTimestamp(staging.rawSourceBodiesDeletedAt)
+    ?? exactCanonicalTimestamp(deletedAt);
+  const next = { ...withoutAttention, status, deletedAt, rawSourceBodiesDeletedAt };
   if (cleanupCause) next.cleanupCause = boundedCleanupReason(cleanupCause);
   else delete next.cleanupCause;
   return next;
@@ -3498,6 +3954,7 @@ function shouldDiscardAfterFailure(error) {
     "PERSISTED_GRANT_INVALID",
     "RECORD_OUTSIDE_APPROVED_SCOPE",
     "STAGING_BATCH_INVALID",
+    "STAGING_PAYLOAD_INVALID",
     "STAGING_BATCH_MISSING",
     "STAGING_TIMESTAMP_INVALID",
     "STAGING_PAYLOAD_TOO_DEEP",
@@ -3571,6 +4028,7 @@ function discardedBatchEntry({
       ...(staged ? stagingReceiptFromBatch(staged) : {}),
       status: deletionCompleted ? (stagingStatus ?? "discarded") : "discarded-pending-deletion",
       deletedAt: deletionCompleted ? now : null,
+      rawSourceBodiesDeletedAt: deletionCompleted ? now : null,
       ...(cleanupCause ? { cleanupCause: boundedCleanupReason(cleanupCause) } : {})
     },
     audit: [{ type: "temporary-batch-discarded", at: now, reason, recoveredWithoutPersistedState: staged !== null }]
@@ -3608,7 +4066,7 @@ function cleanupResultKey(result) {
   return `${result?.batchId ?? ""}\u0000${result?.generationTag ?? ""}\u0000${result?.leaseId ?? ""}`;
 }
 
-function cleanupResultMatchesPersistedGeneration(entry, result) {
+function cleanupResultMatchesPersistedGeneration(entry, result, { allowTagOnly = false } = {}) {
   const persistedLeaseId = entry?.staging?.leaseId;
   if (typeof persistedLeaseId !== "string" || !OPAQUE_ID.test(persistedLeaseId)) return false;
   const expectedGenerationTag = generationTagForLease(persistedLeaseId);
@@ -3624,10 +4082,11 @@ function cleanupResultMatchesPersistedGeneration(entry, result) {
         && result.generationTag === expectedGenerationTag
       );
   }
-  // Missing or malformed lease cleanup can bind to lifecycle state only via
-  // the newer filename-derived generation tag. A public batch ID alone is
-  // never sufficient.
-  return result?.leaseId === null
+  // Filename-derived evidence is sufficient to route a bounded needs-attention
+  // result to the tracked generation, but it is never terminal deletion
+  // authority. Only the exact persisted lease can finalize lifecycle truth.
+  return allowTagOnly
+    && result?.leaseId === null
     && typeof result.generationTag === "string"
     && GENERATION_TAG.test(result.generationTag)
     && result.generationTag === expectedGenerationTag;
@@ -3658,6 +4117,29 @@ async function persistedGenerationIsReadableNow({
   }
 }
 
+async function refreshRawDeletionEvidence({ entry, staging, batchId }) {
+  if (
+    !entry?.staging
+    || exactCanonicalTimestamp(entry.staging.rawSourceBodiesDeletedAt)
+    || typeof entry.staging.leaseId !== "string"
+    || typeof staging?.rawDeletionEvidence !== "function"
+  ) return false;
+  try {
+    const evidence = await staging.rawDeletionEvidence({
+      batchId,
+      leaseId: entry.staging.leaseId
+    });
+    const rawSourceBodiesDeletedAt = exactCanonicalTimestamp(evidence?.rawSourceBodiesDeletedAt);
+    if (!rawSourceBodiesDeletedAt) return false;
+    entry.staging = { ...entry.staging, rawSourceBodiesDeletedAt };
+    return true;
+  } catch {
+    // This marker is optional, monotonic evidence. Any readback uncertainty
+    // leaves the public projection conservative until a later locked retry.
+    return false;
+  }
+}
+
 async function markExpiredBatches({ lifecycle, staging, now }) {
   const cleaned = await staging.cleanupExpired({ now });
   const removals = Array.isArray(cleaned.removedBatches)
@@ -3667,7 +4149,11 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     .map(cleanupResultKey));
   const acknowledgements = [];
   const verifiedCleanupKeys = new Set();
+  const tagOnlyCleanupNeedsAttentionBatches = [];
   let changed = false;
+  for (const [batchId, entry] of Object.entries(lifecycle.batches)) {
+    if (await refreshRawDeletionEvidence({ entry, staging, batchId })) changed = true;
+  }
   for (const removal of removals) {
     const { batchId } = removal;
     const entry = lifecycle.batches[batchId];
@@ -3677,7 +4163,23 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     // Untracked or stale generations can be reported for local attention, but
     // they can never alter or clear a persisted lifecycle generation sharing
     // the same public batch ID.
-    if (entry && !cleanupResultMatchesPersistedGeneration(entry, removal)) continue;
+    if (entry && !cleanupResultMatchesPersistedGeneration(entry, removal)) {
+      // A genuinely untracked, ownerless artifact can be removed using its
+      // filename-derived generation tag. That bounded evidence is still not
+      // exact deletion authority for a persisted lifecycle generation. If it
+      // addresses the tracked tag, preserve conservative public truth and
+      // route the exact persisted lease to needs-attention instead of leaving
+      // a now-absent batch looking resumable or accepting truncated-tag truth.
+      if (cleanupResultMatchesPersistedGeneration(entry, removal, { allowTagOnly: true })) {
+        tagOnlyCleanupNeedsAttentionBatches.push({
+          batchId,
+          generationTag: removal.generationTag,
+          leaseId: null,
+          reason: "STAGING_CLEANUP_EVIDENCE_REQUIRED"
+        });
+      }
+      continue;
+    }
     // Cleanup scans and durable lifecycle reconciliation are separate I/O
     // boundaries. An exact generation can be restored after a scan produced
     // removal evidence but before this locked lifecycle mutation. Re-read the
@@ -3802,11 +4304,14 @@ async function markExpiredBatches({ lifecycle, staging, now }) {
     acknowledgements.push({ batchId, leaseId });
   }
 
-  const cleanupNeedsAttentionBatches = cleaned.cleanupNeedsAttentionBatches ?? [];
+  const cleanupNeedsAttentionBatches = [
+    ...(cleaned.cleanupNeedsAttentionBatches ?? []),
+    ...tagOnlyCleanupNeedsAttentionBatches
+  ];
   for (const attention of cleanupNeedsAttentionBatches) {
     const { batchId, reason } = attention;
     const entry = lifecycle.batches[batchId];
-    if (!cleanupResultMatchesPersistedGeneration(entry, attention)) continue;
+    if (!cleanupResultMatchesPersistedGeneration(entry, attention, { allowTagOnly: true })) continue;
     if (await persistedGenerationIsReadableNow({
       staging,
       entry,
@@ -3958,14 +4463,16 @@ async function finalizePersistedCompilationCleanup({ state, lifecycle, entry, st
     // The result is already durable. Keep the private staging receipt marked
     // pending so a later resume or the independently armed expiry worker can
     // complete deletion without losing the compiled projection.
+    let stateChanged = await refreshRawDeletionEvidence({ entry, staging, batchId });
     if (cleanupNeedsLocalAttention(error)) {
       entry.staging = { ...entry.staging, cleanupNeedsAttention: "filesystem-generation-integrity" };
       if (!entry.audit.some((event) => event.type === "temporary-staging-cleanup-needs-attention" && event.at === now)) {
         entry.audit.push({ type: "temporary-staging-cleanup-needs-attention", at: now, reason: error.code });
         lifecycle.audit.push({ type: "temporary-staging-cleanup-needs-attention", at: now, batchId, reason: error.code });
       }
-      try { await stateStore.save(state); } catch {}
+      stateChanged = true;
     }
+    if (stateChanged) try { await stateStore.save(state); } catch {}
     return false;
   }
 
@@ -3986,6 +4493,9 @@ async function finalizePersistedCompilationCleanup({ state, lifecycle, entry, st
     entry.staging = previousStaging;
     entry.audit.length = previousAuditLength;
     lifecycle.audit.length = previousLifecycleAuditLength;
+    if (await refreshRawDeletionEvidence({ entry, staging, batchId })) {
+      try { await stateStore.save(state); } catch {}
+    }
     return false;
   }
 }
@@ -3998,14 +4508,16 @@ async function finalizeDiscardedCleanup({ state, lifecycle, entry, stateStore, s
     const deleted = await staging.delete({ batchId, leaseId, reason: "discarded" });
     if (deleted !== true) return false;
   } catch (error) {
+    let stateChanged = await refreshRawDeletionEvidence({ entry, staging, batchId });
     if (cleanupNeedsLocalAttention(error)) {
       entry.staging = { ...entry.staging, cleanupNeedsAttention: "filesystem-generation-integrity" };
       if (!entry.audit.some((event) => event.type === "temporary-discarded-staging-cleanup-needs-attention" && event.at === now)) {
         entry.audit.push({ type: "temporary-discarded-staging-cleanup-needs-attention", at: now, reason: error.code });
         lifecycle.audit.push({ type: "temporary-discarded-staging-cleanup-needs-attention", at: now, batchId, reason: error.code });
       }
-      try { await stateStore.save(state); } catch {}
+      stateChanged = true;
     }
+    if (stateChanged) try { await stateStore.save(state); } catch {}
     return false;
   }
   const previousStaging = clone(entry.staging);
@@ -4022,6 +4534,9 @@ async function finalizeDiscardedCleanup({ state, lifecycle, entry, stateStore, s
     entry.staging = previousStaging;
     entry.audit.length = previousAuditLength;
     lifecycle.audit.length = previousLifecycleAuditLength;
+    if (await refreshRawDeletionEvidence({ entry, staging, batchId })) {
+      try { await stateStore.save(state); } catch {}
+    }
     return false;
   }
 }
@@ -4034,14 +4549,16 @@ async function finalizeExpiredCleanup({ state, lifecycle, entry, stateStore, sta
     const deleted = await staging.delete({ batchId, leaseId, reason: "expired" });
     if (deleted !== true) return false;
   } catch (error) {
+    let stateChanged = await refreshRawDeletionEvidence({ entry, staging, batchId });
     if (cleanupNeedsLocalAttention(error)) {
       entry.staging = { ...entry.staging, cleanupNeedsAttention: "filesystem-generation-integrity" };
       if (!entry.audit.some((event) => event.type === "temporary-expired-staging-cleanup-needs-attention" && event.at === now)) {
         entry.audit.push({ type: "temporary-expired-staging-cleanup-needs-attention", at: now, reason: error.code });
         lifecycle.audit.push({ type: "temporary-expired-staging-cleanup-needs-attention", at: now, batchId, reason: error.code });
       }
-      try { await stateStore.save(state); } catch {}
+      stateChanged = true;
     }
+    if (stateChanged) try { await stateStore.save(state); } catch {}
     return false;
   }
   const previousStaging = clone(entry.staging);
@@ -4058,6 +4575,9 @@ async function finalizeExpiredCleanup({ state, lifecycle, entry, stateStore, sta
     entry.staging = previousStaging;
     entry.audit.length = previousAuditLength;
     lifecycle.audit.length = previousLifecycleAuditLength;
+    if (await refreshRawDeletionEvidence({ entry, staging, batchId })) {
+      try { await stateStore.save(state); } catch {}
+    }
     return false;
   }
 }
@@ -4428,7 +4948,7 @@ async function cleanupExpiredKnowledgeStagingLocked({ stateStore, staging, clock
     cleanup: {
       simulated: true,
       rawSourceBodiesRetained: Object.values(lifecycle.batches).some((entry) => (
-        entry.staging && !entry.staging.deletedAt
+        rawSourceBodiesRetainedForStaging(entry.staging)
       )),
       needsAttentionBatchIds: [...new Set(
         reconciliation.cleanupNeedsAttentionBatches.map((entry) => entry.batchId)

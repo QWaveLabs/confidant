@@ -145,6 +145,26 @@ become a competing authority.
   malformed-lease cleanup, and hardlink-with-missing-lease needs-attention and
   recovery, alongside the single-link orphan, tracked-invalid, and legitimate
   exact-generation expiry controls.
+- Raw-body deletion truth is tracked separately from full cleanup completion.
+  The lifecycle accepts a monotonic `rawSourceBodiesDeletedAt` marker only from
+  the exact local engine, for the exact persisted batch and lease, when a
+  canonical generation-bound tombstone durably records verified data unlink,
+  has no cleanup-blocked reason, and a native check confirms that the raw data
+  path is absent. If the data and lease are gone but worker quiescence or
+  content-free owner/temporary-artifact cleanup still needs attention, full
+  `deletedAt` remains null and the batch remains retryable, while
+  `rawSourceBodiesRetained` truthfully becomes false. A fresh restart can
+  recover that marker from the same durable tombstone without reading source
+  bodies. Forged, stale, malformed, future-dated, wrong-generation, custom,
+  wrapped, proxy, or subclass evidence cannot set it.
+- Canonical receipt, tombstone, owner, and exact numeric PID-scoped worker-temp
+  artifacts seed generation discovery on every fresh adapter startup, even
+  when the corresponding data and lease paths are already absent. Malformed or
+  unverified residue therefore remains visible as bounded needs-attention
+  truth across repeated restarts instead of disappearing from status. A
+  nonnumeric `.worker.tmp` lookalike is not treated as a private worker
+  artifact, and residue filenames alone never grant deletion or lifecycle
+  authority.
 - Deletion truth is authority-bound to the exact `LocalTemporaryStaging`
   instance created by this module. Its captured internal implementation—not a
   public method lookup—performs cleanup and receipt acknowledgement. Wrappers,
@@ -208,6 +228,15 @@ become a competing authority.
 - A temporary staging-read interruption returns a retryable result while
   preserving the same protected batch. Normal-language resume compiles it once,
   deletes the stage, and returns the same result on an idempotent later retry.
+- During restart initialization and expiry cleanup, a one-shot operational read
+  failure for either the protected lease marker or payload returns
+  `STAGING_READ_FAILED`; it preserves the exact data and lease bytes, leaves
+  lifecycle state nonterminal, and creates neither a deletion receipt nor a
+  tombstone. A clean exact-engine retry then resumes and compiles that same
+  generation. Malformed payload JSON instead classifies as
+  `STAGING_PAYLOAD_INVALID`; hard-link and identity concerns remain durable
+  needs-attention evidence and are never relabeled as malformed input or
+  deleted automatically.
 - A state-save interruption after staging is reconciled from the matching
   bounded file by a fresh adapter. If permission was revoked first, recovery
   deletes and discards the stage instead of compiling it.
@@ -256,9 +285,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **62/62 passed**.
+- QWA-146 focused suite: **68/68 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **110/110 passed**.
+- Full repository suite: **116/116 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
