@@ -2576,7 +2576,11 @@ export class LocalTemporaryStaging {
         try {
           raw = await readSmallJson(this.#fileSystem, join(root, entry.name));
         } catch (error) {
-          if (error?.code === "ENOENT" || error instanceof SyntaxError) continue;
+          // A malformed, oversized, non-file, or symlinked completion
+          // artifact is never deletion evidence. Leave it for the descriptor
+          // scan below to surface as durable local attention instead of
+          // letting it block every subsequent staging restart.
+          if (error?.code === "ENOENT" || isIntrinsicRetentionArtifactError(error)) continue;
           throw error;
         }
         const leaseId = typeof raw?.leaseId === "string" && OPAQUE_ID.test(raw.leaseId) ? raw.leaseId : null;

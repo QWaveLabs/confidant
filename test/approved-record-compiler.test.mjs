@@ -3784,6 +3784,64 @@ test("fresh restarts keep standalone cleanup residue visible without accepting d
   }
 });
 
+test("fresh restarts preserve unsafe standalone completion artifacts as cleanup attention", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-unsafe-residue-"));
+  try {
+    const variants = [
+      {
+        label: "symlinked-receipt",
+        suffix: ".receipt.json",
+        async create({ residuePath, variantDirectory }) {
+          const outside = path.join(variantDirectory, "outside-receipt.json");
+          await writeFile(outside, '{"not":"staging evidence"}\n', { encoding: "utf8", mode: 0o600 });
+          await symlink(outside, residuePath);
+          return async () => {
+            assert.equal(await readFile(outside, "utf8"), '{"not":"staging evidence"}\n');
+            assert.equal((await lstat(residuePath)).isSymbolicLink(), true);
+          };
+        }
+      },
+      {
+        label: "oversized-tombstone",
+        suffix: ".tombstone.json",
+        async create({ residuePath }) {
+          const contents = `${"x".repeat((16 * 1024) + 1)}\n`;
+          await writeFile(residuePath, contents, { encoding: "utf8", mode: 0o600 });
+          return async () => {
+            assert.equal(await readFile(residuePath, "utf8"), contents);
+          };
+        }
+      }
+    ];
+
+    for (const [index, variant] of variants.entries()) {
+      const variantDirectory = path.join(directory, variant.label);
+      const root = path.join(variantDirectory, ".qwave-second-brain-staging");
+      const batchId = `fixture-${variant.label}`;
+      const tag = (index + 9).toString(16).repeat(24);
+      const residuePath = path.join(root, `batch-${batchId}.${tag}${variant.suffix}`);
+      await mkdir(root, { mode: 0o700, recursive: true });
+      const assertStillPresent = await variant.create({ residuePath, variantDirectory });
+
+      for (let restart = 0; restart < 3; restart += 1) {
+        const staging = fixtureStaging(root);
+        await staging.initialize();
+        const cleanup = await staging.cleanupExpired({ now: laterToday });
+        assert.deepEqual(cleanup.removedBatchIds, [], `${variant.label} restart ${restart} removed unsafe residue`);
+        assert.deepEqual(cleanup.cleanupNeedsAttentionBatches, [{
+          batchId,
+          generationTag: tag,
+          leaseId: null,
+          reason: "STAGING_CLEANUP_EVIDENCE_REQUIRED"
+        }]);
+        await assertStillPresent();
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("fresh restarts ignore nonnumeric worker-temp lookalikes", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa146-residue-lookalike-"));
   try {

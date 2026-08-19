@@ -160,8 +160,9 @@ become a competing authority.
 - Canonical receipt, tombstone, owner, and exact numeric PID-scoped worker-temp
   artifacts seed generation discovery on every fresh adapter startup, even
   when the corresponding data and lease paths are already absent. Malformed or
-  unverified residue therefore remains visible as bounded needs-attention
-  truth across repeated restarts instead of disappearing from status. A
+  unsafe (including symlinked, non-file, or oversized) or unverified residue
+  therefore remains visible as bounded needs-attention truth across repeated
+  restarts instead of disappearing from status or blocking initialization. A
   nonnumeric `.worker.tmp` lookalike is not treated as a private worker
   artifact, and residue filenames alone never grant deletion or lifecycle
   authority.
@@ -237,6 +238,11 @@ become a competing authority.
   `STAGING_PAYLOAD_INVALID`; hard-link and identity concerns remain durable
   needs-attention evidence and are never relabeled as malformed input or
   deleted automatically.
+- A malformed, symlinked, non-file, or oversized standalone completion receipt
+  or tombstone is never accepted as deletion evidence. Fresh adapters preserve
+  it, continue initialization, and report bounded
+  `STAGING_CLEANUP_EVIDENCE_REQUIRED` status for local review across repeated
+  restarts.
 - A state-save interruption after staging is reconciled from the matching
   bounded file by a fresh adapter. If permission was revoked first, recovery
   deletes and discards the stage instead of compiling it.
@@ -285,9 +291,9 @@ git diff --check
 ! ps -axo pid=,ppid=,command= | grep -E '[p]rivate-staging-retention-worker\.mjs|[q]wa146-env-observer-worker\.mjs'
 ```
 
-- QWA-146 focused suite: **68/68 passed**.
+- QWA-146 focused suite: **69/69 passed**.
 - Shared QWA-139 permission suite: **11/11 passed**.
-- Full repository suite: **116/116 passed**.
+- Full repository suite: **117/117 passed**.
 - All source, test, and test-support `.mjs` files passed `node --check`, and
   `git diff --check` reported no whitespace errors.
 - No detached retention worker remained after either focused or full
