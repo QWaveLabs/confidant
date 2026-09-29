@@ -9,7 +9,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJson, writeJson } from './lib/files.mjs';
-import { parseHandle, last10, isShortCode, isAutomatedEmail, phoneHandle, emailHandle, nameHandle } from './lib/handles.mjs';
+import { parseHandle, last10, isShortCode, isAutomatedEmail, phoneHandle, emailHandle, nameHandle, groupHandle } from './lib/handles.mjs';
 import { shortHash, fingerprint } from './lib/hash.mjs';
 import { normalizeName, nameTokens, prettyHandle, looksLikeHandle, titleCase, emailDomain, FREEMAIL, oneLine } from './lib/b-text.mjs';
 import { bPaths, bTables, takeLock, isoNow } from './lib/b-common.mjs';
@@ -126,7 +126,7 @@ class UnionFind {
 // ---------- one pass over the store ----------
 
 function newStat() {
-  return { names: new Map(), sources: new Set(), first: Infinity, last: -Infinity, inbound: 0, outbound: 0, meetings: 0, calls: 0, answered: 0, days: new Set(), fromMe: 0, fromOther: 0, bulk: 0, emails: 0, other: 0 };
+  return { names: new Map(), sources: new Set(), first: Infinity, last: -Infinity, inbound: 0, outbound: 0, meetings: 0, calls: 0, answered: 0, days: new Set(), fromMe: 0, fromOther: 0, bulk: 0, emails: 0, other: 0, business: 0 };
 }
 
 function parseCard(r) {
@@ -161,8 +161,10 @@ function scan(ctx) {
     const n = oneLine(name);
     if (n && n.length <= 80) map.set(n, (map.get(n) ?? 0) + 1);
   };
+  // Meta only where it matters: cards, bulk mail, calls, and chat messages
+  // that carry group members or a business sender id.
   const stmt = db.prepare(`SELECT id, source, kind, thread, ts_ms, from_handle, from_name, to_json, is_from_me, title,
-    CASE WHEN kind IN ('contact', 'email', 'call') THEN meta_json END AS meta FROM records`);
+    CASE WHEN kind IN ('contact', 'email', 'call') OR (kind = 'message' AND (meta_json LIKE '%"is_group"%' OR meta_json LIKE '%"alphanumeric_sender"%')) THEN meta_json END AS meta FROM records`);
   for (const r of stmt.iterate()) {
     records++;
     if (r.kind === 'contact') {
@@ -179,11 +181,13 @@ function scan(ctx) {
       if (h) to.push({ h, name: p.name });
     }
     const groupH = [fromH, ...to.map((x) => x.h)].find((h) => h && isGroup(h)) ?? null;
+    const meta = r.meta ? safeJson(r.meta, {}) : null;
     if (fromH && !isGroup(fromH)) {
       const s = st(fromH);
       if (r.from_name) addName(s.names, r.from_name);
       if (fromMe) s.fromMe++;
       else s.fromOther++;
+      if (meta?.alphanumeric_sender && !fromMe) s.business++;
     }
     const people = [];
     for (const { h, name } of to) {
@@ -205,13 +209,14 @@ function scan(ctx) {
         }
       }
     } else if (kind === 'call') {
-      const meta = safeJson(r.meta, {});
-      const other = fromMe ? people[0] : fromH;
+      // The other side is whoever is not the owner: from on incoming calls,
+      // to on outgoing ones, and to when a recording matched no call.
+      const other = fromMe ? people[0] : fromH ?? people[0];
       if (other) {
         const s = st(other);
         s.calls++;
         s.other++;
-        if (Number(meta.duration_s ?? meta.duration ?? 0) > 0) s.answered++;
+        if (Number(meta?.duration_s ?? meta?.duration ?? 0) > 0 || (r.text ?? '').length) s.answered++;
         touch(s, ms, r.source);
       }
     } else if (kind === 'message' || kind === 'email') {
@@ -221,7 +226,7 @@ function scan(ctx) {
         touch(s, ms, r.source);
         if (kind === 'email') {
           s.emails++;
-          if (isBulkMeta(safeJson(r.meta, {}))) s.bulk++;
+          if (isBulkMeta(meta ?? {})) s.bulk++;
         } else s.other++;
       }
       if (fromMe && !groupH && people.length > 0 && people.length <= DIRECT_MAX[kind]) {
@@ -237,10 +242,18 @@ function scan(ctx) {
         if (!t) T.set(r.thread, (t = { source: r.source, senders: new Set(), recips: new Set(), group: null, names: new Map(), count: 0, last: -Infinity, ownerOnly: { n: 0, days: new Set(), first: Infinity, last: -Infinity } }));
         t.count++;
         if (ms > t.last) t.last = ms;
-        if (groupH) {
-          t.group = groupH;
+        if (groupH || meta?.is_group) {
+          t.group = groupH ?? groupHandle(r.source, r.thread);
           const gp = to.find((x) => x.h === groupH);
           if (gp?.name) addName(t.names, gp.name);
+          if (meta?.chat_name) addName(t.names, meta.chat_name);
+          for (const raw of meta?.participants ?? []) {
+            const h = canonHandle(typeof raw === 'string' ? raw : raw?.handle ?? valueOf(raw));
+            if (h && !isGroup(h)) {
+              st(h);
+              t.recips.add(h);
+            }
+          }
         }
         if (r.title) addName(t.names, r.title);
         if (!fromMe && fromH && !isGroup(fromH)) t.senders.add(fromH);
@@ -435,7 +448,7 @@ function computeIdentity(ctx) {
       for (const d of s.days) a.days.add(d);
       a.first = Math.min(a.first, s.first);
       a.last = Math.max(a.last, s.last);
-      for (const k of ['inbound', 'outbound', 'meetings', 'calls', 'answered', 'bulk', 'emails', 'other']) a[k] += s[k];
+      for (const k of ['inbound', 'outbound', 'meetings', 'calls', 'answered', 'bulk', 'emails', 'other', 'business']) a[k] += s[k];
     }
     const c = credit.get(root);
     if (c) {
@@ -476,6 +489,7 @@ function computeIdentity(ctx) {
     const real = members.filter((h) => !isName(h));
     let kind = 'person';
     if (real.length && real.every((h) => isShortCode(h) || isAutomatedEmail(h))) kind = 'system';
+    else if (a.business > 0 && !card && a.outbound === 0) kind = 'system';
     else if (!card && a.bulk > 0 && a.bulk * 2 >= a.emails && a.outbound === 0) kind = 'system';
     else if (!card && a.other === 0 && a.outbound === 0 && a.inbound >= 10) kind = 'system';
     if (members.some((h) => excludedHandles.has(h)) || excludedNames.has(normalizeName(name)) || aliases.some((x) => excludedNames.has(normalizeName(x)))) kind = 'excluded';

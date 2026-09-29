@@ -19,7 +19,8 @@ import { goldenRecords, contributionFor, cleanupRecords, cleanupContribution } f
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_PLAN = join(HERE, 'fixtures', 'b-cleanup.plan.json');
-const scrub = (s) => String(s).replace(/\b\d(?:[ -]?\d){12,18}\b/g, '[card]');
+// A scrub rule that did not exist when the bullet was merged.
+const scrub = (s) => String(s).replace(/\bZETA-\d{4}\b/g, '[voucher]');
 const read = (ctx, rel) => readFileSync(join(ctx.vault, rel), 'utf8');
 const edit = (ctx, rel, fn) => writeFileSync(join(ctx.vault, rel), fn(read(ctx, rel)));
 
@@ -89,7 +90,7 @@ test('cleanup apply fixes only the safe things, asks about the rest, and undoes 
   assert.ok(read(ctx, 'People/Investors/Carla Diaz.md').includes('Met through [[Ben Cole]].'), 'links rewritten');
   const ana = read(ctx, 'People/Ana Ruiz.md');
   assert.ok(ana.includes('Renewals sit with [[Acme|Acme Inc]]. Ask [[Nobody Here]].'), 'renamed link fixed, unknown link left alone');
-  assert.ok(read(ctx, 'People/Maya Lin.md').includes('card [card] for hosting'), 'leak scrubbed in the generated text');
+  assert.ok(read(ctx, 'People/Maya Lin.md').includes('voucher [voucher] for hosting'), 'leak scrubbed in the generated text');
   assert.equal(parseNote(read(ctx, 'Commitments/Send the signed contract after legal review.md')).data.status, 'open', 'maybe-done is asked, not applied');
   assert.ok(existsSync(join(ctx.vault, 'People/Ana Ruiz Gomez.md')), 'probable duplicates are asked, not merged');
 

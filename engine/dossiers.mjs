@@ -121,7 +121,7 @@ export async function buildDossiers(ctx, { since, until, changedSince, frontier,
   const window = changedSince ? { changedSince, since: frontier ?? since ?? null, until: until ?? null } : { since: since ?? daysAgo(60, ctx.now), until: until ?? null };
   let records = changedSince ? ctx.store.records({ changedSince, since: window.since ?? undefined, until: window.until ?? undefined }) : ctx.store.records({ since: window.since, until: window.until ?? undefined });
   records = records.filter((r) => r.kind !== 'contact');
-  const stats = { records: records.length, used: 0, trivia: 0, automated: 0, context: 0 };
+  const stats = { records: records.length, used: 0, trivia: 0, automated: 0, context: 0, waiting: 0 };
 
   // Changed-only runs get a few earlier lines of each conversation as context.
   const context = new Set();
@@ -202,8 +202,15 @@ export async function buildDossiers(ctx, { since, until, changedSince, frontier,
     const base = { ref: r.id, date, ch, ...(isCtx ? { context: true } : {}) };
     const fromP = r.is_from_me ? identity.ownerPerson : resolve(r.from);
 
-    if (r.kind === 'meeting' || r.kind === 'recording') {
-      const others = (r.to ?? []).map((party) => ({ party, p: resolve(party) })).filter((x) => !identity.isOwner(x.p));
+    // A recorded phone call with its transcript is sorted like a meeting.
+    const callTranscript = r.kind === 'call' && (r.text ?? '').trim().length >= 200;
+    if (r.kind === 'meeting' || r.kind === 'recording' || callTranscript) {
+      if (r.meta?.needs_transcript && !(r.text ?? '').trim() && !summaryText(r.meta)) {
+        stats.waiting++;
+        continue;
+      }
+      const parties = r.kind === 'call' ? [r.from, ...(r.to ?? [])].filter((x) => x && (x.handle || x.name)) : r.to ?? [];
+      const others = parties.map((party) => ({ party, p: resolve(party) })).filter((x) => !identity.isOwner(x.p));
       const text = r.text ?? '';
       const speakers = [...new Set(text.split('\n').map((l) => SPEAKER.exec(l.trim())?.[1]?.trim()).filter(Boolean))];
       if (r.kind === 'recording' && !others.length && speakers.length < 2) {
@@ -289,7 +296,7 @@ export async function buildDossiers(ctx, { since, until, changedSince, frontier,
     }
 
     if (r.kind === 'call') {
-      const other = r.is_from_me ? resolve((r.to ?? [])[0]) : fromP;
+      const other = r.is_from_me ? resolve((r.to ?? [])[0]) : fromP ?? resolve((r.to ?? [])[0]);
       const secs = Number(r.meta?.duration_s ?? r.meta?.duration ?? 0);
       if (!usable(other) || secs < 30 || isCtx) continue;
       const mins = Math.max(1, Math.round(secs / 60));
@@ -329,7 +336,7 @@ export async function buildDossiers(ctx, { since, until, changedSince, frontier,
     }
 
     if (r.kind === 'message') {
-      const group = identity.groupByThread(r.thread);
+      const group = identity.groupByThread(r.thread) ?? (r.meta?.is_group ? { name: r.meta.chat_name || ch, members: [] } : null);
       const text = r.text ?? '';
       if (group) {
         const key = r.thread;
@@ -436,7 +443,7 @@ export async function run(args, ctx) {
   });
   ctx.log.out(
     { window: out.window, people: out.people.length, threads: out.threads.length, meetings: out.meetings.length, stats: out.stats, path: bPaths(ctx).dossiers },
-    `${out.people.length} people, ${out.threads.length} threads and ${out.meetings.length} meetings ready to sort (${out.stats.used} of ${out.stats.records} records used, ${out.stats.trivia} small talk and ${out.stats.automated} automated left out).`,
+    `${out.people.length} people, ${out.threads.length} threads and ${out.meetings.length} meetings ready to sort (${out.stats.used} of ${out.stats.records} records used, ${out.stats.trivia} small talk and ${out.stats.automated} automated left out${out.stats.waiting ? `, ${out.stats.waiting} recordings waiting for a transcript` : ''}).`,
   );
   return 0;
 }

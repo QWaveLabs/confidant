@@ -129,13 +129,13 @@ export function contributionFor(batch) {
 
 // Second phase for cleanup: Ben writes from a second number, a near copy of
 // Ana appears, an old website project goes quiet, and a card number slipped
-// into a bullet before privacy scrubbing existed.
+// into a bullet before privacy scrubbing had a rule for it.
 export const BEN_WA = 'tel:+15557771234';
 export function cleanupRecords() {
   return [
     msg('bw1', { source: 'whatsapp', thread: 'whatsapp:ben', ts: at(0, 13), from: BEN_WA, fromName: 'Ben', text: 'Sent the signed contract this morning, legal approved it.' }),
     email('g1', { ts: at(1), from: 'mailto:ana.gomez@acmecorp.example', fromName: 'Ana Ruiz Gomez', to: ['mailto:sam@rivera.co'], subject: 'Procurement', text: 'I am joining the Acme procurement team next week and will own vendor renewals.' }),
-    email('old1', { ts: at(58), from: 'mailto:maya@studio.example', fromName: 'Maya Lin', to: ['mailto:sam@rivera.co'], subject: 'Website refresh', text: 'The website refresh draft is ready. Use card 4111 1111 1111 1111 for the hosting invoice.' }),
+    email('old1', { ts: at(58), from: 'mailto:maya@studio.example', fromName: 'Maya Lin', to: ['mailto:sam@rivera.co'], subject: 'Website refresh', text: 'The website refresh draft is ready. Use voucher ZETA-4417 for the hosting invoice.' }),
   ];
 }
 
@@ -149,7 +149,7 @@ export function cleanupContribution(batch, identity) {
     people: [
       { person_id: id(BEN_WA), name: 'Ben Cole', bullets: [{ date: '2026-09-28', text: 'Said legal approved the contract and he sent it signed', source_refs: ['whatsapp:bw1'] }] },
       { person_id: id('mailto:ana.gomez@acmecorp.example'), name: 'Ana Ruiz Gomez', company: 'Acme', bullets: [{ date: '2026-09-27', text: 'Joining the Acme procurement team to own vendor renewals', source_refs: ['email:g1'] }] },
-      { person_id: id('mailto:maya@studio.example'), name: 'Maya Lin', kind: 'vendor', bullets: [{ date: '2026-07-31', text: 'Shared the website refresh draft and card 4111 1111 1111 1111 for hosting', source_refs: ['email:old1'] }] },
+      { person_id: id('mailto:maya@studio.example'), name: 'Maya Lin', kind: 'vendor', bullets: [{ date: '2026-07-31', text: 'Shared the website refresh draft and voucher ZETA-4417 for hosting', source_refs: ['email:old1'] }] },
     ],
     companies: [{ name: 'Acme Inc', people: ['Ana Ruiz Gomez'] }],
     projects: [{ name: 'Website refresh', status: 'active', goal: 'Refresh the marketing site.', people: ['Maya Lin'], bullets: [{ date: '2026-07-31', text: 'Draft is ready for review', source_refs: ['email:old1'] }] }],

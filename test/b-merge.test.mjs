@@ -159,3 +159,13 @@ test('mocs keeps a view the person customized and links the latest brief', async
   assert.ok(home.includes('- [[People]]: 4 notes'));
   assert.ok(note(ctx, 'People/People.md').includes('### Other notes\n- [[My own list]]'));
 });
+
+test('merge scrubs private details through privacy.scrubText', async () => {
+  const { ctx, byKind } = await setup();
+  await mergeWith(ctx, byKind.people, {
+    people: [{ name: 'Ana Ruiz', relationship: 'Pays with card 4111 1111 1111 1111.', bullets: [{ date: '2026-09-22', text: 'Sent card 4111 1111 1111 1111 for the deposit', source_refs: ['imessage:a1'] }] }],
+  });
+  const ana = note(ctx, 'People/Ana Ruiz.md');
+  assert.ok(!ana.includes('4111'));
+  assert.ok(ana.includes('Sent card [card] for the deposit.'));
+});
