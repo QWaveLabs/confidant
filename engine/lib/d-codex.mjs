@@ -75,13 +75,25 @@ export function automationRunStats(db, automationIds, sinceIso) {
   return { total, read };
 }
 
-// This vault's own automations: status, cwds and last run, keyed by
-// automation_id. Used by health to notice a task Codex itself has paused,
-// or that no longer lists this vault among its working directories.
+// This vault's own automations: status, kind, cwds and last run, keyed by
+// automation_id. Used by health and `tasks verify` to notice a task Codex
+// itself has paused, one that no longer lists this vault among its working
+// directories, or one created as a `heartbeat` (attached to the install
+// chat) instead of a standalone `cron` task. `SELECT *` so an older Codex
+// without the `kind` column still answers; kind is then null.
 export function automationStatuses(db, automationIds) {
   if (!automationIds.length) return [];
   const placeholders = automationIds.map(() => '?').join(',');
-  return db.prepare(`SELECT id, status, cwds, next_run_at, last_run_at FROM automations WHERE id IN (${placeholders})`).all(...automationIds);
+  return db.prepare(`SELECT * FROM automations WHERE id IN (${placeholders})`).all(...automationIds).map((r) => ({
+    id: r.id,
+    name: r.name ?? null,
+    status: r.status,
+    kind: r.kind ?? null,
+    cwds: r.cwds,
+    notification_policy: r.notification_policy ?? null,
+    next_run_at: r.next_run_at ?? null,
+    last_run_at: r.last_run_at ?? null,
+  }));
 }
 
 // Codex sessions (threads) opened with this vault as the working directory,

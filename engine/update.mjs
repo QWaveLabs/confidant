@@ -121,7 +121,7 @@ export async function run(args, ctx) {
   if (lock.held) {
     // Another run (a scheduled task that overlapped, or a person running
     // the CLI by hand) is already updating this vault. Exit clean so the
-    // caller's heartbeat rule can read `locked: true` and stay quiet.
+    // calling task can read `locked: true` and reply in one line.
     ctx.log.out({ ok: false, locked: true, holder: lock.holder }, 'Another run is already updating this vault. Nothing to do this time.');
     return 0;
   }

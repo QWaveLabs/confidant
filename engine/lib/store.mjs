@@ -147,6 +147,12 @@ export class Store {
     this.db.prepare('INSERT INTO cursors (source, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(source) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at').run(source, value == null ? null : String(value), now);
   }
 
+  // Every cursor whose key starts with `prefix` (an app source keeps several,
+  // e.g. gmail_live and gmail_window), as [{ key, value, updated_at }].
+  cursorsWithPrefix(prefix) {
+    return this.db.prepare('SELECT source AS key, value, updated_at FROM cursors WHERE substr(source, 1, ?) = ? ORDER BY source').all(prefix.length, prefix);
+  }
+
   getMeta(key, fallback = null) {
     const v = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value;
     return v == null ? fallback : JSON.parse(v);

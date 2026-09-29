@@ -98,12 +98,18 @@ test('buildTaskSpec produces schema-valid tasks with real prompt text, in the va
   for (const task of spec) {
     assert.equal(task.cwd, '/tmp/some-vault');
     assert.ok(task.prompt.length >= 40);
-    assert.match(task.prompt, /heartbeat/);
+    assert.equal(task.kind, 'cron');
+    assert.equal(task.status, 'ACTIVE');
+    assert.equal(task.executionEnvironment, 'local');
+    assert.match(task.prompt, /## Your reply in this chat/);
+    assert.match(task.prompt, /^::inbox-item\{title="\.\.\." summary="\.\.\."\}$/m);
+    assert.doesNotMatch(task.prompt, /heartbeat/i);
     assert.match(task.prompt, /English/);
   }
   const morning = spec.find((t) => t.key === 'morning_brief');
   assert.equal(morning.name, 'Morning Chief of Staff');
-  assert.equal(morning.notify, 'heartbeat');
+  assert.equal(morning.notificationPolicy, null);
+  assert.equal(spec.find((t) => t.key === 'brain_update').notificationPolicy, 'failed_runs_only');
 });
 
 test('buildTaskSpec in Spanish uses Spanish task names and asks the prompt to write in Spanish', () => {

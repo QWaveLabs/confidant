@@ -21,6 +21,11 @@ command, not a command's own flags; for a flag not shown literally here,
 read that command's own file under `engine/` or its section in
 `CONTRACTS.md`.
 
+At the end of each section below, record it as finished with
+`bin/confidant config phase <name>`, using the name in that section's
+heading (for example `config phase connect` once Connect is done). That is
+what lets a resumed install pick up in the right place.
+
 ## Before you start
 
 Run `bin/confidant doctor --json`. It tells you:
@@ -31,9 +36,10 @@ Run `bin/confidant doctor --json`. It tells you:
   `.confidant/state.json` phase; and
 - the path a brand new vault would get (`planNewVaultPath`).
 
-**If a resumable vault exists**, open its `.confidant/state.json` and pick
-up at `phase`, using the section below with that name. Don't repeat
-finished phases.
+**If a resumable vault exists**, follow **Resuming** at the end of this
+file. Don't repeat finished steps. If the person asked to upgrade (or its
+phase is `done` and this repo is a newer version than the one that set it
+up), follow **Upgrading** instead.
 
 **If the person already has a second brain or any existing Obsidian
 vault** at the default path, say so in one line and create a new vault
@@ -42,25 +48,30 @@ Never open, edit, or write into a vault this install didn't create.
 
 **If this is a fresh start**, tell the person, briefly, before asking
 anything: it usually takes 15 to 30 minutes of their attention (some of it
-runs in the background afterward), and they'll see something like 10
-approval prompts along the way (cloning this repo, trusting it so
-`bin/confidant` can run without asking every time, one prompt per
-scheduled agent you create, and one for the wake schedule if they want
-it). Also tell them none of these approvals sends, posts or replies to
-anyone, so they should decline any prompt that would. Then move to
-**Setup**.
+runs in the background afterward), there is one restart of the ChatGPT app
+in the middle, and they'll see something like 12 approval prompts along the
+way (cloning this repo, trusting it so `bin/confidant` can run without
+asking every time, creating a project for their vault, one prompt per
+scheduled agent you create, and one for the wake schedule if they want it).
+Also tell them none of these approvals sends, posts or replies to anyone,
+so they should decline any prompt that would. Then move to **Setup**.
 
-## Setup (state: `start` → `setup`)
+## Setup (`config phase setup`)
 
 Ask **one** message that gathers all of this together:
 
 - their role: founder, agency, consultant, investor, sales, executive, or
   recruiter;
 - what time they want their morning brief (default 06:45);
-- their language, en or es; and
+- their language, en or es;
 - what it should never see: default to banking, health, and passwords, and
   ask them to name any family chats or specific people or clients (for
-  example someone under an NDA) to leave out completely.
+  example someone under an NDA) to leave out completely; and
+- which tools they use for work, in their own words: email (and which
+  accounts), calendar, Slack, WhatsApp, a notetaker (Fathom, Fireflies,
+  Granola, Read.ai, Grain, tl;dv, Zoom, Google Meet notes, Plaud), voice
+  memos, Wispr Flow. This is only a starting list: the Connect step also
+  finds everything already on the Mac, so they don't need to remember it all.
 
 If the prompt they pasted included a "My blueprint:" line, prefill your
 question with those values so they're just confirming or adjusting, not
@@ -75,8 +86,9 @@ email addresses, keywords, or whole accounts they name go in
 <HH:MM> --language en|es`, adding one repeatable flag per item they named:
 `--exclude-category`, `--exclude-person`, `--exclude-chat`,
 `--exclude-domain`, `--exclude-handle`, `--exclude-keyword`, or
-`--exclude-email-account`. Save the "blueprint" line's values for later,
-since they also shape the scheduled tasks.
+`--exclude-email-account`. Keep their list of tools for Connect, and the
+"blueprint" line's values for later, since they also shape the scheduled
+tasks.
 
 If the person names a new exclusion later, after the vault already exists,
 run `bin/confidant init --role <role> --resume` again with just the new
@@ -84,84 +96,172 @@ run `bin/confidant init --role <role> --resume` again with just the new
 `.confidant/config.json`'s `exclusions` and touches nothing else in the
 vault.
 
-## Connect (state: `setup` → `connect`)
+## Connect (`config phase connect`)
 
-Show **one** connect list, in this order, and only for sources the person
-actually says they want:
+The goal is every tool they use connected, not only the ones they
+remembered to name. Work in this order.
 
-1. **Full Disk Access for ChatGPT.** Tell them to open System Settings,
-   then Privacy & Security, then Full Disk Access, and turn ChatGPT on.
-   This requires relaunching ChatGPT, which ends this conversation. Tell
-   them exactly that, and that they should come back afterward and say
-   "continue setting up my second brain."
-2. **Mail accounts.** If their email is already added to the Mac's Mail
-   app, that's the fastest path: their whole history is already local.
-   Otherwise ask if they'd like to add an account to Mail.
-3. **Codex apps**, for whichever of these they use and Mail doesn't
-   already cover: Gmail, Google Calendar, Google Drive, Slack.
-4. **WhatsApp.** Ask if they use WhatsApp for Mac (make sure it's signed
-   in), and whether they have older chats worth exporting; if so, tell
-   them to export each one and drop the file into
-   `.confidant/exports/whatsapp/` in the vault.
-5. **API keys**, only for the notetakers they actually use: Deepgram (for
-   transcribing phone call recordings and voice memos), Fathom, Fireflies,
-   Granola, Read.ai, Grain, tl;dv. For each, run
-   `bin/confidant keys set <name>`, which prompts for the key through a
-   hidden macOS dialog and never shows it in chat. Skip anything they
-   don't use. If they have a Plaud device, connect its Codex app instead.
+### 1. Find everything already on this Mac
 
-For every source, after you know its real status, record it:
-`bin/confidant config source --id <source> --status connected|partial|skipped|blocked|unused [--note "..."]`.
-Use `partial` when something connects but not fully (for example, Full
-Disk Access is still pending). Use `blocked` when the person needs to do
-something else first. Never mark a source `connected` before it actually
-is.
+Run `bin/confidant extract --probe --json`. It checks every source
+Confidant knows: iMessage and SMS, WhatsApp, Mail, Calendar, Contacts,
+call history, call recordings, Voice Memos, Wispr Flow, Zoom recordings,
+notetaker recap emails, and each notetaker's API key. For every source that
+probes `ok` and is not something they excluded, record it connected right
+away, without asking:
+`bin/confidant config source --id <source> --status connected`.
 
-## Extract (state: `connect` → `extract`)
+Sources that report `needsFullDiskAccess` wait for step 2. Sources whose
+app simply isn't on this Mac are `unused`, unless they named that tool in
+Setup (then it is `blocked`, with a note saying what's missing).
+
+### 2. One list of what they need to do, then one restart
+
+Two kinds of permission only take effect in a fresh ChatGPT chat after the
+app restarts: **Full Disk Access**, and **plugins** (Codex's connected apps).
+So gather both into **one** message, and have the person do everything in
+it before restarting, once:
+
+1. **Full Disk Access for ChatGPT**, if `doctor` said Messages or Mail
+   aren't readable: System Settings, then Privacy & Security, then Full
+   Disk Access, and turn ChatGPT on.
+2. **Plugins for the tools the Mac can't read on its own**, only for the
+   ones they use and that you don't already have tools for in this chat.
+   Check your own tools first: if Gmail, Google Calendar, Google Drive or
+   Slack tools are already available to you here, that plugin is already
+   installed and signed in.
+   - **Email.** If an account is already in the Mac's Mail app, it's
+     covered for free (its whole history is local). For any other Gmail or
+     Google Workspace account they want included, they install the
+     **Gmail** plugin.
+   - **Calendar.** If their Google calendar is already in the Mac's
+     Calendar app, it's covered. Otherwise the **Google Calendar** plugin.
+   - **Google Meet notes**: the **Google Drive** plugin.
+   - **Slack**: the **Slack** plugin.
+   - **Plaud**: its plugin or MCP server, if they have one.
+
+   How: in the ChatGPT app, open **Plugins** in the sidebar, search for the
+   name, select the plus button, and sign in when it asks. Nothing else to
+   configure; Confidant only ever reads through them.
+3. **WhatsApp**: if they use it, make sure WhatsApp for Mac is installed
+   and signed in. If they have older chats worth including from before
+   they used WhatsApp on this Mac, they can export each one and drop the
+   file into `.confidant/exports/whatsapp/` in the vault, now or any time.
+
+Then tell them exactly this: quit ChatGPT completely (ChatGPT menu, then
+Quit), open it again, start a new chat, and say "continue setting up my
+second brain." Record progress first with `bin/confidant config phase
+setup` if you haven't, and each source still waiting on this restart as
+`partial` with a note (for example `--note "waiting for Full Disk Access"`),
+so the resume picks up here.
+
+If there is nothing in this list to do (Full Disk Access already on, no
+plugins needed), skip the restart and carry on.
+
+### 3. After the restart (or right away if none was needed)
+
+1. Run `bin/confidant extract --probe --json` again, and record every
+   source that now probes `ok` as `connected`.
+2. For each plugin they installed, confirm you can see its tools in this
+   chat, then make one small read (list one recent email, one calendar
+   event, one file in the "Google Meet" folder, one Slack conversation).
+   Only after that read works, record it:
+   `bin/confidant config source --id gmail|gcal|drive|slack|plaud --status connected`.
+   If the tools aren't there, the plugin isn't installed or signed in:
+   record `blocked` with a note, and tell them plainly what to do.
+3. **API keys**, only for the notetakers they actually use and that aren't
+   already `ok`: Deepgram (for transcribing phone call recordings, voice
+   memos and Zoom recordings), Fathom, Fireflies, Granola, Read.ai, Grain,
+   tl;dv. For each, follow `recipes/keys.md`: run `bin/confidant keys set
+   <name>`, which asks for the key through a hidden macOS dialog and never
+   shows it in chat, then probe that source again and record it only once
+   it probes `ok`.
+
+Use `partial` when something connects but not fully, `blocked` when the
+person needs to do something else first, `skipped` when they chose not to,
+and `unused` for tools they don't have. Never mark a source `connected`
+before it actually is. Finish this step with one short list, in their
+language, of everything connected and anything still blocked and why.
+
+## Extract (`config phase extract`)
 
 Run `bin/confidant extract` for the deterministic local and API sources
 (iMessage, WhatsApp, Mail, Calendar, Contacts, calls, call recordings,
-voice memos, notetaker APIs). It's incremental and safe to re-run.
+voice memos, Wispr Flow, Zoom, notetaker APIs). It's incremental and safe
+to re-run.
 
-Then, for each connected Codex app (Gmail, Google Calendar, Google Drive,
-Slack, Plaud), follow the matching recipe file in `recipes/` next to this
-one. Each recipe tells you what to read through that app and how to hand
-the records to `bin/confidant ingest`.
+Then, for each connected plugin (Gmail, Google Calendar, Google Drive,
+Slack, Plaud), follow the "During the install" section of the matching
+recipe file in `recipes/` next to this one. Each recipe tells you what to
+read through that app and how to hand the records to `bin/confidant
+ingest`. The recipes cap how much to read now; the 3-hour Brain Update
+keeps every connected plugin current afterward, using the same recipes.
 
-## Sort (state: `extract` → `sort`)
+## Sort (`config phase sort`)
 
 Follow `.agents/skills/confidant-sort/SKILL.md` with `scope: install`. It
 sorts the most recent 60 days: identity, then dossiers, then batches that
 you or a subagent write contributions for, then merge, then mocs.
 
 Tell the person the rest of their history keeps filling in automatically,
-newest first and all the way back to the beginning, roughly every 3 hours, once the scheduled tasks below are
-running.
+newest first and all the way back to the beginning, roughly every 3 hours,
+once the scheduled tasks below are running.
 
 If you hit a usage or rate limit partway through sorting, stop cleanly,
 note where you left off, and plan to create the temporary `finish_sorting`
 task below (`tasks spec --include-finish`) so it picks up the rest later.
 
-## Tasks (state: `sort` → `tasks`)
+## Tasks (`config phase tasks`)
 
-Run `bin/confidant tasks spec --json`. It returns one entry per scheduled
-agent (`key`, `name`, `rrule`, `prompt`, `notify`, `cwd`, and sometimes
-`fallbackRrules`), already scaled to the brief time and role you set up.
-For each entry:
+Confidant's agents are **standalone scheduled tasks** that run in the vault
+folder. Each run starts its own chat, which the person reads in
+**Scheduled** in the ChatGPT app, with the full brief right there in the
+chat. They are never heartbeats attached to this chat: a heartbeat runs
+inside one existing chat and its results can disappear from view.
 
-1. Create it with the `automation_update` tool: mode `create`, status
-   `ACTIVE`, execution environment `local`, `cwd` set to the vault, no
-   model pinned, and the entry's `prompt`.
-2. If the rule is rejected, retry using `fallbackRrules` one at a time
-   (this may mean creating more than one task for that key).
-3. Record every automation you created:
-   `bin/confidant tasks record --key <key> --id <automation id>`.
+1. **Give the vault its own project.** Call `list_projects` and look for a
+   project whose folder is the vault. If there isn't one, call
+   `create_project` with `name` "Second Brain" ("Segundo cerebro" in
+   Spanish) and `sources` set to the vault's absolute path (the person
+   asked for this setup, so they asked for this project). If the folder
+   isn't allowed, ask the person to add it themselves (in the sidebar,
+   add a new project and choose the vault folder), then call
+   `list_projects` again. Keep its `projectId`.
+2. **Get the specs.** Run `bin/confidant tasks spec --json`. It returns one
+   entry per agent, already scaled to their brief time and role. Run
+   `bin/confidant tasks list --json` too, and skip any key already
+   recorded, so a resumed install never creates a task twice.
+3. **Create each one** with the `automation_update` tool, passing every
+   field exactly as the spec gives it:
+   - `mode`: `create`
+   - `kind`: `cron` (the spec says so; never leave it out, since the tool
+     otherwise defaults to a heartbeat on this chat)
+   - `projectId`: the vault project's id from step 1
+   - `executionEnvironment`: `local`
+   - `name`, `prompt`, `rrule`, `status` and `reasoningEffort`: from the
+     spec
+   - `notificationPolicy`: only when the spec's value isn't null
+   - `model`: the tool requires one for this kind of task. Use the model
+     this chat is running on. GPT-5.5 retires on October 14, 2026, so if
+     that is this chat's model, use GPT-6 Sol (`gpt-6-sol`) when their plan
+     offers it. Never pick one on your own preference.
+
+   If a rule is rejected, retry using the entry's `fallbackRrules` one at a
+   time (this may mean creating more than one task for that key).
+4. **Record every task you created**, one call per automation:
+   `bin/confidant tasks record --key <key> --id <automation id> [--rrule <the rule you used>]`.
+5. **Verify.** Run `bin/confidant tasks verify --json`. It reads the
+   ChatGPT app's own records and reports, per task, whether it exists, is
+   active, runs in the vault, and is a standalone task. Fix anything it
+   flags (a `heartbeat` or `wrong_folder` task: delete it with
+   `automation_update` mode `delete`, `tasks forget --id <id>`, and create
+   it again as above) and run it once more. Only tasks it reports `ok`
+   count as scheduled.
 
 If sorting hit a usage limit above, also create `finish_sorting` (get its
-spec with `bin/confidant tasks spec --include-finish --json`) the same
-way.
+spec with `bin/confidant tasks spec --include-finish --json`) the same way.
 
-## Config (state: `tasks` → `finish`)
+## Config (`config phase finish`)
 
 1. `bin/confidant config sandbox` writes the vault's own sandbox rules
    (workspace-write, no browsing, no destructive app tools). Review what
@@ -177,7 +277,7 @@ way.
    automatically at login** (`bin/confidant config login-item --yes`).
    Skip whichever they decline.
 
-## Finish (state: `finish` → `done`)
+## Finish (`config phase done`)
 
 1. Run `bin/confidant welcome --open`. It writes `Confidant Guide.html`
    (or `Guía de Confidant.html` in Spanish) inside the vault and opens it.
@@ -186,12 +286,13 @@ way.
    `obsidian://open?path=<url-encoded vault path>`.
 3. Send one final chat message covering, plainly:
    - what's connected, with real counts, and what's still backfilling;
-   - the nine scheduled tasks (the six agents plus Health Check, Brain Cleanup
-     and Confidant Check-in) and when they run;
+   - the scheduled tasks `tasks verify` reported `ok` (the six agents plus
+     Health Check, Brain Cleanup and Confidant Check-in) and when they run;
    - anything skipped or blocked, and why;
-   - next steps: open Obsidian, check the Scheduled view in the ChatGPT
-     app tomorrow morning, and keep the Mac on and ChatGPT open so the
-     agents can run; and
+   - next steps: every brief shows up in full in **Scheduled** in the
+     ChatGPT app (their first Morning Chief of Staff arrives there at their
+     brief time on the next weekday) and is also saved in Obsidian; keep
+     the Mac on and ChatGPT open so the agents can run; and
    - "Questions? Email support@meetconfidant.com."
 
 Only ever report real, verified status. `bin/confidant status --json`
@@ -201,7 +302,54 @@ before sending that message.
 ## Resuming
 
 If the person says anything like "continue setting up my second brain,"
-re-read `.confidant/state.json` in the vault (or run `bin/confidant doctor
---json` to find it) and pick up at its `phase`, using the matching section
-above. Don't redo a finished phase, and don't recreate a vault that
-already exists.
+run `bin/confidant doctor --json` to find the vault, then read its
+`.confidant/state.json`. `phase` is the last step recorded as finished;
+continue with the one after it:
+
+| `phase` | Continue with |
+|---|---|
+| `start` or missing | Setup |
+| `setup` | Connect (step 3 if they just restarted for Full Disk Access or plugins) |
+| `connect` | Extract |
+| `extract` | Sort |
+| `sort` | Tasks |
+| `tasks` | Config |
+| `finish` | Finish |
+| `done` | Nothing to install. Run `tasks verify` and `status`, and help with whatever they asked. |
+
+Don't redo a finished step, and don't recreate a vault that already
+exists.
+
+## Upgrading
+
+For a person whose second brain is already set up, when they ask to
+upgrade or update Confidant. Nothing in their notes changes; this refreshes
+Confidant's own engine and brings every scheduled task up to date.
+
+1. Run `bin/confidant doctor --json` to find their vault, then
+   `bin/confidant init --resume --vault <vault>` from this repo. It copies
+   this version's engine, prompts and skills into the vault and leaves
+   their notes, config and history alone.
+2. Run `bin/confidant tasks verify --vault <vault> --json` and
+   `bin/confidant tasks spec --vault <vault> --json`.
+3. Make sure the vault has its own project (**Tasks** step 1).
+4. For each task `verify` reports:
+   - `ok`: call `automation_update` with `mode` `update`, its `id`, `kind`
+     `cron`, the vault's `projectId`, `executionEnvironment` `local`, and
+     `name`, `prompt`, `rrule`, `status`, `reasoningEffort` and (when not
+     null) `notificationPolicy` from the spec entry with the same key.
+     Keep its current `model`.
+   - `heartbeat` or `wrong_folder`: delete it (`automation_update` mode
+     `delete`), run `bin/confidant tasks forget --id <id>`, and create it
+     again as in **Tasks** step 3, then record it.
+   - `not_found`: `tasks forget --id <id>`, then create and record it.
+   - `paused`: update it as for `ok`, but keep its status `PAUSED`; the
+     person paused it on purpose.
+   Create any key `verify` lists under "Not created yet" the same way.
+5. Run `tasks verify` again, then, if they use Gmail, Google Calendar,
+   Google Drive, Slack or Plaud and those aren't recorded yet, walk through
+   **Connect** steps 2 and 3 for just those.
+6. Tell them, in two or three plain sentences, what changed: every
+   scheduled run now shows its full brief in Scheduled, the connected apps
+   refresh every 3 hours, and anything still blocked.
+

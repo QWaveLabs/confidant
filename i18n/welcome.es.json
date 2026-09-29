@@ -31,7 +31,7 @@
       "heading": "Cómo usarlo",
       "obsidian": "Abre el segundo cerebro en Obsidian para leer y buscar todo lo que sabe: {link}",
       "briefs": "Tu resumen matutino y tu revisión semanal llegan a la carpeta {folder} como notas normales.",
-      "scheduled": "Cada ejecución de un agente aparece en la vista Programado dentro de la app de ChatGPT, así ves qué corrió y cuándo.",
+      "scheduled": "Cada ejecución de un agente aparece en la vista Programado dentro de la app de ChatGPT con el resumen completo en el chat, y el mismo resumen queda guardado en tu Segundo cerebro.",
       "ask": "Abre este segundo cerebro como proyecto en Codex y simplemente pregunta. Algunas cosas que la gente pregunta:",
       "examples": [
         "¿Qué se me está escapando?",

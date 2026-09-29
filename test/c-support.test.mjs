@@ -1,11 +1,15 @@
 import { homedir } from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run, sanitizeDiagnostics, statusCounts, collectDiagnostics, checkRateLimit } from '../engine/support.mjs';
 import { fakeCtx, mockFetch } from './c-shared.test.mjs';
+
+// The version the payload carries is whatever package.json says, so a
+// release bump never breaks this test.
+const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 function tempMessage(text) {
   const dir = mkdtempSync(join(tmpdir(), 'cf-support-'));
@@ -161,7 +165,7 @@ test('--send --yes posts the exact payload and records the send for the rate lim
   assert.equal(code, 0);
   assert.equal(fetchImpl.calls.length, 1);
   const body = JSON.parse(fetchImpl.calls[0].opts.body);
-  assert.deepEqual(body, { install_id: 'inst_1', kind: 'support', message: 'It crashed.', diagnostics: null, version: '2.0.0-dev', language: 'en' });
+  assert.deepEqual(body, { install_id: 'inst_1', kind: 'support', message: 'It crashed.', diagnostics: null, version: PKG_VERSION, language: 'en' });
   const out = ctx.log.out_.at(-1);
   assert.equal(out.sent, true);
   assert.equal(ctx.state.support.sent.length, 1);

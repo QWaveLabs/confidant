@@ -15,6 +15,7 @@ export const COMMANDS = {
   init: { module: './init.mjs', needsVault: false, help: 'Create a new vault (never reuses an existing second brain)' },
   extract: { module: './extract/index.mjs', needsVault: true, help: 'Pull new records from local and API sources' },
   ingest: { module: './ingest.mjs', needsVault: true, help: 'Store records Codex read through a connected app' },
+  apps: { module: './apps.mjs', needsVault: true, help: 'Connected Codex apps to refresh this run, with their recipes and saved cursors' },
   identity: { module: './identity.mjs', needsVault: true, help: 'Work out who is who across every source' },
   dossiers: { module: './dossiers.mjs', needsVault: true, help: 'Build per-person, per-thread and per-meeting context' },
   batch: { module: './batch.mjs', needsVault: true, help: 'Plan the next sorting batches for Codex' },

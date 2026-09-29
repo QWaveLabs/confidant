@@ -31,18 +31,26 @@ left off, from `.confidant/state.json` in their vault.
 ## How the install works
 
 1. **Setup.** One message: role, brief time, language, what to never touch.
-2. **Connect.** One list, in order: Full Disk Access, Mail accounts, Codex
-   apps (Gmail, Google Calendar, Google Drive, Slack), WhatsApp, and API keys
-   for whichever notetakers the person uses.
+2. **Connect.** `bin/confidant extract --probe` finds every source already
+   on the Mac and connects it. Then one list covers Full Disk Access and the
+   plugins for Gmail, Google Calendar, Google Drive, Slack and Plaud, done
+   before a single ChatGPT restart, then API keys for whichever notetakers
+   the person uses. Nothing is recorded as connected until it actually
+   reads.
 3. **Extract.** Local and API sources go through deterministic code
    (`bin/confidant extract`); connected Codex apps go through
    `bin/confidant ingest`, guided by the recipes in
-   `.agents/skills/confidant-install/recipes/`.
+   `.agents/skills/confidant-install/recipes/`. The 3-hour Brain Update
+   refreshes those apps too (`bin/confidant apps` lists them with their
+   saved cursors), so they never go stale after the install.
 4. **Sort.** `.agents/skills/confidant-sort/SKILL.md` builds identity,
    dossiers, and notes for the most recent 60 days. The rest of the person's
    history keeps filling in afterward, newest first and all the way back, roughly every 3 hours.
-5. **Tasks.** Nine scheduled tasks are created with the ChatGPT app's own
-   `automation_update` tool, running against the vault.
+5. **Tasks.** Nine standalone scheduled tasks are created with the ChatGPT
+   app's own `automation_update` tool on the vault's own project, then
+   checked with `bin/confidant tasks verify`. Every run is its own chat in
+   Scheduled, and that chat shows the full brief, not just a note that it
+   was saved to Obsidian.
 6. **Config.** The vault gets its own sandboxed `.codex/config.toml`
    (workspace-write, no browsing, no destructive app tools), the project is
    marked trusted, and an optional wake schedule and login item are set up.

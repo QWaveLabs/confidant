@@ -1,14 +1,18 @@
 {
-  "$comment": "Output of `confidant tasks spec --json`: one entry per scheduled task the install skill creates with automation_update (mode create, status ACTIVE, executionEnvironment local, cwd = vault).",
+  "$comment": "Output of `confidant tasks spec --json`: one entry per scheduled task the install skill creates with automation_update. kind, name, rrule, prompt, status, executionEnvironment, reasoningEffort and notificationPolicy (when not null) are passed to that tool as is; cwd is the vault, whose Codex project id goes in projectId.",
   "type": "array",
   "items": {
     "type": "object",
     "required": [
       "key",
+      "kind",
       "name",
       "rrule",
       "prompt",
-      "notify",
+      "status",
+      "executionEnvironment",
+      "reasoningEffort",
+      "notificationPolicy",
       "cwd"
     ],
     "additionalProperties": false,
@@ -26,6 +30,10 @@
           "check_in",
           "finish_sorting"
         ]
+      },
+      "kind": {
+        "const": "cron",
+        "$comment": "standalone: every run is its own chat in Scheduled; never heartbeat"
       },
       "name": {
         "type": "string"
@@ -45,11 +53,25 @@
         "type": "string",
         "minLength": 40
       },
-      "notify": {
+      "status": {
+        "const": "ACTIVE"
+      },
+      "executionEnvironment": {
+        "const": "local"
+      },
+      "reasoningEffort": {
         "enum": [
-          "heartbeat",
-          "failed_runs_only"
+          "low",
+          "medium",
+          "high"
         ]
+      },
+      "notificationPolicy": {
+        "enum": [
+          null,
+          "failed_runs_only"
+        ],
+        "$comment": "null keeps Codex's default notifications; failed_runs_only still lists every run in Scheduled"
       },
       "cwd": {
         "type": "string"

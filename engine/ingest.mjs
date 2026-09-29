@@ -299,6 +299,28 @@ function mapPlaud(item) {
 
 const MAPPERS = { gmail: mapGmail, gcal: mapGcal, drive: mapDrive, slack: mapSlack, plaud: mapPlaud };
 
+// `<source>_live` is the newest item already stored, so the next 3-hour run
+// fetches only what is newer (see `confidant apps`). It only moves forward,
+// counts items the privacy filter left out (they were fetched too), and is
+// skipped for Calendar, whose future events would push it past today; the
+// calendar recipe re-reads a fixed window around today instead. An explicit
+// --cursor-key <source>_live from the caller wins.
+function advanceLiveCursor(ctx, source, records, explicitKey) {
+  const key = `${source}_live`;
+  if (source === 'gcal' || explicitKey === key || !records.length) return null;
+  const nowMs = Date.now();
+  const newest = records.reduce((max, r) => {
+    const ms = Date.parse(r.ts);
+    return Number.isFinite(ms) && ms <= nowMs && ms > max ? ms : max;
+  }, 0);
+  if (!newest) return null;
+  const current = Date.parse(ctx.store.getCursor(key) ?? '');
+  if (Number.isFinite(current) && current >= newest) return null;
+  const value = new Date(newest).toISOString();
+  ctx.store.setCursor(key, value);
+  return value;
+}
+
 export async function run(args, ctx) {
   const source = args.source;
   if (!source || !MAPPERS[source]) {
@@ -354,6 +376,8 @@ export async function run(args, ctx) {
     totals.updated = counts.updated;
     totals.unchanged = counts.unchanged;
     if (args.cursorKey) ctx.store.setCursor(String(args.cursorKey), args.cursorValue != null ? String(args.cursorValue) : new Date().toISOString());
+    const live = advanceLiveCursor(ctx, source, valid, args.cursorKey);
+    if (live) totals.live = live;
   } else {
     totals.inserted = keep.length;
   }

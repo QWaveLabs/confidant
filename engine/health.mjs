@@ -93,7 +93,9 @@ function checkTasks(ctx, strings, problems, opts = {}) {
   const byId = new Map(statuses.map((s) => [s.id, s]));
   return tasks.map((tsk) => {
     const row = byId.get(tsk.automation_id);
-    const ok = !!row && row.status === 'ACTIVE' && cwdsMatch(row.cwds, ctx.vault);
+    // A heartbeat task runs inside the install chat, where Codex can hide its
+    // results; Confidant's tasks must be standalone cron tasks on the vault.
+    const ok = !!row && row.status === 'ACTIVE' && row.kind !== 'heartbeat' && cwdsMatch(row.cwds, ctx.vault);
     if (!ok) {
       problems.push({
         area: `task:${tsk.key}`,

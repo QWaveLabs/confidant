@@ -1,4 +1,4 @@
-// `confidant config <sandbox|trust|wake|login-item|source> ...`
+// `confidant config <sandbox|trust|wake|login-item|source|phase> ...`
 // Sandbox, trust, wake schedule and login item setup, plus recording a
 // source's real status in config.json. Every subcommand supports --dry-run
 // and prints exactly what it will change before it changes anything.
@@ -149,6 +149,28 @@ function runSource(args, ctx) {
   return 0;
 }
 
+// --- phase ----------------------------------------------------------------
+
+// Records the install step just finished, so a resumed install (after the
+// Full Disk Access relaunch, or a usage limit) knows where to pick up.
+export const PHASES = ['start', 'setup', 'connect', 'extract', 'sort', 'tasks', 'finish', 'done'];
+
+function runPhase(args, ctx) {
+  const phase = args._[1];
+  if (!PHASES.includes(phase)) {
+    ctx.log.error(`Use: confidant config phase <${PHASES.join('|')}>`);
+    return 2;
+  }
+  const state = ctx.state ?? { phase: 'start', history: [] };
+  const next = { ...state, phase, history: [...(state.history ?? []), { phase, at: new Date().toISOString() }] };
+  if (!ctx.dryRun) {
+    ctx.state = next;
+    ctx.saveState();
+  }
+  ctx.log.out({ phase }, () => `Install step recorded: ${phase}\n`);
+  return 0;
+}
+
 export async function run(args, ctx, deps = {}) {
   const sub = args._[0];
   switch (sub) {
@@ -157,8 +179,9 @@ export async function run(args, ctx, deps = {}) {
     case 'wake': return runWake(args, ctx, deps);
     case 'login-item': return runLoginItem(args, ctx, deps);
     case 'source': return runSource(args, ctx);
+    case 'phase': return runPhase(args, ctx);
     default:
-      ctx.log.error(`Unknown "confidant config ${sub ?? ''}". Use sandbox, trust, wake, login-item or source.`);
+      ctx.log.error(`Unknown "confidant config ${sub ?? ''}". Use sandbox, trust, wake, login-item, source or phase.`);
       return 2;
   }
 }

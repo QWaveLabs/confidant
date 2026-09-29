@@ -68,6 +68,11 @@ function rawSlots(config, { includeFinish = false } = {}) {
   const { hour: briefHour, minute: briefMinute } = parseTime(config?.briefTime);
   const meetingHours = meetingPrepHours(config?.meetingsPerWeek);
   const scan = shiftMinutes(briefHour, briefMinute, -15);
+  // notificationPolicy is the Codex automation setting of the same name.
+  // null keeps Codex's default: every finished run lands in Scheduled and
+  // raises a desktop notification. 'failed_runs_only' still lands every run
+  // in Scheduled but only notifies when a run fails; it is for the two tasks
+  // that run eight times a day, so they never bury the briefs.
   const out = [
     // Every 3 hours, every day, at :10 rather than on the hour: that keeps
     // this off every fixed single-time task's own minute (follow_up_radar
@@ -76,23 +81,23 @@ function rawSlots(config, { includeFinish = false } = {}) {
     // of the 06:30 scanner and the 06:45 brief. The HOURLY;INTERVAL=3
     // fallback cannot carry this :10 offset (there is no DTSTART): it
     // anchors to whatever minute the automation is created at instead.
-    { key: 'brain_update', notify: 'heartbeat', days: ALL_DAYS, hours: [0, 3, 6, 9, 12, 15, 18, 21], minute: 10, fallback: 'hourly3' },
+    { key: 'brain_update', notificationPolicy: 'failed_runs_only', days: ALL_DAYS, hours: [0, 3, 6, 9, 12, 15, 18, 21], minute: 10, fallback: 'hourly3' },
     // The person's own chosen time. Kept exact unless it truly collides.
-    { key: 'morning_brief', notify: 'heartbeat', days: WEEKDAYS, hours: [briefHour], minute: briefMinute },
-    { key: 'meeting_prep', notify: 'heartbeat', days: WEEKDAYS, hours: meetingHours, minute: 30, fallback: 'split' },
-    { key: 'follow_up_radar', notify: 'heartbeat', days: WEEKDAYS, hours: [16], minute: 0 },
-    { key: 'weekly_review', notify: 'heartbeat', days: ['FR'], hours: [15], minute: 0 },
-    { key: 'health_check', notify: 'heartbeat', days: ALL_DAYS, hours: [8], minute: 20 },
-    { key: 'brain_cleanup', notify: 'heartbeat', days: ['SU'], hours: [20], minute: 40 },
-    { key: 'check_in', notify: 'heartbeat', days: ['TH'], hours: [11], minute: 40 },
+    { key: 'morning_brief', notificationPolicy: null, days: WEEKDAYS, hours: [briefHour], minute: briefMinute },
+    { key: 'meeting_prep', notificationPolicy: null, days: WEEKDAYS, hours: meetingHours, minute: 30, fallback: 'split' },
+    { key: 'follow_up_radar', notificationPolicy: null, days: WEEKDAYS, hours: [16], minute: 0 },
+    { key: 'weekly_review', notificationPolicy: null, days: ['FR'], hours: [15], minute: 0 },
+    { key: 'health_check', notificationPolicy: null, days: ALL_DAYS, hours: [8], minute: 20 },
+    { key: 'brain_cleanup', notificationPolicy: null, days: ['SU'], hours: [20], minute: 40 },
+    { key: 'check_in', notificationPolicy: null, days: ['TH'], hours: [11], minute: 40 },
     // Derived from the brief time, so it is the one most free to move.
-    { key: 'opportunity_scanner', notify: 'heartbeat', days: WEEKDAYS, hours: [scan.hour], minute: scan.minute },
+    { key: 'opportunity_scanner', notificationPolicy: null, days: WEEKDAYS, hours: [scan.hour], minute: scan.minute },
   ];
   if (includeFinish) {
     // Offset 90 minutes from brain_update's own every-3-hours grid, so the
     // two never collide by construction: hours differ (1,4,7... vs 0,3,6...)
     // even where a minute nudge later lands them on the same minute.
-    out.push({ key: 'finish_sorting', notify: 'heartbeat', days: ALL_DAYS, hours: [1, 4, 7, 10, 13, 16, 19, 22], minute: 30, fallback: 'hourly3', temporary: true });
+    out.push({ key: 'finish_sorting', notificationPolicy: 'failed_runs_only', days: ALL_DAYS, hours: [1, 4, 7, 10, 13, 16, 19, 22], minute: 30, fallback: 'hourly3', temporary: true });
   }
   return out;
 }
@@ -110,7 +115,7 @@ export function buildSchedule(config, opts = {}) {
       : undefined;
     return {
       key: s.key,
-      notify: s.notify,
+      notificationPolicy: s.notificationPolicy ?? null,
       days: s.days,
       hours: s.hours,
       minute,

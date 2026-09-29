@@ -23,3 +23,16 @@ entirely: role is one of founder, agency, consultant, investor, sales,
 executive or recruiter; brief is the time of day for the morning brief,
 HH:MM; language is en or es; never is a plain list of anything that should
 always stay out (banking, health, a family chat's name, a client under NDA).
+
+## Upgrading someone who already has it
+
+Send this instead to a person whose second brain is already set up. It
+refreshes Confidant's engine and brings their scheduled tasks up to date
+without touching their notes.
+
+> I already have my Confidant second brain. Please clone {REPO_URL} at tag
+> {TAG} into a safe local folder, and check that its latest commit is exactly
+> {SHA}. If it isn't, stop and tell me instead of continuing. Then open the
+> folder and follow its AGENTS.md instructions to upgrade my second brain.
+> Keep every source read-only, never send, post or reply to anything on my
+> behalf, and tell me plainly what changed when you're done.

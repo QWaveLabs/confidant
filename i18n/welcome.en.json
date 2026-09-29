@@ -31,7 +31,7 @@
       "heading": "How to use it",
       "obsidian": "Open the vault in Obsidian to read and search everything it knows: {link}",
       "briefs": "Your morning brief and weekly review land in the {folder} folder as plain notes.",
-      "scheduled": "Every agent run shows up in the Scheduled view inside the ChatGPT app, so you can see what ran and when.",
+      "scheduled": "Every agent run shows up in the Scheduled view inside the ChatGPT app with the full brief right in the chat, and the same brief is saved in your Second Brain.",
       "ask": "Open this vault as a project in Codex and just ask. A few things people ask:",
       "examples": [
         "What am I forgetting?",

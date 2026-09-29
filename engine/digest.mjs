@@ -19,7 +19,8 @@ import { scrubText } from './privacy.mjs';
 
 // Record text quoted in a digest: one line, masked (cards, codes, passwords),
 // then clipped. Newlines are gone so a message cannot fake a heading or a
-// heartbeat block; the task reads it as data.
+// line of its own (an `::inbox-item` directive, say); the task reads it as
+// data.
 function quote(s, n) {
   return scrubText(String(s ?? '').replace(/\s+/g, ' ').trim()).text.slice(0, n);
 }

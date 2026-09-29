@@ -12,15 +12,18 @@ Codex clones this repo (pinned tag + SHA) and follows `AGENTS.md` and
 
 1. It asks one setup message: role, brief time, exclusions and language.
    A pasted "My blueprint:" line fills these in.
-2. It shows one connect list: Full Disk Access, Mail accounts, Codex apps,
-   and API keys.
+2. It connects everything: `extract --probe` finds every source already on
+   the Mac, then one list covers Full Disk Access and the plugins (Gmail,
+   Google Calendar, Google Drive, Slack, Plaud) before a single ChatGPT
+   restart, then API keys. Each step is recorded with `config phase`.
 3. It extracts everything: local and API sources go through deterministic
    code, and the Codex apps go through `confidant ingest`.
 4. It sorts: `identity`, then `dossiers`, then `batch next`. Codex subagents
    write contributions, then `merge`, then `mocs`. The install sorts the most
    recent 60 days. The 3-hour Brain Update drains the rest of the history,
    newest first.
-5. It creates the scheduled tasks (ACTIVE) and sets up the sandbox, trust,
+5. It creates the scheduled tasks (standalone cron tasks on the vault's
+   own Codex project, ACTIVE, verified with `tasks verify`) and sets up the sandbox, trust,
    wake schedule and login item. It writes `Confidant Guide.html`, then
    summarizes in chat with next steps and support@meetconfidant.com.
 
@@ -304,14 +307,27 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 
 ## Scheduled tasks (D)
 
+- Every task is a **standalone scheduled task** (`kind: cron` in Codex) on
+  the vault's own Codex project, never a heartbeat attached to a chat. Each
+  run starts its own chat, listed in **Scheduled** in the ChatGPT app, and
+  that chat is what the person reads.
 - `confidant tasks spec --json` returns `schemas/task.schema.json` entries.
-  The install skill creates each one with `automation_update`:
-  - mode create
-  - status ACTIVE
-  - execution environment local
-  - cwd = vault
-  - no model pinned
-- After each create it runs `confidant tasks record --key <k> --id <automation id>`.
+  The install skill makes sure the vault has a Codex project
+  (`list_projects`, else `create_project` with the vault folder), then
+  creates each task with `automation_update`, passing the spec's fields as
+  is:
+  - mode create, kind cron, projectId = the vault project
+  - name, prompt, rrule, status ACTIVE, executionEnvironment local,
+    reasoningEffort
+  - notificationPolicy only when not null (`failed_runs_only` for
+    brain_update and finish_sorting, the two that run eight times a day;
+    every run is still listed in Scheduled)
+  - model: the tool requires one for cron tasks; the chat's own model
+- After each create it runs `confidant tasks record --key <k> --id <automation id> [--rrule <rule>]`
+  (a key can own several automations when its rule was split into
+  fallbacks), then `confidant tasks verify --json`, which reads Codex's own
+  `automations` table and flags `not_found`, `heartbeat`, `paused` and
+  `wrong_folder`. `confidant tasks forget --id <id>` drops a stale record.
 - Task keys:
   - `brain_update`: "Commitment Tracker + Brain Update", every 3 hours at :10 (00:10, 03:10, 06:10 ... so it never collides with tasks on the hour)
   - `opportunity_scanner`: weekdays, brief time minus 15 minutes
@@ -319,19 +335,36 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   - `meeting_prep`: weekdays at :30, scaled by meetingsPerWeek
   - `follow_up_radar`: weekdays at 16:00
   - `weekly_review`: "Weekly CEO Review", Fridays at 15:00
-  - `health_check`: "Health Check", daily 08:20, silent unless something is broken
+  - `health_check`: "Health Check", daily 08:20, a one-line all clear unless something is broken
   - `brain_cleanup`: "Brain Cleanup", Sundays 20:40
   - `check_in`: "Confidant Check-in", Thursdays 11:40, decides each week whether to speak (first impressions, one improvement question every 2 weeks, monthly value receipt, gentle nudge when usage is low)
   - `finish_sorting`: temporary, only if the install hit usage limits
-- Every task prompt ends with the heartbeat block:
-  `<heartbeat><decision>NOTIFY|DONT_NOTIFY</decision><message>one line</message></heartbeat>`.
+- **What a run shows.** Every task prompt ends with a "Your reply in this
+  chat" section: the run's final reply carries the result itself (the
+  whole brief for morning_brief, follow_up_radar, meeting_prep,
+  opportunity_scanner and weekly_review; a short receipt or message for the
+  rest), in plain Markdown with plain names instead of wikilinks and one
+  absolute link to the note, and ends with exactly one line
+  `::inbox-item{title="..." summary="..."}`, which Codex requires of cron
+  runs and shows as the Scheduled entry. No `<heartbeat>` block: that
+  format is for heartbeat tasks only.
 - `confidant digest <key>` prints the run's context in markdown, 5 to 10K tokens.
-- `confidant update` is the brain update:
-  1. lock
-  2. extract every enabled local/api/derived source incrementally
-  3. identity, then dossiers with changedSince, then batch next (scope update, plus one backlog batch)
-  4. print the batches for Codex
-- `confidant update --finish` then runs `mocs` and writes `state.lastUpdate`.
+- `confidant apps --json` lists the connected Codex apps (gmail, gcal,
+  drive, slack, plaud) with their recipe path and saved cursors, and
+  `locked: true` when another run holds the vault lock. Cursors per app:
+  `<id>_live` (newest item stored; `ingest` moves it forward on its own,
+  except for gcal), `<id>_window` (oldest history window stored, or
+  `done`), `gcal_upcoming`, and `slack_<channel id>`. Each recipe has an
+  "Every 3 hours (Brain Update)" section: new items since `<id>_live`
+  first (for gcal, always yesterday through 14 days ahead), then one older
+  window.
+- The brain update run:
+  1. `confidant apps --json`, then each app's recipe, then `ingest`
+  2. `confidant update`: lock, extract every enabled local/api/derived
+     source incrementally, identity, dossiers with changedSince, batch next
+     (scope update, plus one backlog batch), print the batches for Codex
+  3. sort, `merge --batch <id>` each, then `confidant update --finish`,
+     which runs `mocs` and writes `state.lastUpdate`.
 
 ## Trust, cleanup, support (added 9/28)
 
@@ -345,7 +378,7 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 ## State (.confidant/state.json)
 
 ```
-{ phase: start|setup|connect|extract|sort|tasks|finish|done, history: [{phase, at}],
+{ phase: start|setup|connect|extract|sort|tasks|finish|done, history: [{phase, at}],   // last finished step, set by `config phase <name>`
   tasks: [{ key, name, rrule, automation_id, created_at }],
   backlog: { remaining_batches, oldest_sorted, done },
   lastUpdate: { at, inserted, merged }, welcome: { path, at }, install: { started_at, finished_at } }
