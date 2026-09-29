@@ -3,6 +3,15 @@
   "tagline": "Remembers everything. Keeps it close.",
   "subtitle": "Your private second brain is set up on this Mac. Here is what it does and how to use it.",
   "supportLine": "Questions? Email {email}.",
+  "stats": {
+    "sourcesConnected": "Sources connected",
+    "notesWritten": "Notes written",
+    "nextBrief": "Next morning brief",
+    "nextBriefNone": "Not scheduled yet",
+    "history": "History",
+    "stillFilling": "Still filling in your older history",
+    "caughtUp": "Fully caught up"
+  },
   "sections": {
     "whatItIs": {
       "heading": "What it is",
@@ -55,6 +64,10 @@
     },
     "troubleshooting": {
       "heading": "If something looks off",
+      "emailIntro": "Still stuck? Send the team a one-click email with a short summary attached: version, macOS, sources connected, last update. Never your messages, contacts or file names.",
+      "emailButton": "Email the Confidant team",
+      "emailSubject": "Confidant support",
+      "emailBody": "Describe what is happening here.",
       "items": [
         { "q": "A brief did not show up", "a": "Agents only run while this Mac is awake and the ChatGPT app is open. Check the Scheduled view in the ChatGPT app for the run and what it says." },
         { "q": "Full Disk Access turned off", "a": "Open System Settings, then Privacy & Security, then Full Disk Access, and turn ChatGPT back on. Relaunch ChatGPT, then tell Codex \"continue setting up my second brain\"." },
