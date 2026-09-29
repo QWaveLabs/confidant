@@ -90,6 +90,30 @@ test('the summary strip shows real counts, the next morning brief, and whether h
   ctx.close();
 });
 
+test('the "Email the Confidant team" button is a mailto link with a short, sanitized diagnostic summary and no content leak', () => {
+  const ctx = fixtureVault({
+    exclusions: { people: ['Secret Contact'] },
+  });
+  ctx.config.sources.gmail = { enabled: false, status: 'blocked', note: 'personal inbox, never send this note' };
+  ctx.state.lastUpdate = { at: new Date(ctx.now.getTime() - 3 * 3600 * 1000).toISOString(), inserted: 5, merged: 2 };
+  const { html } = renderGuide(ctx);
+  const m = html.match(/<a class="button" href="([^"]+)">([^<]+)<\/a>/);
+  assert.ok(m, 'the email button is present');
+  assert.equal(m[2], 'Email the Confidant team');
+  const mailto = m[1].replace(/&amp;/g, '&');
+  assert.match(mailto, /^mailto:support@meetconfidant\.com\?subject=/);
+  const body = decodeURIComponent(mailto.split('body=')[1]);
+  assert.match(body, /Version: /);
+  assert.match(body, /macOS: /);
+  assert.match(body, /Sources connected: \d/);
+  assert.match(body, /Last update: 3 hours ago/);
+  assert.match(body, /Known issues: Gmail/);
+  assert.ok(!body.includes('personal inbox, never send this note'), 'a source\'s freeform note never reaches the summary');
+  assert.ok(!body.includes('Secret Contact'), 'exclusion names never reach the summary');
+  assert.ok(!body.includes(ctx.vault), 'the raw absolute vault path never reaches the summary');
+  ctx.close();
+});
+
 test('the favicon is a self-contained inline SVG data URI, never a request for /favicon.ico', () => {
   const ctx = fixtureVault();
   const { html } = renderGuide(ctx);

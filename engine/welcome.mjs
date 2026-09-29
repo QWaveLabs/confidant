@@ -150,10 +150,72 @@ function buildPrivacy(tr, trInstall, ctx) {
   return section(tr('sections.privacy.heading'), inner);
 }
 
-function buildTroubleshooting(tr) {
+function readVersion() {
+  try {
+    return readJson(join(REPO_ROOT, 'package.json'), {}).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Same technique doctor.mjs uses for the rest of the system report, kept
+// small and local here rather than pulling in doctor's much heavier
+// Mail-account and Full-Disk-Access checks just for one line of a mailto
+// summary.
+function readMacOSVersion() {
+  try {
+    const xml = readFileSync('/System/Library/CoreServices/SystemVersion.plist', 'utf8');
+    return xml.match(/<key>ProductVersion<\/key>\s*<string>([^<]*)<\/string>/)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function relativeAge(iso, now, lang) {
+  if (!iso) return lang === 'es' ? 'nunca' : 'never';
+  const hours = Math.round((now.getTime() - new Date(iso).getTime()) / 3600000);
+  if (hours < 1) return lang === 'es' ? 'hace menos de una hora' : 'less than an hour ago';
+  if (hours < 24) return lang === 'es' ? `hace ${hours} horas` : `${hours} hours ago`;
+  const days = Math.round(hours / 24);
+  return lang === 'es' ? `hace ${days} días` : `${days} days ago`;
+}
+
+// A short, sanitized (no message content, no contacts, no file paths)
+// diagnostic summary for the one-click "Email the Confidant team" button:
+// version, macOS, sources connected, last update age, and any source the
+// person's own config already flags as blocked. Real data only.
+function buildDiagnosticSummary(ctx) {
+  const stats = summaryStats(ctx);
+  const blocked = sourceRows(ctx).filter((s) => s.status === 'blocked').map((s) => s.label);
+  const lang = ctx.lang === 'es' ? 'es' : 'en';
+  return {
+    version: readVersion() ?? (lang === 'es' ? 'desconocida' : 'unknown'),
+    macos: readMacOSVersion() ?? (lang === 'es' ? 'desconocido' : 'unknown'),
+    sourcesConnected: stats.sourcesConnected,
+    lastUpdateAge: relativeAge(ctx.state?.lastUpdate?.at, ctx.now, lang),
+    issues: blocked.length ? blocked.join(', ') : lang === 'es' ? 'ninguno conocido' : 'none known',
+  };
+}
+
+function supportMailtoLink(tr, ctx) {
+  const d = buildDiagnosticSummary(ctx);
+  const lines = ctx.lang === 'es'
+    ? [`Versión: ${d.version}`, `macOS: ${d.macos}`, `Fuentes conectadas: ${d.sourcesConnected}`, `Última actualización: ${d.lastUpdateAge}`, `Problemas conocidos: ${d.issues}`]
+    : [`Version: ${d.version}`, `macOS: ${d.macos}`, `Sources connected: ${d.sourcesConnected}`, `Last update: ${d.lastUpdateAge}`, `Known issues: ${d.issues}`];
+  const subject = tr('sections.troubleshooting.emailSubject');
+  const body = `${tr('sections.troubleshooting.emailBody')}\n\n${lines.join('\n')}`;
+  return `mailto:support@meetconfidant.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+function buildTroubleshooting(tr, ctx) {
   const items = tr('sections.troubleshooting.items').map((it) =>
     `        <p class="label">${escapeHtml(it.q)}</p>\n        <p class="muted">${escapeHtml(it.a)}</p>`).join('\n        <hr style="margin:14px 0">\n');
-  return section(tr('sections.troubleshooting.heading'), card(items));
+  const mailto = supportMailtoLink(tr, ctx);
+  const button = card(
+    `        <p class="muted">${escapeHtml(tr('sections.troubleshooting.emailIntro'))}</p>\n` +
+    `        <p><a class="button" href="${escapeHtml(mailto)}">${escapeHtml(tr('sections.troubleshooting.emailButton'))}</a></p>`,
+  );
+  return section(tr('sections.troubleshooting.heading'), `${card(items)}\n${button}`);
 }
 
 // Builds the full page. Pure aside from reading i18n/persona files and the
@@ -173,7 +235,7 @@ export function renderGuide(ctx) {
     buildConnected(tr, trInstall, ctx),
     buildFolders(tr, ctx, persona),
     buildPrivacy(tr, trInstall, ctx),
-    buildTroubleshooting(tr),
+    buildTroubleshooting(tr, ctx),
   ].join('\n');
 
   const shellPath = join(REPO_ROOT, 'templates', 'welcome', 'shell.html');

@@ -64,6 +64,10 @@
     },
     "troubleshooting": {
       "heading": "Si algo no se ve bien",
+      "emailIntro": "¿Sigue sin resolverse? Envía al equipo un correo con un clic y un resumen breve adjunto: versión, macOS, fuentes conectadas, última actualización. Nunca tus mensajes, contactos ni nombres de archivo.",
+      "emailButton": "Escribir al equipo de Confidant",
+      "emailSubject": "Soporte de Confidant",
+      "emailBody": "Describe aquí lo que está pasando.",
       "items": [
         { "q": "No llegó un resumen", "a": "Los agentes solo corren mientras esta Mac está encendida y la app de ChatGPT está abierta. Revisa la vista Programado en la app de ChatGPT para ver esa ejecución y qué dice." },
         { "q": "Se desactivó el Acceso completo al disco", "a": "Abre Ajustes del Sistema, luego Privacidad y Seguridad, luego Acceso completo al disco, y vuelve a activar ChatGPT. Reinicia ChatGPT y dile a Codex \"continúa configurando mi segundo cerebro\"." },
