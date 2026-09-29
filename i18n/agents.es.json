@@ -6,6 +6,9 @@
     "meeting_prep": "Preparación de reuniones",
     "follow_up_radar": "Radar de seguimiento",
     "weekly_review": "Revisión semanal de dirección",
+    "health_check": "Revisión de estado",
+    "brain_cleanup": "Limpieza del cerebro",
+    "check_in": "Seguimiento de Confidant",
     "finish_sorting": "Finalizar clasificación"
   },
   "headings": {
@@ -14,7 +17,8 @@
       "commitments": "Compromisos pendientes",
       "meetings": "Reuniones de hoy",
       "stalled": "Proyectos estancados",
-      "opportunities": "Oportunidades"
+      "opportunities": "Oportunidades",
+      "keepWarm": "Mantener el contacto"
     },
     "follow_up_radar": {
       "i_owe": "Yo debo",
@@ -61,6 +65,40 @@
   },
   "empty": "Nada que reportar.",
   "briefs": {
-    "weeklyFileName": "Semana del {date}"
+    "weeklyFileName": "Semana del {date}",
+    "cleanupFileName": "Limpieza {date}"
+  },
+  "health": {
+    "healthy": "Todo funciona bien.",
+    "neverUpdated": "La actualización del cerebro nunca se ha completado con éxito.",
+    "fixNeverUpdated": "Ejecuta `confidant update` una vez a mano para ver qué pasa, o revisa que la tarea programada de registro de compromisos y actualización del cerebro siga activa.",
+    "staleUpdate": "La última actualización exitosa fue hace {hours} horas.",
+    "fixStaleUpdate": "Ejecuta `confidant update` a mano, o revisa que la tarea programada de registro de compromisos y actualización del cerebro siga activa y no esté pausada.",
+    "sourceBroken": "{source} no se puede leer en este momento.",
+    "fixFullDiskAccess": "Otorga acceso total al disco a la app de ChatGPT en Ajustes del Sistema > Privacidad y Seguridad, luego ejecuta `confidant extract` de nuevo.",
+    "fixKey": "La clave de {source} parece inválida o falta. Ejecuta `confidant keys set {source}` con una clave nueva.",
+    "fixSourceGeneric": "Ejecuta `confidant extract --source {source} --probe` para ver el error exacto.",
+    "backlogStuck": "El pendiente de clasificación no ha avanzado en {days} días.",
+    "fixBacklogStuck": "Ejecuta `confidant update` a mano y lee lo que muestra; el pendiente solo crece si la fusión sigue fallando.",
+    "lowDisk": "Este Mac tiene poco espacio en disco.",
+    "fixLowDisk": "Libera espacio en este Mac. Confidant necesita espacio para que la base de datos de la bóveda siga creciendo.",
+    "notWritable": "No se puede escribir en la carpeta de la bóveda en este momento.",
+    "fixNotWritable": "Revisa que la carpeta de la bóveda siga existiendo en su ruta original y que sus permisos no hayan cambiado.",
+    "taskInactive": "La tarea programada {task} no está activa.",
+    "fixTaskInactive": "Vuelve a crear la tarea {task}, o revisa Automatizaciones en la app de ChatGPT para ver si se pausó o se eliminó."
+  },
+  "checkIn": {
+    "questions": [
+      "¿Qué podría hacer Confidant por ti que todavía no está haciendo?",
+      "¿Cuál es esa cosa que quisieras que tu resumen te dijera y no te dice?",
+      "¿Hay algo que hace Confidant que molesta más de lo que ayuda?",
+      "¿Qué te haría confiarle a Confidant más de tu historial?"
+    ],
+    "monthlyReceipt": {
+      "commitmentsTracked": "promesas rastreadas",
+      "meetingsPrepped": "reuniones preparadas",
+      "opportunitiesFlagged": "oportunidades señaladas",
+      "followUpsCaught": "seguimientos atrapados"
+    }
   }
 }

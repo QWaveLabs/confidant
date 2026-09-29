@@ -53,6 +53,7 @@ test('init creates the nine folders, config, state and vault contract for a fres
   assert.equal(config.briefTime, '07:15');
   assert.equal(config.timezone, 'America/New_York');
   assert.deepEqual(config.sources, {});
+  assert.match(config.installId, /^[a-z0-9]{24}$/);
 
   const state = readJson(join(vault, '.confidant', 'state.json'));
   assert.equal(state.phase, 'setup');

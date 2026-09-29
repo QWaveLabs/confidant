@@ -9,6 +9,7 @@
 // into a folder that is not already a Confidant vault, unless --resume says
 // so. A brand new vault always gets its own new folder.
 import { cpSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { ensureDir, readJson, writeJson, writeFileAtomic } from './lib/files.mjs';
 import {
@@ -93,6 +94,17 @@ function writeVaultAgentsIfAbsent(vault, lang) {
   writeFileAtomic(dest, readFileSync(src, 'utf8'));
 }
 
+// A random id for support and feedback reports only (schemas/config.schema.json
+// wants 16 to 40 lowercase alphanumerics; 24 matches the other short ids
+// this codebase already uses).
+function generateInstallId(len = 24) {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = randomBytes(len);
+  let out = '';
+  for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
 function buildConfig(args, vault, language, role) {
   const owner = {};
   if (args.ownerName) owner.name = String(args.ownerName);
@@ -114,6 +126,7 @@ function buildConfig(args, vault, language, role) {
     timezone: args.timezone ? String(args.timezone) : systemTimeZone(),
     sources: {},
     installedAt: new Date().toISOString(),
+    installId: generateInstallId(),
   };
   if (Object.keys(owner).length) config.owner = owner;
   if (Object.keys(exclusions).length) config.exclusions = exclusions;
@@ -126,6 +139,7 @@ function emptyState() {
     history: [{ phase: 'setup', at: new Date().toISOString() }],
     tasks: [],
     backlog: { remaining_batches: 0, oldest_sorted: null, done: false },
+    checkins: [],
   };
 }
 
