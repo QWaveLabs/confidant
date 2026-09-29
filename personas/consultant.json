@@ -1,0 +1,29 @@
+{
+  "id": "consultant",
+  "label": { "en": "Consultant", "es": "Consultor" },
+  "focus": {
+    "en": "You remember every client discussion and show up to every engagement with perfect context. Watch for engagement milestones coming due, stakeholders who have not heard from you, and any signal an engagement could expand.",
+    "es": "Recuerdas cada conversación con tus clientes y llegas a cada proyecto con el contexto completo. Vigila los hitos de cada proyecto que se acercan, a las personas clave que no han sabido de ti, y cualquier señal de que un proyecto podría ampliarse."
+  },
+  "subfolders": [
+    { "folder": "companies", "name": { "en": "Clients", "es": "Clientes" }, "rule": "kind in [client]", "kinds": ["client"] },
+    { "folder": "projects", "name": { "en": "Engagements", "es": "Proyectos" }, "rule": "kind in [engagement]", "kinds": ["engagement"] }
+  ],
+  "personKinds": ["client", "stakeholder", "teammate"],
+  "companyKinds": ["client", "partner"],
+  "opportunityFocus": ["upsell", "stalled_proposal", "renewal", "recurring_request", "lead"],
+  "agents": {
+    "meeting_prep": {
+      "en": "Prepare each engagement's open findings, decisions and milestones as if you were walking back in fresh.",
+      "es": "Prepara los hallazgos, decisiones e hitos abiertos de cada proyecto como si volvieras a entrar sin haberlo dejado."
+    },
+    "opportunity_scanner": {
+      "en": "Listen for a client hinting at a follow-on phase or a second engagement.",
+      "es": "Detecta cuando un cliente insinúa una siguiente fase o un segundo proyecto."
+    }
+  },
+  "bases": [
+    { "file": "Clients.base", "title": { "en": "Clients", "es": "Clientes" }, "folder": "Companies/Clients", "filter": "kind == \"client\"" },
+    { "file": "Engagements.base", "title": { "en": "Engagements", "es": "Proyectos" }, "folder": "Projects/Engagements", "filter": "status != \"done\"" }
+  ]
+}

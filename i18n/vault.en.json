@@ -1,0 +1,13 @@
+{
+  "home": {
+    "body": "Your second brain is being built. As you connect sources and Codex sorts your history, this page fills with links to your people, companies, projects and everything else worth remembering."
+  },
+  "ready": "Second Brain ready at {vault}",
+  "wouldCreate": "Would create: {vault}",
+  "existingFound": "Existing second brains found:",
+  "noExisting": "No existing second brain found.",
+  "refuseOverwrite": "\"{vault}\" already exists and is not a Confidant vault. Refusing to write into it. Pass --resume only for an existing Confidant vault, or choose a different --vault path.",
+  "resumeMissing": "--resume was set but \"{vault}\" is not a Confidant vault yet. Run init without --resume first.",
+  "unknownRole": "--role must be one of: {roles}",
+  "missingPersona": "No persona found for role \"{role}\"."
+}

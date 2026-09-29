@@ -1,0 +1,28 @@
+{
+  "id": "executive",
+  "label": { "en": "Executive", "es": "Ejecutivo" },
+  "focus": {
+    "en": "You keep context across teams, projects and meetings without keeping notes. Watch for a delegated task with no update, a decision that keeps resurfacing, and any recurring problem your team has raised more than once.",
+    "es": "Mantienes el contexto de equipos, proyectos y reuniones sin tomar notas. Vigila una tarea delegada sin novedades, una decisión que sigue reapareciendo, y cualquier problema recurrente que tu equipo haya mencionado más de una vez."
+  },
+  "subfolders": [
+    { "folder": "projects", "name": { "en": "Initiatives", "es": "Iniciativas" }, "rule": "kind in [initiative]", "kinds": ["initiative"] },
+    { "folder": "people", "name": { "en": "Team", "es": "Equipo" }, "rule": "kind in [team]", "kinds": ["team"] }
+  ],
+  "personKinds": ["team", "peer", "stakeholder", "vendor"],
+  "companyKinds": ["vendor", "partner", "customer"],
+  "opportunityFocus": ["upsell", "stalled_proposal", "other"],
+  "agents": {
+    "weekly_review": {
+      "en": "Team blockers and recurring problems belong near the top. A stalled initiative outranks a stalled deal.",
+      "es": "Los bloqueos del equipo y los problemas recurrentes van cerca del principio. Una iniciativa estancada pesa más que un trato estancado."
+    },
+    "morning_brief": {
+      "en": "Lead with anything delegated that has gone quiet, so nothing waits on you to notice.",
+      "es": "Empieza con cualquier tarea delegada que se haya quedado en silencio, para que nada dependa de que tú lo notes."
+    }
+  },
+  "bases": [
+    { "file": "Initiatives.base", "title": { "en": "Initiatives", "es": "Iniciativas" }, "folder": "Projects/Initiatives", "filter": "status != \"done\"" }
+  ]
+}

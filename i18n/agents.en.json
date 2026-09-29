@@ -1,0 +1,65 @@
+{
+  "names": {
+    "brain_update": "Commitment Tracker + Brain Update",
+    "opportunity_scanner": "Opportunity Scanner",
+    "morning_brief": "Morning Chief of Staff",
+    "meeting_prep": "Meeting Prep",
+    "follow_up_radar": "Follow-Up Radar",
+    "weekly_review": "Weekly CEO Review",
+    "finish_sorting": "Finish Sorting"
+  },
+  "headings": {
+    "morning_brief": {
+      "waiting": "People waiting on you",
+      "commitments": "Commitments due",
+      "meetings": "Today's meetings",
+      "stalled": "Stalled projects",
+      "opportunities": "Opportunities"
+    },
+    "follow_up_radar": {
+      "i_owe": "I owe",
+      "owed_to_me": "Owed to me",
+      "delegated": "Delegated"
+    },
+    "meeting_prep": {
+      "who": "Who",
+      "history": "Last conversations",
+      "decided": "What you decided",
+      "promises": "Open promises",
+      "issues": "Open issues",
+      "opportunity": "Opportunity",
+      "talking": "Talking points"
+    },
+    "opportunity_scanner": {
+      "recent": "Last 7 days",
+      "open": "Open opportunities"
+    },
+    "weekly_review": {
+      "decisions": "Major decisions",
+      "commitments": "Unfinished commitments",
+      "stalled": "Stalled projects",
+      "opportunities": "Revenue opportunities",
+      "waiting": "People waiting on you",
+      "blockers": "Team blockers",
+      "recurring": "Recurring problems",
+      "ideas": "Ideas worth revisiting",
+      "developments": "Biggest developments",
+      "priorities": "Priorities for next week"
+    },
+    "brain_update": {
+      "status": "Status"
+    }
+  },
+  "labels": {
+    "dueTomorrow": "Due tomorrow",
+    "overdue": "Overdue",
+    "dueToday": "Due today",
+    "lastExchange": "Last exchange",
+    "noDate": "No date",
+    "firstMeeting": "First meeting"
+  },
+  "empty": "Nothing to report.",
+  "briefs": {
+    "weeklyFileName": "Weekly {date}"
+  }
+}
