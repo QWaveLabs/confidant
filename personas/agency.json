@@ -1,0 +1,29 @@
+{
+  "id": "agency",
+  "label": { "en": "Agency owner", "es": "Dueño de agencia" },
+  "focus": {
+    "en": "You keep track of clients, promises, deliverables, opportunities and conversations across accounts at once. Watch for any deliverable running late, any client asking for more scope, and any account that has gone quiet.",
+    "es": "Llevas el control de clientes, promesas, entregables, oportunidades y conversaciones en varias cuentas a la vez. Vigila cualquier entregable que se esté atrasando, cualquier cliente que pida más alcance, y cualquier cuenta que se haya quedado en silencio."
+  },
+  "subfolders": [
+    { "folder": "companies", "name": { "en": "Clients", "es": "Clientes" }, "rule": "kind in [client]", "kinds": ["client"] },
+    { "folder": "projects", "name": { "en": "Deliverables", "es": "Entregables" }, "rule": "status in [active, waiting] and kind in [deliverable]", "kinds": ["deliverable"] }
+  ],
+  "personKinds": ["client", "teammate", "vendor", "prospect"],
+  "companyKinds": ["client", "vendor", "partner"],
+  "opportunityFocus": ["upsell", "stalled_proposal", "recurring_request", "renewal", "lead"],
+  "agents": {
+    "follow_up_radar": {
+      "en": "Group open loops by client account, not just by person, so a whole account never slips.",
+      "es": "Agrupa los pendientes por cuenta de cliente, no solo por persona, para que ninguna cuenta se te escape."
+    },
+    "weekly_review": {
+      "en": "Flag deliverables that slipped this week and any client conversation that hinted at more scope.",
+      "es": "Señala los entregables que se atrasaron esta semana y cualquier conversación con un cliente que insinuara más alcance."
+    }
+  },
+  "bases": [
+    { "file": "Clients.base", "title": { "en": "Clients", "es": "Clientes" }, "folder": "Companies/Clients", "filter": "kind == \"client\"" },
+    { "file": "Deliverables.base", "title": { "en": "Deliverables", "es": "Entregables" }, "folder": "Projects/Deliverables", "filter": "status != \"done\"" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "home": {
+    "body": "Tu segundo cerebro se está construyendo. A medida que conectes fuentes y Codex clasifique tu historial, esta página se llena con enlaces a tus personas, empresas, proyectos y todo lo demás que vale la pena recordar."
+  },
+  "ready": "Segundo cerebro listo en {vault}",
+  "wouldCreate": "Se crearía en: {vault}",
+  "existingFound": "Segundos cerebros existentes encontrados:",
+  "noExisting": "No se encontró ningún segundo cerebro existente.",
+  "refuseOverwrite": "\"{vault}\" ya existe y no es un segundo cerebro de Confidant. No se va a escribir ahí. Usa --resume solo con un segundo cerebro existente, o elige otra ruta con --vault.",
+  "resumeMissing": "Se indicó --resume pero \"{vault}\" todavía no es un segundo cerebro de Confidant. Ejecuta init sin --resume primero.",
+  "unknownRole": "--role debe ser uno de: {roles}",
+  "missingPersona": "No se encontró un perfil para el rol \"{role}\"."
+}

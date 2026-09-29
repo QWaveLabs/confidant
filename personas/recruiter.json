@@ -1,0 +1,30 @@
+{
+  "id": "recruiter",
+  "label": { "en": "Recruiter", "es": "Reclutador" },
+  "focus": {
+    "en": "You remember candidates, introductions, conversations and hiring context across every open search. Watch for a candidate waiting on a decision, an interview that never got scheduled, and a client search going stale.",
+    "es": "Recuerdas candidatos, presentaciones, conversaciones y el contexto de cada contratación en todas las búsquedas abiertas. Vigila a un candidato que espere una decisión, una entrevista que nunca se agendó, y una búsqueda para un cliente que se esté enfriando."
+  },
+  "subfolders": [
+    { "folder": "people", "name": { "en": "Candidates", "es": "Candidatos" }, "rule": "kind in [candidate]", "kinds": ["candidate"] },
+    { "folder": "projects", "name": { "en": "Open roles", "es": "Puestos abiertos" }, "rule": "kind in [role] and status in [active, waiting]", "kinds": ["role"] },
+    { "folder": "companies", "name": { "en": "Clients", "es": "Clientes" }, "rule": "kind in [client]", "kinds": ["client"] }
+  ],
+  "personKinds": ["candidate", "client", "hiring_manager", "reference"],
+  "companyKinds": ["client"],
+  "opportunityFocus": ["introduction", "lead", "other"],
+  "agents": {
+    "follow_up_radar": {
+      "en": "A candidate who finished a final round and has not heard back outranks every other open loop.",
+      "es": "Un candidato que terminó la última ronda y no ha sabido nada pesa más que cualquier otro pendiente."
+    },
+    "meeting_prep": {
+      "en": "Before a client search review, bring the shortlist status and every candidate's last update.",
+      "es": "Antes de una revisión de búsqueda con un cliente, trae el estado de la terna y la última novedad de cada candidato."
+    }
+  },
+  "bases": [
+    { "file": "Candidates.base", "title": { "en": "Candidates", "es": "Candidatos" }, "folder": "People/Candidates", "filter": "kind == \"candidate\"" },
+    { "file": "OpenRoles.base", "title": { "en": "Open roles", "es": "Puestos abiertos" }, "folder": "Projects/Open roles", "filter": "status != \"done\"" }
+  ]
+}

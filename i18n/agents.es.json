@@ -1,0 +1,66 @@
+{
+  "names": {
+    "brain_update": "Registro de compromisos y actualización del cerebro",
+    "opportunity_scanner": "Detector de oportunidades",
+    "morning_brief": "Mano derecha matutina",
+    "meeting_prep": "Preparación de reuniones",
+    "follow_up_radar": "Radar de seguimiento",
+    "weekly_review": "Revisión semanal de dirección",
+    "finish_sorting": "Finalizar clasificación"
+  },
+  "headings": {
+    "morning_brief": {
+      "waiting": "Personas que te esperan",
+      "commitments": "Compromisos pendientes",
+      "meetings": "Reuniones de hoy",
+      "stalled": "Proyectos estancados",
+      "opportunities": "Oportunidades"
+    },
+    "follow_up_radar": {
+      "i_owe": "Yo debo",
+      "owed_to_me": "Me deben",
+      "delegated": "Delegué"
+    },
+    "meeting_prep": {
+      "who": "Quién es",
+      "history": "Últimas conversaciones",
+      "decided": "Lo que decidieron",
+      "promises": "Promesas abiertas",
+      "issues": "Temas abiertos",
+      "opportunity": "Oportunidad",
+      "talking": "Puntos a tratar"
+    },
+    "opportunity_scanner": {
+      "recent": "Últimos 7 días",
+      "open": "Oportunidades abiertas"
+    },
+    "weekly_review": {
+      "context": "Reuniones y conversaciones de esta semana",
+      "decisions": "Decisiones importantes",
+      "commitments": "Compromisos sin cerrar",
+      "stalled": "Proyectos estancados",
+      "opportunities": "Oportunidades de ingresos",
+      "waiting": "Personas que te esperan",
+      "blockers": "Bloqueos del equipo",
+      "recurring": "Problemas recurrentes",
+      "ideas": "Ideas que vale la pena retomar",
+      "developments": "Novedades más importantes",
+      "priorities": "Prioridades para la próxima semana"
+    },
+    "brain_update": {
+      "status": "Estado"
+    }
+  },
+  "labels": {
+    "dueTomorrow": "Vence mañana",
+    "overdue": "Vencido",
+    "dueToday": "Vence hoy",
+    "lastExchange": "Último intercambio",
+    "noDate": "Sin fecha",
+    "firstMeeting": "Primera reunión"
+  },
+  "empty": "Nada que reportar.",
+  "briefs": {
+    "weeklyFileName": "Semana del {date}"
+  }
+}
