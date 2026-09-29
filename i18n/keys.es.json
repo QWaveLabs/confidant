@@ -1,0 +1,10 @@
+{
+  "set": "guardada",
+  "missing": "falta",
+  "saved": "Se guardó la clave de {label}.",
+  "cancelled": "No se escribió ninguna clave. No se guardó nada.",
+  "dryRun": "Prueba en seco: no se guardó ninguna clave.",
+  "unknownKey": "\"{name}\" no es una clave conocida. Usa una de: {list}.",
+  "usage": "Uso: confidant keys set <nombre> | confidant keys status",
+  "prompt": "Pega tu clave de API de {label}. Se guarda en el llavero de este Mac y no se vuelve a mostrar."
+}
