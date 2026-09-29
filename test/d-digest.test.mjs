@@ -229,6 +229,34 @@ test('Spanish vault digests use Spanish headings', () => {
   assert.match(text, /## Delegué/);
 });
 
+test('meeting_prep in a Spanish vault reads a note\'s "## Cronología" section, not just "## Timeline"', () => {
+  const now = new Date('2026-09-25T14:00:00.000Z');
+  const vault = mkdtempSync(join(tmpdir(), 'cf-digest-cronologia-'));
+  const paths = statePaths(vault);
+  mkdirSync(paths.root, { recursive: true });
+  writeJson(paths.config, { version: 1, vault, language: 'es', role: 'founder', briefTime: '06:45', timezone: 'America/New_York', sources: {} });
+  writeJson(paths.state, { phase: 'done', history: [], tasks: [], backlog: { remaining_batches: 0, oldest_sorted: null, done: false } });
+  writeJson(join(paths.root, 'identity.json'), {
+    owner: { person_id: 'me', name: 'Rob', handles: [] },
+    people: [{ id: 'p1', name: 'Mike Brennan', kind: 'customer', handles: ['tel:+15551230000'], sources: ['imessage'], tier: 'active', note_path: 'Personas/Mike Brennan.md' }],
+    groups: [], generated_at: now.toISOString(),
+  });
+  mkdirSync(join(vault, 'Personas'), { recursive: true });
+  writeFileSync(join(vault, 'Personas', 'Mike Brennan.md'), [
+    '---', 'type: person', 'confidant_id: p1', 'updated: 2026-09-20', 'tags: []', 'sources: 1', 'name: Mike Brennan', 'kind: customer', '---',
+    '# Mike Brennan', '', '## Cronología',
+    '- 2026-09-20, Preguntó por la actualización del CRM. _(Zoom)_', '',
+  ].join('\n'));
+
+  const ctx = createContext({ vault, now, json: false }); // ctx.lang derives from config.language ('es'), written above
+  ctx.store.upsertRecords([
+    { id: 'calendar:1', source: 'calendar', kind: 'event', thread: 'calendar:evt1', ts: '2026-09-25T15:30:00.000Z', title: 'Sync', text: '', from: null, to: [{ handle: 'tel:+15551230000', name: 'Mike Brennan' }], is_from_me: false },
+  ]);
+  const text = buildDigest(ctx, 'meeting_prep');
+  ctx.close();
+  assert.match(text, /Preguntó por la actualización del CRM/, 'the Spanish Cronología heading must be read, not just the English Timeline heading');
+});
+
 test('morning_brief adds a Keep warm section on Mondays only, for inner or active people gone quiet 21+ days', () => {
   const monday = new Date('2026-09-28T14:00:00.000Z'); // Monday, America/New_York
   const vault = mkdtempSync(join(tmpdir(), 'cf-digest-warm-'));
