@@ -1,6 +1,6 @@
 {
   "name": "confidant",
-  "version": "2.0.0-dev",
+  "version": "2.0.0-rc.1",
   "private": true,
   "description": "Installs and runs a Confidant second brain on a Mac, driven by Codex in the ChatGPT app.",
   "type": "module",
