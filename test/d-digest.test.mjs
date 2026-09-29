@@ -112,6 +112,54 @@ test('meeting_prep digest gives per-attendee sections from the person note and o
   assert.match(text, /You owe them: Send Mike the updated CRM filtering pricing/);
 });
 
+test('meeting_prep digest surfaces "Worth remembering" from the person\'s own free prose, and stays empty when there is none', () => {
+  const now = new Date('2026-09-25T14:00:00.000Z');
+  const vault = mkdtempSync(join(tmpdir(), 'cf-digest-personal-'));
+  const paths = statePaths(vault);
+  mkdirSync(paths.root, { recursive: true });
+  writeJson(paths.config, { version: 1, vault, language: 'en', role: 'founder', briefTime: '06:45', timezone: 'America/New_York', sources: {} });
+  writeJson(paths.state, { phase: 'done', history: [], tasks: [], backlog: { remaining_batches: 0, oldest_sorted: null, done: false } });
+  writeJson(join(paths.root, 'identity.json'), {
+    owner: { person_id: 'me', name: 'Rob', handles: [] },
+    people: [
+      { id: 'p1', name: 'Mike Brennan', kind: 'customer', handles: ['tel:+15551230000'], sources: ['imessage'], tier: 'active', note_path: 'People/Mike Brennan.md' },
+      { id: 'p2', name: 'Nadia Petrov', kind: 'customer', handles: ['mailto:nadia@brightwell.com'], sources: ['email'], tier: 'inner', note_path: 'People/Nadia Petrov.md' },
+    ],
+    groups: [],
+    generated_at: now.toISOString(),
+  });
+  mkdirSync(join(vault, 'People'), { recursive: true });
+  writeFileSync(join(vault, 'People', 'Mike Brennan.md'), [
+    '---', 'type: person', 'confidant_id: p1', 'updated: 2026-09-20', 'tags: []', 'sources: 3', 'name: Mike Brennan', 'kind: customer', '---',
+    '# Mike Brennan', '',
+    "Running the Chicago Marathon in October. Ask how training is going.", '',
+    '<!-- confidant:start bio -->', 'Generated filler that must not leak into Worth remembering.', '<!-- confidant:end bio -->', '',
+    '## Timeline',
+    '- 2026-09-20, Asked about the CRM filtering update. _(Zoom)_', '',
+  ].join('\n'));
+  writeFileSync(join(vault, 'People', 'Nadia Petrov.md'), [
+    '---', 'type: person', 'confidant_id: p2', 'updated: 2026-09-20', 'tags: []', 'sources: 1', 'name: Nadia Petrov', 'kind: customer', '---',
+    '# Nadia Petrov', '', '## Timeline', '- 2026-09-18, Asked about Austin. _(Email)_', '',
+  ].join('\n'));
+
+  const ctx = createContext({ vault, now, json: false });
+  ctx.store.upsertRecords([
+    { id: 'calendar:1', source: 'calendar', kind: 'event', thread: 'calendar:evt1', ts: '2026-09-25T15:30:00.000Z', title: 'Sync', text: '', from: null, to: [{ handle: 'tel:+15551230000', name: 'Mike Brennan' }], is_from_me: false },
+    { id: 'calendar:2', source: 'calendar', kind: 'event', thread: 'calendar:evt2', ts: '2026-09-25T16:00:00.000Z', title: 'Check-in', text: '', from: null, to: [{ handle: 'mailto:nadia@brightwell.com', name: 'Nadia Petrov' }], is_from_me: false },
+  ]);
+  const text = buildDigest(ctx, 'meeting_prep');
+  ctx.close();
+
+  assert.match(text, /## Worth remembering/);
+  assert.match(text, /Running the Chicago Marathon in October/);
+  assert.ok(!text.includes('Generated filler that must not leak'), 'a managed <!-- confidant:start/end --> block must never appear as personal prose');
+  // Nadia's note has no free prose before its Timeline: her section exists but stays empty.
+  const nadiaSection = text.slice(text.indexOf('### Nadia Petrov'));
+  const heading = '## Worth remembering';
+  const afterHeading = nadiaSection.slice(nadiaSection.indexOf(heading) + heading.length).trim();
+  assert.match(afterHeading, /^_None\._/);
+});
+
 test('opportunity_scanner digest lists recent inbound records and open opportunities', () => {
   const ctx = buildFixture();
   const text = buildDigest(ctx, 'opportunity_scanner');

@@ -6,14 +6,18 @@ person's Second Brain vault.
 1. Run `.confidant/engine/bin/confidant digest meeting_prep` for every
    meeting starting before the next time this task runs. For each one it
    gives you, per attendee: who they are, your last conversations, what you
-   decided together, open commitments in both directions, open issues, and
-   any live opportunity with them.
+   decided together, open commitments in both directions, any live
+   opportunity with them, and anything personal worth remembering, drawn
+   from their own note. Read the open issues and talking points yourself,
+   from that same material; no separate query backs those two.
 2. For each meeting, write the prep either inside that meeting's note
    (in its own managed section) if one already exists, or as its own
    section in today's brief file otherwise. Keep it short: a person should
    be able to read it in under a minute before walking in.
 3. Skip a meeting only if there is truly nothing on record about it or its
-   attendees; do not invent context.
+   attendees; do not invent context, especially for "worth remembering",
+   which must come from something the person actually wrote or said, never
+   a guess.
 
 Write in {language}.
 

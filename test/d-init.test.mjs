@@ -118,6 +118,74 @@ test('init is idempotent with --resume: config and state survive, folders and en
   assert.equal(state.tasks.length, 1, 'previously recorded tasks survive resume');
 });
 
+test('every --exclude-* flag lands in the right config.exclusions key on a fresh install', async () => {
+  const home = tmpHome();
+  const vault = join(home, 'Second Brain');
+  const ctx = createContext({ vault: null, json: true });
+  await run({
+    role: 'founder', language: 'en', briefTime: '06:45', vault,
+    excludeCategory: ['banking', 'health'],
+    excludePerson: 'Uncle Rick',
+    excludeHandle: 'tel:+15551234567',
+    excludeDomain: ['nda-client.com', 'nda-client.com'], // duplicate on purpose
+    excludeChat: 'Family Group',
+    excludeKeyword: 'diagnosis',
+    excludeEmailAccount: 'rob.personal@gmail.com',
+    _: [],
+  }, ctx);
+
+  const config = readJson(join(vault, '.confidant', 'config.json'));
+  assert.deepEqual(config.exclusions, {
+    categories: ['banking', 'health'],
+    people: ['Uncle Rick'],
+    handles: ['tel:+15551234567'],
+    domains: ['nda-client.com'],
+    chats: ['Family Group'],
+    keywords: ['diagnosis'],
+    emailAccounts: ['rob.personal@gmail.com'],
+  });
+});
+
+test('--resume with new --exclude-* flags merges into an existing vault\'s exclusions, and touches nothing else', async () => {
+  const home = tmpHome();
+  const vault = join(home, 'Second Brain');
+  const first = createContext({ vault: null, json: true });
+  await run({ role: 'founder', language: 'en', briefTime: '06:45', vault, excludeCategory: 'banking', excludeChat: 'Family Group', _: [] }, first);
+
+  const beforeState = readJson(join(vault, '.confidant', 'state.json'));
+  writeFileSync(join(vault, '.confidant', 'state.json'), JSON.stringify({ ...beforeState, phase: 'done', tasks: [{ key: 'morning_brief', name: 'x', rrule: 'r', automation_id: 'auto-1', created_at: '2026-01-01T00:00:00Z' }] }));
+  const beforeConfigInstallId = readJson(join(vault, '.confidant', 'config.json')).installId;
+
+  const second = createContext({ vault: null, json: true });
+  const code = await run({ role: 'founder', language: 'en', vault, resume: true, excludeCategory: 'health', excludeHandle: 'mailto:ex@old-client.com', _: [] }, second);
+  assert.equal(code, 0);
+
+  const config = readJson(join(vault, '.confidant', 'config.json'));
+  assert.deepEqual(config.exclusions, {
+    categories: ['banking', 'health'], // unioned, not replaced
+    chats: ['Family Group'], // untouched from the fresh install
+    handles: ['mailto:ex@old-client.com'],
+  });
+  assert.equal(config.installId, beforeConfigInstallId, 'nothing else about config changes');
+
+  const state = readJson(join(vault, '.confidant', 'state.json'));
+  assert.equal(state.phase, 'done', 'state is untouched by an exclusion-only resume');
+  assert.equal(state.tasks.length, 1, 'recorded tasks survive an exclusion-only resume');
+});
+
+test('--resume without any --exclude-* flag does not rewrite config.json at all', async () => {
+  const home = tmpHome();
+  const vault = join(home, 'Second Brain');
+  const first = createContext({ vault: null, json: true });
+  await run({ role: 'founder', language: 'en', briefTime: '06:45', vault, excludeCategory: 'banking', _: [] }, first);
+  const before = readJson(join(vault, '.confidant', 'config.json'));
+
+  const second = createContext({ vault: null, json: true });
+  await run({ role: 'founder', language: 'en', vault, resume: true, _: [] }, second);
+  const after = readJson(join(vault, '.confidant', 'config.json'));
+  assert.deepEqual(after, before);
+});
+
 test('init --resume on a folder that is not yet a Confidant vault refuses', async () => {
   const home = tmpHome();
   const vault = join(home, 'Second Brain');

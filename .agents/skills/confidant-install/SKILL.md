@@ -63,15 +63,21 @@ starting from a blank page.
 
 Turn their free-text answer into a real config: categories they mention
 (banking, health, family, personal email, passwords) go in
-`exclusions.categories`; specific names, chats, domains, or accounts they
-name go in `exclusions.people`, `.chats`, `.domains`, or `.emailAccounts`.
-Then run `bin/confidant init --role <role> --brief-time <HH:MM> --language en|es`,
-repeating `--exclude-category <name>` and `--exclude-person <name>` once per
-item for any categories or people they named. `init` does not yet take a
-chat, domain, or email-account exclusion directly; note those down and add
-them once the vault exists (see `.confidant/config.json`'s `exclusions`
-shape in CONTRACTS.md). Save the "blueprint" line's values for later, since
-they also shape the scheduled tasks.
+`exclusions.categories`; specific names, chats, domains, phone numbers or
+email addresses, keywords, or whole accounts they name go in
+`exclusions.people`, `.chats`, `.domains`, `.handles`, `.keywords`, or
+`.emailAccounts`. Then run `bin/confidant init --role <role> --brief-time
+<HH:MM> --language en|es`, adding one repeatable flag per item they named:
+`--exclude-category`, `--exclude-person`, `--exclude-chat`,
+`--exclude-domain`, `--exclude-handle`, `--exclude-keyword`, or
+`--exclude-email-account`. Save the "blueprint" line's values for later,
+since they also shape the scheduled tasks.
+
+If the person names a new exclusion later, after the vault already exists,
+run `bin/confidant init --role <role> --resume` again with just the new
+`--exclude-*` flags: it unions them into the existing
+`.confidant/config.json`'s `exclusions` and touches nothing else in the
+vault.
 
 ## Connect (state: `setup` → `connect`)
 

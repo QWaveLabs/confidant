@@ -1,13 +1,19 @@
 // `confidant init --role <r> --language <en|es> --brief-time HH:MM
 //   [--timezone <tz>] [--owner-name <name>] [--owner-email <e> ...]
-//   [--exclude-category <c> ...] [--exclude-person <p> ...] [--vault <path>]
-//   [--resume]`
+//   [--exclude-category <c> ...] [--exclude-person <p> ...]
+//   [--exclude-handle <h> ...] [--exclude-domain <d> ...]
+//   [--exclude-chat <c> ...] [--exclude-keyword <k> ...]
+//   [--exclude-email-account <a> ...] [--vault <path>] [--resume]`
 // `confidant init --plan` only prints where a new vault would go, and any
 // second brain init already found. Neither writes anything.
 //
 // The one rule that matters more than any flag: an install never writes
 // into a folder that is not already a Confidant vault, unless --resume says
 // so. A brand new vault always gets its own new folder.
+//
+// `--resume` with any `--exclude-*` flag updates only `config.exclusions`
+// on an existing vault (unioned with what was already there), and touches
+// nothing else: not folders, not the engine copy, not the rest of config.
 import { cpSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
@@ -105,17 +111,46 @@ function generateInstallId(len = 24) {
   return out;
 }
 
+// One CLI flag per schemas/config.schema.json exclusions key.
+const EXCLUSION_ARG_MAP = {
+  categories: 'excludeCategory',
+  people: 'excludePerson',
+  handles: 'excludeHandle',
+  domains: 'excludeDomain',
+  chats: 'excludeChat',
+  keywords: 'excludeKeyword',
+  emailAccounts: 'excludeEmailAccount',
+};
+
+// Every --exclude-* flag actually given, as a partial exclusions object:
+// only the keys someone passed, each deduped. Used both to build a fresh
+// config and, on --resume, to merge into an existing one.
+function exclusionsFromArgs(args) {
+  const out = {};
+  for (const [key, argName] of Object.entries(EXCLUSION_ARG_MAP)) {
+    const values = [...new Set([].concat(args[argName] ?? []).filter(Boolean).map(String))];
+    if (values.length) out[key] = values;
+  }
+  return out;
+}
+
+// Unions two exclusions objects key by key, deduped. Anything already in
+// `existing` that `incoming` does not touch is kept exactly as it was.
+function mergeExclusions(existing = {}, incoming = {}) {
+  const merged = { ...existing };
+  for (const [key, values] of Object.entries(incoming)) {
+    merged[key] = [...new Set([...(existing[key] ?? []), ...values])];
+  }
+  return merged;
+}
+
 function buildConfig(args, vault, language, role) {
   const owner = {};
   if (args.ownerName) owner.name = String(args.ownerName);
   const emails = [].concat(args.ownerEmail ?? []).filter(Boolean).map(String);
   if (emails.length) owner.emails = emails;
 
-  const exclusions = {};
-  const categories = [].concat(args.excludeCategory ?? []).filter(Boolean).map(String);
-  if (categories.length) exclusions.categories = categories;
-  const people = [].concat(args.excludePerson ?? []).filter(Boolean).map(String);
-  if (people.length) exclusions.people = people;
+  const exclusions = exclusionsFromArgs(args);
 
   const config = {
     version: 1,
@@ -205,6 +240,16 @@ export async function run(args, ctx) {
     config = buildConfig(args, vault, language, role);
     assertValid('config', config);
     if (!ctx.dryRun) writeJson(paths.config, config);
+  } else {
+    // Resuming an existing vault: the only thing new --exclude-* flags may
+    // change is config.exclusions, merged with whatever was already there.
+    // Every other field of an existing config is left exactly as it was.
+    const incoming = exclusionsFromArgs(args);
+    if (Object.keys(incoming).length) {
+      config = { ...config, exclusions: mergeExclusions(config.exclusions, incoming) };
+      assertValid('config', config);
+      if (!ctx.dryRun) writeJson(paths.config, config);
+    }
   }
 
   let state = readJson(paths.state, null);
