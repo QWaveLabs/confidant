@@ -11,7 +11,7 @@ If a Plaud tool is available:
    `.confidant/tmp/`, one recording per line:
    `{id, title, created_at, duration, transcript, summary, participants}`.
 3. Store them:
-   `confidant ingest --source plaud --file <path> --cursor-key plaud --cursor-value <the newest recording's date>`
+   `bin/confidant ingest --source plaud --file <path> --cursor-key plaud --cursor-value <the newest recording's date>`
 4. Cap how many recordings you do in one run; the scheduled Brain Update
    continues the rest every 3 hours.
 

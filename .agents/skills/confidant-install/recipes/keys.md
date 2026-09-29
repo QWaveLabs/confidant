@@ -3,12 +3,12 @@
 Confidant needs a short visit to each service's own settings page to get an
 API key. Do this once per service, only for the services the person
 actually uses. Never ask the person to paste a key into the chat: run
-`confidant keys set <name>` instead. That command opens a small, hidden
+`bin/confidant keys set <name>` instead. That command opens a small, hidden
 macOS dialog right on the person's screen. What they type there goes
 straight into this Mac's Keychain and is never shown in the chat or printed
 anywhere.
 
-Check what is already saved first: `confidant keys status`. It only prints
+Check what is already saved first: `bin/confidant keys status`. It only prints
 which keys exist, never their values.
 
 For each service the person wants to connect:
@@ -19,14 +19,14 @@ Used to transcribe phone call recordings and Voice Memos. The person signs
 up at https://console.deepgram.com, creates a project if asked, and opens
 API Keys in the left sidebar. They create a new key and copy it.
 
-Run `confidant keys set deepgram`.
+Run `bin/confidant keys set deepgram`.
 
 ## Fathom (`fathom`)
 
 The person signs in to https://fathom.video, opens Settings, then
 Integrations, then API, and generates a key there.
 
-Run `confidant keys set fathom`.
+Run `bin/confidant keys set fathom`.
 
 ## Fireflies (`fireflies`)
 
@@ -36,7 +36,7 @@ allows only 50 API requests a day, so Confidant paces itself and finishes
 importing over several runs. This is expected, not a failure; say so if the
 person asks why Fireflies is taking a few days to catch up.
 
-Run `confidant keys set fireflies`.
+Run `bin/confidant keys set fireflies`.
 
 ## Granola (`granola`)
 
@@ -45,14 +45,14 @@ lower plan, skip this and say so plainly; do not ask them to upgrade. On
 Business or higher, they sign in at https://granola.ai, open Settings, then
 Integrations, then API, and create a key (it starts with `grn_`).
 
-Run `confidant keys set granola`.
+Run `bin/confidant keys set granola`.
 
 ## Grain (`grain`)
 
 The person signs in to https://grain.com, opens Settings, then
 Integrations, then the API tab, and creates a Personal Access Token.
 
-Run `confidant keys set grain`.
+Run `bin/confidant keys set grain`.
 
 ## tl;dv (`tldv`)
 
@@ -62,7 +62,7 @@ depends on the meeting organizer's plan (Pro, Business or Enterprise); if
 their account is Free, tell them tl;dv import will be skipped even though
 they can still see their meetings in the tl;dv app.
 
-Run `confidant keys set tldv`.
+Run `bin/confidant keys set tldv`.
 
 ## Read.ai (`readai`)
 
@@ -81,7 +81,7 @@ terminal, with the person only doing the sign-in step in their browser:
    to you, or to run it themselves in a terminal if they are comfortable.
    That exchanges the authorization code for an `access_token` and a
    `refresh_token`. Only the refresh token is kept.
-4. Run `confidant keys set readai` and, when the hidden dialog appears,
+4. Run `bin/confidant keys set readai` and, when the hidden dialog appears,
    have the person (or you, if they shared the values with you) paste the
    three values joined by colons, in this order:
    `client_id:client_secret:refresh_token`

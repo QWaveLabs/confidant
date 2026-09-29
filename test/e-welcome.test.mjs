@@ -130,6 +130,14 @@ test('escapes exclusion names and other free text before they reach the page', (
   ctx.close();
 });
 
+test('renders the "What it is" intro section (i18n/welcome.*.json defines it; it must actually appear on the page)', () => {
+  const en = fixtureVault({ lang: 'en' });
+  const { html } = renderGuide(en);
+  assert.match(html, /<h2>What it is<\/h2>/);
+  assert.match(html, /Confidant is a private second brain built from your own working history/);
+  en.close();
+});
+
 test('includes the support email and picks the right filename per language', () => {
   const en = fixtureVault({ lang: 'en' });
   const guideEn = renderGuide(en);
