@@ -1,0 +1,69 @@
+{
+  "title": "Confidant ya está instalado",
+  "tagline": "Lo recuerda todo y lo guarda bien.",
+  "subtitle": "Tu segundo cerebro privado ya está configurado en esta Mac. Esto es lo que hace y cómo usarlo.",
+  "supportLine": "¿Dudas? Escribe a {email}.",
+  "sections": {
+    "whatItIs": {
+      "heading": "Qué es",
+      "body": "Confidant es un segundo cerebro privado construido con tu propio historial de trabajo: mensajes, reuniones, correos y notas, organizado en una carpeta de notas sencilla en esta Mac. Seis agentes la revisan según un horario y te dicen qué necesita tu atención, para que dejes de tener que recordarlo todo tú."
+    },
+    "whatItDoes": {
+      "heading": "Qué hace",
+      "notScheduledYet": "Aún no programado",
+      "planned": "Previsto: {cadence}"
+    },
+    "howItWorks": {
+      "heading": "Cómo funciona",
+      "body": "Tus fuentes conectadas alimentan una carpeta privada de notas en esta Mac. Los seis agentes de arriba revisan esa carpeta según su horario y escriben en ella: resúmenes, radar, y notas actualizadas de personas, proyectos y compromisos.",
+      "diagram": { "sources": "Tus fuentes", "vault": "Segundo cerebro (esta Mac)", "agents": "Seis agentes" }
+    },
+    "howToUse": {
+      "heading": "Cómo usarlo",
+      "obsidian": "Abre el segundo cerebro en Obsidian para leer y buscar todo lo que sabe: {link}",
+      "briefs": "Tu resumen matutino y tu revisión semanal llegan a la carpeta {folder} como notas normales.",
+      "scheduled": "Cada ejecución de un agente aparece en la vista Programado dentro de la app de ChatGPT, así ves qué corrió y cuándo.",
+      "ask": "Abre este segundo cerebro como proyecto en Codex y simplemente pregunta. Algunas cosas que la gente pregunta:",
+      "examples": [
+        "¿Qué se me está escapando?",
+        "Prepárame para mi reunión de las 10:30 con Mike",
+        "¿Qué le prometí a la gente esta semana?",
+        "¿Quién está esperando algo de mí?",
+        "¿Qué oportunidades estoy dejando pasar?"
+      ]
+    },
+    "connected": {
+      "heading": "Qué está conectado",
+      "recordsLabel": "{count} registros",
+      "lastSeen": "última vez {date}",
+      "backfilling": "La instalación organizó tus últimos 60 días. El resto de tu historial se sigue llenando solo, del más antiguo al más reciente, más o menos cada 3 horas.",
+      "empty": "Nada conectado todavía."
+    },
+    "folders": {
+      "heading": "Tus carpetas",
+      "notesLabel": "{count} notas",
+      "subfoldersLabel": "Incluye:"
+    },
+    "privacy": {
+      "heading": "Privacidad",
+      "neverSees": "Qué nunca ve",
+      "neverSeesEmpty": "Todavía no has excluido nada en concreto. Pídele a Codex que actualice tu configuración cuando quieras para agregar temas bancarios, salud, chats familiares o cualquier persona que prefieras dejar fuera.",
+      "whereItLives": "Dónde vive tu información",
+      "whereItLivesBody": "Tus notas viven en una carpeta sencilla en esta Mac, en {vault}. Para hacer su trabajo, Codex envía el contexto que necesita a los modelos de OpenAI a través de tu propia cuenta de ChatGPT. Tú controlas los ajustes de datos de esa cuenta desde ChatGPT.",
+      "control": "Tus controles",
+      "controlBody": "Cada fuente se queda en modo de solo lectura: Confidant nunca escribe de vuelta en Gmail, Slack ni en ningún otro lugar del que lee. Puedes desconectar una fuente, agregar una exclusión o cambiar qué nunca debe ver en cualquier momento, pidiéndole a Codex que actualice tu configuración."
+    },
+    "troubleshooting": {
+      "heading": "Si algo no se ve bien",
+      "items": [
+        { "q": "No llegó un resumen", "a": "Los agentes solo corren mientras esta Mac está encendida y la app de ChatGPT está abierta. Revisa la vista Programado en la app de ChatGPT para ver esa ejecución y qué dice." },
+        { "q": "Se desactivó el Acceso completo al disco", "a": "Abre Ajustes del Sistema, luego Privacidad y Seguridad, luego Acceso completo al disco, y vuelve a activar ChatGPT. Reinicia ChatGPT y dile a Codex \"continúa configurando mi segundo cerebro\"." },
+        { "q": "Una app conectada se desconectó", "a": "Vuelve a conectarla desde los ajustes de conectores de la app de ChatGPT y dile a Codex \"continúa configurando mi segundo cerebro\"." },
+        { "q": "Una clave de API venció", "a": "Pídele a Codex que ejecute confidant keys set para esa fuente otra vez." },
+        { "q": "Pausar o cambiar una tarea", "a": "Abre la vista Programado dentro de la app de ChatGPT: ahí puedes pausar, editar o eliminar cualquiera de los seis agentes directamente." },
+        { "q": "La configuración se interrumpió", "a": "Dile a Codex \"continúa configurando mi segundo cerebro\" en el proyecto de este segundo cerebro. Retoma justo donde se quedó." },
+        { "q": "Quieres dejar de usar Confidant", "a": "Elimina las tareas programadas de este segundo cerebro desde la vista Programado y luego borra la carpeta del segundo cerebro. Nada más en tu Mac depende de ella." }
+      ]
+    }
+  }
+}
