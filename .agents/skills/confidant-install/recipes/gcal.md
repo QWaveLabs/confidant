@@ -9,7 +9,7 @@ For each window:
 2. Write the raw event objects, exactly as the app returned them, to a
    JSONL file under `.confidant/tmp/`, one event per line.
 3. Store them:
-   `confidant ingest --source gcal --file <path> --cursor-key gcal_window --cursor-value <the window's start date>`
+   `bin/confidant ingest --source gcal --file <path> --cursor-key gcal_window --cursor-value <the window's start date>`
 4. Move to the next older window. Cap how many windows you do in one run;
    the scheduled Brain Update continues the rest every 3 hours.
 

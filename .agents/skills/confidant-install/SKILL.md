@@ -13,9 +13,10 @@ step fails, retry it a couple of times, then explain plainly what happened
 and what the person can do, and keep going with the rest of the install.
 
 Every command below is `bin/confidant <command>`, run from the repo root
-(or, once the vault exists, from inside it). Run `bin/confidant <command>
---help` for a command's exact flags before using one not shown literally
-here.
+(or, once the vault exists, from inside it). `--help` only lists every
+command, not a command's own flags; for a flag not shown literally here,
+read that command's own file under `engine/` or its section in
+`CONTRACTS.md`.
 
 ## Before you start
 
@@ -64,10 +65,13 @@ Turn their free-text answer into a real config: categories they mention
 (banking, health, family, personal email, passwords) go in
 `exclusions.categories`; specific names, chats, domains, or accounts they
 name go in `exclusions.people`, `.chats`, `.domains`, or `.emailAccounts`.
-Then run `bin/confidant init` (see `--help` for its exact options) with the
-role, brief time, language, and exclusions you gathered. Save the
-"blueprint" line's values for later, since they also shape the scheduled
-tasks.
+Then run `bin/confidant init --role <role> --brief-time <HH:MM> --language en|es`,
+repeating `--exclude-category <name>` and `--exclude-person <name>` once per
+item for any categories or people they named. `init` does not yet take a
+chat, domain, or email-account exclusion directly; note those down and add
+them once the vault exists (see `.confidant/config.json`'s `exclusions`
+shape in CONTRACTS.md). Save the "blueprint" line's values for later, since
+they also shape the scheduled tasks.
 
 ## Connect (state: `setup` → `connect`)
 
@@ -164,8 +168,9 @@ way.
 
 ## Finish (state: `finish` → `done`)
 
-1. Run `bin/confidant welcome`. It writes and opens `Confidant Guide.html`
-   (or `Guía de Confidant.html` in Spanish) inside the vault.
+1. Run `bin/confidant welcome --open`. It writes `Confidant Guide.html`
+   (or `Guía de Confidant.html` in Spanish) inside the vault and opens it.
+   Without `--open` it only writes the file.
 2. Open the vault in Obsidian:
    `obsidian://open?path=<url-encoded vault path>`.
 3. Send one final chat message covering, plainly:

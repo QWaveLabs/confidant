@@ -45,6 +45,10 @@ function card(inner) {
   return `      <div class="card">\n${inner}\n      </div>`;
 }
 
+function buildWhatItIs(tr) {
+  return section(tr('sections.whatItIs.heading'), `      <p>${escapeHtml(tr('sections.whatItIs.body'))}</p>`);
+}
+
 function buildAgentsSection(tr, rows) {
   const items = rows.map((a) => card(
     `        <div class="row"><span class="label">${escapeHtml(a.name)}</span><span class="meta">${escapeHtml(a.scheduled ? a.cadence : tr('sections.whatItDoes.notScheduledYet'))}</span></div>\n` +
@@ -229,6 +233,7 @@ export function renderGuide(ctx) {
   const rows = agentRows(ctx.config, ctx.state, lang);
 
   const body = [
+    buildWhatItIs(tr),
     buildAgentsSection(tr, rows),
     buildHowItWorks(tr),
     buildHowToUse(tr, ctx, briefsFolderName),
