@@ -199,6 +199,19 @@ function nextMeetingPrepBound(ctx) {
   return localTimeToInstant(today, later[0], schedule.minute, ctx.tz, ctx.now);
 }
 
+// The person's own free prose in their note, before the Timeline section
+// and outside any managed block: no note type has a dedicated field for a
+// personal detail (a hobby, an anniversary, where they went to school), so
+// whatever the person themselves wrote near the top of the note is the
+// grounded source for "Worth remembering".
+function personalNotes(body, limit = 300) {
+  const beforeTimeline = (body ?? '').split(/^##\s*Timeline/m)[0] ?? '';
+  const withoutManaged = beforeTimeline.replace(/<!--\s*confidant:start[\s\S]*?confidant:end[^>]*-->/g, '');
+  const withoutHeading = withoutManaged.replace(/^#\s+.*$/m, '');
+  const text = withoutHeading.trim();
+  return text ? text.slice(0, limit) : '';
+}
+
 function attendeeSection(ctx, identity, strings, personName, handle) {
   const h = strings('headings.meeting_prep');
   const person = handle ? identity.byHandle(handle) : identity.byName(personName);
@@ -227,6 +240,7 @@ function attendeeSection(ctx, identity, strings, personName, handle) {
   const decided = decisions.map((n) => `- ${n.data.date}: ${firstLine(n.body, n.data.confidant_id)}`);
   const opportunities = notesOfType(ctx.vault, 'opportunity').filter((n) => n.data.status === 'open' && mentionsPerson(n.data.counterpart, name));
   const oppLines = opportunities.map((n) => `- ${firstLine(n.body, n.path)}`);
+  const personal = personalNotes(noteBody);
 
   return [
     `### ${name}`,
@@ -235,6 +249,7 @@ function attendeeSection(ctx, identity, strings, personName, handle) {
     section(h.decided, list(decided)),
     section(h.promises, list(promises)),
     section(h.opportunity, list(oppLines)),
+    section(h.personal, personal),
   ].join('\n');
 }
 
