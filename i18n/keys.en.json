@@ -1,0 +1,10 @@
+{
+  "set": "set",
+  "missing": "missing",
+  "saved": "{label} key saved.",
+  "cancelled": "No key was entered. Nothing was saved.",
+  "dryRun": "Dry run: no key was saved.",
+  "unknownKey": "\"{name}\" is not a known key. Use one of: {list}.",
+  "usage": "Usage: confidant keys set <name> | confidant keys status",
+  "prompt": "Paste your {label} API key. It is stored in this Mac's Keychain and is never shown again."
+}
