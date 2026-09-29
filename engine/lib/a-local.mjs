@@ -9,6 +9,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canRead, openSourceCopy } from './sqlite.mjs';
 import { normalizeEmail, normalizePhone, phoneHandle, emailHandle, last10, parseHandle } from './handles.mjs';
+import { notOk } from './a-reasons.mjs';
 
 export const homeOf = (ctx) => ctx?.home ?? homedir();
 export const libraryPath = (ctx, ...parts) => join(homeOf(ctx), 'Library', ...parts);
@@ -29,14 +30,12 @@ export function accessError(err, path) {
   return err;
 }
 
-// Probe helper: null when the file is readable, otherwise a probe result.
-export function unreadable(path, what) {
-  if (!existsSync(path)) return { ok: false, reason: `${what} not found on this Mac` };
+// Probe helper: null when the file is readable, otherwise a coded probe result.
+export function unreadable(ctx, sourceId, path, what) {
+  if (!existsSync(path)) return notOk(ctx, sourceId, 'not_installed', `${what} not found on this Mac`);
   const access = canRead(path);
   if (access.ok) return null;
-  return access.needsFullDiskAccess
-    ? { ok: false, reason: 'needs Full Disk Access', needsFullDiskAccess: true }
-    : { ok: false, reason: `cannot read ${what} (${access.code})` };
+  return access.needsFullDiskAccess ? notOk(ctx, sourceId, 'needs_full_disk_access') : notOk(ctx, sourceId, 'unreadable', `cannot read ${what} (${access.code})`);
 }
 
 export function fileSize(path) {

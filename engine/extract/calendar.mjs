@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs';
 import { emailHandle, normalizeEmail } from '../lib/handles.mjs';
 import { fromAppleTime, localDate } from '../lib/time.mjs';
 import { libraryPath, unreadable, openCopy, columns, tableNames, readCursor, writeCursor, ownerOf, zonedToUtc, cleanText, clip } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'calendar';
 const AHEAD_DAYS = 60;
@@ -32,9 +33,9 @@ export function dbPath(ctx) {
   return existsSync(modern) || !existsSync(legacy) ? modern : legacy;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'Calendar database');
+  const bad = unreadable(ctx, id, path, 'Calendar database');
   if (bad) return bad;
   const db = openCopy(ctx, path);
   const c = columns(db, 'CalendarItem');
@@ -210,7 +211,7 @@ function instances(ctx, data, horizonMs) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const db = openCopy(ctx, path);
@@ -238,3 +239,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
   const finished = start < 0 || start + slice.length >= pool.length;
   return { records: slice.map((it) => it.build()), cursor: writeCursor(next(slice.at(-1)?.id ?? c.pos ?? null, finished)), done: finished };
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

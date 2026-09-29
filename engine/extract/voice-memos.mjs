@@ -13,6 +13,7 @@ import { join, basename } from 'node:path';
 import { readAudioTranscript } from '../lib/a-mp4.mjs';
 import { libraryPath, unreadable, openCopy, columns, tableNames, pendingPage, ownerParty, cleanText, transcribeFile } from '../lib/a-local.mjs';
 import { fromAppleTime } from '../lib/time.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'voice_memos';
 const MAX_TRANSCRIBE = 5;
@@ -24,7 +25,7 @@ export function recordingsDir(ctx) {
 }
 export const dbPath = (ctx) => join(recordingsDir(ctx), 'CloudRecordings.db');
 
-function readMemos(db) {
+export function readMemos(db) {
   const c = columns(db, 'ZCLOUDRECORDING');
   const tables = tableNames(db);
   const folder = tables.has('zfolder') && c.has('ZFOLDER') && columns(db, 'ZFOLDER').has('ZENCRYPTEDNAME');
@@ -40,7 +41,7 @@ function readMemos(db) {
 }
 
 // ZPATH can say .m4a while the file on disk is .qta (after Enhance), or the reverse.
-function audioFile(dir, path) {
+export function audioFile(dir, path) {
   const p = join(dir, basename(String(path)));
   if (existsSync(p)) return p;
   for (const ext of ['.m4a', '.qta']) {
@@ -50,9 +51,9 @@ function audioFile(dir, path) {
   return null;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'Voice Memos database');
+  const bad = unreadable(ctx, id, path, 'Voice Memos database');
   if (bad) return bad;
   return { ok: true, count: readMemos(openCopy(ctx, path)).length };
 }
@@ -105,10 +106,13 @@ async function build(ctx, dir, memos) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const dir = recordingsDir(ctx);
   const memos = readMemos(openCopy(ctx, path)).map((m) => ({ ...m, id: String(m.uid ?? m.pk), mark: Number(m.date ?? 0) }));
   return pendingPage(cursor, memos, { limit, build: (items) => build(ctx, dir, items) });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

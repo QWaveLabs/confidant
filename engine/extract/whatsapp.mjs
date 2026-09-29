@@ -16,6 +16,7 @@ import { fromAppleTime } from '../lib/time.mjs';
 import { canRead } from '../lib/sqlite.mjs';
 import { libraryPath, unreadable, openCopy, columns, tableNames, pageByKey, ownerParty, cleanText } from '../lib/a-local.mjs';
 import { contactNames } from '../lib/a-addressbook.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'whatsapp';
 const CONTAINER = ['Group Containers', 'group.net.whatsapp.WhatsApp.shared'];
@@ -26,9 +27,9 @@ const MEDIA = { 1: 'image', 2: 'video', 3: 'audio', 4: 'contact', 5: 'location',
 const TEXT_TYPES = new Set([0, 7, 27, 46]);
 const SKIP_SESSIONS = new Set([2, 3, 4]);
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'WhatsApp database');
+  const bad = unreadable(ctx, id, path, 'WhatsApp database');
   if (bad) return bad;
   const db = openCopy(ctx, path);
   return { ok: true, count: db.prepare('SELECT COUNT(*) AS n FROM ZWAMESSAGE').get().n };
@@ -188,7 +189,7 @@ function toRecords(ctx, L, rows) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const db = openCopy(ctx, path);
@@ -202,3 +203,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
     toRecords: (rows) => toRecords(ctx, L, rows),
   });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

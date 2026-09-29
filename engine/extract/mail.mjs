@@ -19,6 +19,7 @@ import { canRead } from '../lib/sqlite.mjs';
 import { fromAppleTime, fromUnix } from '../lib/time.mjs';
 import { emlxMessage, parseMessage, trimQuoted } from '../lib/a-mime.mjs';
 import { libraryPath, unreadable, openCopy, columns, tableNames, pageByKey, ownerOf, cleanText, clip, listDir, accessError } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'email';
 const MAX_TEXT = 20000;
@@ -58,7 +59,7 @@ export function parseMailboxUrl(url) {
   return { scheme: m[1].toLowerCase(), host: m[2], segments };
 }
 
-function boxKind(segments) {
+export function boxKind(segments) {
   const last = fold(segments.at(-1) ?? '');
   const joined = fold(segments.join('/'));
   if (SKIP_BOX.test(last) || /^\[gmail\]\/(spam|trash|drafts|bin|papelera|borradores)$/.test(joined)) return 'skip';
@@ -175,29 +176,24 @@ function loadLookups(ctx, db, root) {
   return value;
 }
 
-export async function probe(ctx) {
-  let found;
-  try {
-    found = mailRoot(ctx);
-  } catch (err) {
-    return { ok: false, reason: 'needs Full Disk Access', needsFullDiskAccess: !!err.needsFullDiskAccess };
-  }
-  if (!found) return { ok: false, reason: 'Mail app data not found on this Mac' };
-  const bad = unreadable(found.index, 'Mail index');
+async function runProbe(ctx) {
+  const found = mailRoot(ctx);
+  if (!found) return notOk(ctx, id, 'not_installed', 'Mail app data not found on this Mac');
+  const bad = unreadable(ctx, id, found.index, 'Mail index');
   if (bad) return bad;
   const db = openCopy(ctx, found.index);
   return { ok: true, count: db.prepare('SELECT COUNT(*) AS n FROM messages').get().n };
 }
 
 // ---------- .emlx files ----------
-const shard = (rowid) => String(Math.floor(rowid / 1000)).split('').reverse().join('/');
+export const shard = (rowid) => String(Math.floor(rowid / 1000)).split('').reverse().join('/');
 
-function mailboxDir(L, box) {
-  if (box.scheme === 'local') return join(L.root, 'Mailboxes', ...box.segments.map((s) => `${s}.mbox`));
-  return join(L.root, box.account, ...box.segments.map((s) => `${s}.mbox`));
+export function mailboxDir(root, box) {
+  if (box.scheme === 'local') return join(root, 'Mailboxes', ...box.segments.map((s) => `${s}.mbox`));
+  return join(root, box.account, ...box.segments.map((s) => `${s}.mbox`));
 }
 
-function walkEmlx(dir, out, depth = 0) {
+export function walkEmlx(dir, out, depth = 0) {
   if (depth > 12) return;
   let entries;
   try {
@@ -218,7 +214,7 @@ function walkEmlx(dir, out, depth = 0) {
 export function findEmlx(L, rowid, box) {
   const names = [`${rowid}.emlx`, `${rowid}.partial.emlx`];
   if (box) {
-    const dir = mailboxDir(L, box);
+    const dir = mailboxDir(L.root, box);
     const shards = [shard(rowid), rowid < 1000 ? '' : null].filter((s) => s !== null);
     if (!L.stores.has(dir)) L.stores.set(dir, listDir(dir).filter((d) => /^[0-9A-F-]{36}$/i.test(d)));
     const stores = L.stores.get(dir);
@@ -350,7 +346,7 @@ function toRecords(ctx, L, rows) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   let found;
   try {
     found = mailRoot(ctx);
@@ -368,3 +364,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
     toRecords: (rows) => toRecords(ctx, L, rows),
   });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);
