@@ -1,0 +1,56 @@
+{
+  "$comment": "personas/<role>.json. The nine top-level folders never change; a persona adds a few subfolders, vocabulary and focus for the sorter and the agents.",
+  "type": "object",
+  "required": ["id", "label", "focus", "subfolders", "personKinds", "companyKinds"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "enum": ["founder", "agency", "consultant", "investor", "sales", "executive", "recruiter"] },
+    "label": { "$ref": "#/$defs/text" },
+    "focus": { "$ref": "#/$defs/text", "$comment": "one paragraph: what matters most for this role, fed to the sorter and every agent" },
+    "subfolders": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["folder", "name", "rule"],
+        "additionalProperties": false,
+        "properties": {
+          "folder": { "enum": ["people", "companies", "projects", "decisions", "commitments", "ideas", "meetings", "opportunities", "knowledge"] },
+          "name": { "$ref": "#/$defs/text" },
+          "rule": { "type": "string", "$comment": "which notes go here, e.g. kind in [portfolio]" },
+          "kinds": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "personKinds": { "type": "array", "items": { "type": "string" } },
+    "companyKinds": { "type": "array", "items": { "type": "string" } },
+    "opportunityFocus": { "type": "array", "items": { "type": "string" } },
+    "agents": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/text" },
+      "$comment": "extra per-agent emphasis keyed by task key"
+    },
+    "bases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "title", "folder"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string" },
+          "title": { "$ref": "#/$defs/text" },
+          "folder": { "type": "string" },
+          "filter": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "object",
+      "required": ["en", "es"],
+      "additionalProperties": false,
+      "properties": { "en": { "type": "string" }, "es": { "type": "string" } }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs a Node that has node:sqlite without a flag (22.13+ / 23.4+).
+# Order: $CONFIDANT_NODE, the Node that ships inside the ChatGPT app, the Codex runtime Node, then PATH.
+for N in "$CONFIDANT_NODE" \
+  "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node" \
+  "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node" \
+  "$(command -v node 2>/dev/null)"; do
+  [ -n "$N" ] && [ -x "$N" ] || continue
+  if "$N" -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>23||(a===23&&b>=4)||(a===22&&b>=13)?0:1)' 2>/dev/null; then
+    exec "$N" "$@"
+  fi
+done
+echo "confidant: no usable Node found. Open the ChatGPT app once, then try again." >&2
+exit 127

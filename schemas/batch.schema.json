@@ -1,0 +1,20 @@
+{
+  "$comment": ".confidant/batches/<id>.json, written by `confidant batch next`. Codex reads it (following prompts/sort.md) and writes .confidant/contrib/<id>.json matching contribution.schema.json.",
+  "type": "object",
+  "required": ["id", "kind", "language", "created_at", "items", "output"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string" },
+    "kind": { "enum": ["people", "threads", "meetings", "identity_review", "update"] },
+    "scope": { "enum": ["install", "update", "backlog"] },
+    "language": { "enum": ["en", "es"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "owner": { "type": "object" },
+    "persona": { "type": "object" },
+    "instructions": { "type": "string", "$comment": "repo-relative path of the prompt to follow" },
+    "known": { "type": "object", "$comment": "existing note names the sorter should reuse: people, companies, projects" },
+    "items": { "type": "array" },
+    "est_tokens": { "type": "integer" },
+    "output": { "type": "string", "$comment": "path where the contribution must be written" }
+  }
+}

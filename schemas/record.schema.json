@@ -1,0 +1,30 @@
+{
+  "$comment": "One raw item from any source. Stored in .confidant/brain.db records table. Handles: tel:+E164, mailto:lower, slack:T/U, group:<source>:<id>, name:<lower name>.",
+  "type": "object",
+  "required": ["id", "source", "kind", "ts", "text"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z_]+:.+$", "$comment": "<source>:<stable id from the source>" },
+    "source": { "type": "string", "pattern": "^[a-z_]+$" },
+    "kind": { "enum": ["message", "email", "event", "meeting", "call", "recording", "note", "dictation", "doc", "contact"] },
+    "thread": { "type": ["string", "null"], "$comment": "conversation key, e.g. imessage:chat42, email:<thread-id>, meeting:<id>" },
+    "ts": { "type": "string", "format": "date-time" },
+    "from": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/party" }] },
+    "to": { "type": "array", "items": { "$ref": "#/$defs/party" } },
+    "is_from_me": { "type": "boolean" },
+    "title": { "type": ["string", "null"] },
+    "text": { "type": "string" },
+    "url": { "type": ["string", "null"] },
+    "meta": { "type": "object" }
+  },
+  "$defs": {
+    "party": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "handle": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

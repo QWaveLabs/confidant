@@ -1,0 +1,19 @@
+{
+  "$comment": "Output of `confidant tasks spec --json`: one entry per scheduled task the install skill creates with automation_update (mode create, status ACTIVE, executionEnvironment local, cwd = vault).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["key", "name", "rrule", "prompt", "notify", "cwd"],
+    "additionalProperties": false,
+    "properties": {
+      "key": { "enum": ["brain_update", "opportunity_scanner", "morning_brief", "meeting_prep", "follow_up_radar", "weekly_review", "finish_sorting"] },
+      "name": { "type": "string" },
+      "rrule": { "type": "string", "pattern": "^FREQ=(HOURLY|DAILY|WEEKLY|MONTHLY)(;[A-Z]+=[A-Z0-9,+-]+)*$" },
+      "fallbackRrules": { "type": "array", "items": { "type": "string" }, "$comment": "create one task per rule if the combined rule is rejected" },
+      "prompt": { "type": "string", "minLength": 40 },
+      "notify": { "enum": ["heartbeat", "failed_runs_only"] },
+      "cwd": { "type": "string" },
+      "temporary": { "type": "boolean" }
+    }
+  }
+}

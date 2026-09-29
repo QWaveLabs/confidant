@@ -1,0 +1,4 @@
+#!/bin/sh
+# Confidant engine entry point. Works from the installer clone and from <vault>/.confidant/engine.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+exec sh "$HERE/bin/node" "$HERE/engine/cli.mjs" "$@"
