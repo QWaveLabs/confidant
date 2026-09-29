@@ -18,6 +18,7 @@ import { NoteWriter, companyKey } from './notes.mjs';
 import { loadIdentity, recordFixes } from './identity.mjs';
 import { batchRow, setBatchStatus, estimateBacklog } from './batch.mjs';
 import { addReviewItems, writeReviewNote } from './review.mjs';
+import { isExcludedName } from './privacy.mjs';
 
 // Values that are ids, dates or enums: never rewritten.
 const RAW_KEYS = new Set(['source_refs', 'person_ids', 'person_id', 'date', 'due', 'direction', 'status', 'type', 'action', 'batch_id']);
@@ -73,7 +74,9 @@ class Merger {
     this.meetingRefs = meetings;
     this.participants = people;
     this.batchDate = latest ?? w.today;
-    this.excluded = new Set((ctx.config?.exclusions?.people ?? []).map(normalizeName).filter(Boolean));
+    // Same name rule as the privacy filter (prefix and token matches), so an
+    // excluded person never gets a note, a link or a place in a list.
+    this.isExcludedName = (n) => isExcludedName(n, ctx.config);
     const owner = this.identity.owner?.name || ctx.config?.owner?.name || '';
     this.ownerName = owner;
     this.ownerNorm = normalizeName(owner);
@@ -143,7 +146,7 @@ class Merger {
     const n = oneLine(name);
     if (!n) return null;
     if (this.isOwnerName(n)) return { owner: true };
-    if (this.excluded.has(normalizeName(n))) return null;
+    if (this.isExcludedName(n)) return null;
     const notes = this.w.findByName('person', n);
     if (notes.length) {
       const inBatch = notes.filter((r) => this.participants.has(r.id));
@@ -229,6 +232,7 @@ class Merger {
   }
 
   personRef(name) {
+    if (this.isExcludedName(oneLine(name))) return null;
     const res = this.resolvePerson({ name });
     if (res?.owner) return { id: null, name: this.ownerName || oneLine(name) };
     const row = res && !res.owner ? this.w.note(res.id) : null;
@@ -343,7 +347,7 @@ class Merger {
       const co = p.company ? this.ensureCompany(p.company, null, date, { create: this.canCreate('company', p.company) }) : null;
       const row = this.ensureProject(p.name, { status: p.status, goal: p.goal ? oneLine(p.goal) : undefined, ...this.linkFields('company', co, p.company) }, date);
       if (!row) continue;
-      const people = (p.people ?? []).filter((n) => !this.isOwnerName(n)).map((n) => this.personRef(n));
+      const people = (p.people ?? []).filter((n) => !this.isOwnerName(n)).map((n) => this.personRef(n)).filter(Boolean);
       const fresh = people.filter((x) => !(row.data.people ?? []).some((y) => (x.id && y.id === x.id) || normalizeName(y.name) === normalizeName(x.name)));
       if (fresh.length) this.w.unionField(row, 'people', fresh, 40);
       this.addBullets(row.id, bullets);
@@ -384,9 +388,13 @@ class Merger {
       for (const n of m.people ?? []) {
         if (this.isOwnerName(n)) continue;
         const ref = this.personRef(n);
+        if (!ref) continue;
         if (!people.some((x) => (x.id && x.id === ref.id) || normalizeName(x.name) === normalizeName(ref.name))) people.push(ref);
       }
-      const actions = (m.action_items ?? []).map((a) => ({ text: oneLine(a.text), ...(a.owner ? { owner: this.isOwnerName(a.owner) ? this.ownerName || a.owner : this.personRef(a.owner).name } : {}), ...(a.due ? { due: a.due } : {}) }));
+      const actions = (m.action_items ?? []).map((a) => {
+        const owner = a.owner ? (this.isOwnerName(a.owner) ? this.ownerName || a.owner : this.personRef(a.owner)?.name) : null;
+        return { text: oneLine(a.text), ...(owner ? { owner } : {}), ...(a.due ? { due: a.due } : {}) };
+      });
       w.setFields(
         row,
         {
@@ -421,6 +429,7 @@ class Merger {
       const by = [];
       for (const n of d.decided_by ?? []) {
         const ref = this.personRef(n);
+        if (!ref) continue;
         if (!by.some((x) => normalizeName(x.name) === normalizeName(ref.name))) by.push(ref);
       }
       w.setFields(row, { title: oneLine(d.title), date: d.date, rationale: d.rationale, against: d.against, decided_by: by, ...this.linkFields('company', co, d.company), ...this.linkFields('project', pr, d.project) }, d.date);
@@ -469,7 +478,7 @@ class Merger {
   }
 
   isExcluded(name) {
-    return !!name && this.excluded.has(normalizeName(name));
+    return !!name && this.isExcludedName(name);
   }
 
   commitments(list) {

@@ -9,12 +9,16 @@
 // Times are read in the person's time zone. Ids are stable hashes, so a
 // re-export of the same chat updates rather than duplicates.
 // Cursor: { files: { name: signature }, cur: { file, sig, offset } }.
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, lstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, basename, extname } from 'node:path';
 import { groupHandle, nameHandle, phoneHandle } from '../lib/handles.mjs';
 import { shortHash } from '../lib/hash.mjs';
-import { readCursor, writeCursor, zonedToUtc, ownerParty, listDir, cleanText } from '../lib/a-local.mjs';
+import { readCursor, writeCursor, zonedToUtc, ownerParty, listDir, cleanText, openCopy, columns } from '../lib/a-local.mjs';
+import { canRead } from '../lib/sqlite.mjs';
+import { dbPath as nativeDbPath } from './whatsapp.mjs';
+
+const MAX_EXPORT_BYTES = 256 * 1024 * 1024;
 import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'whatsapp_export';
@@ -54,13 +58,18 @@ export function chatNameFromFile(file) {
 }
 
 function readExport(file) {
+  // Regular files only (no FIFOs, sockets or links to them), within a size cap.
+  const st = lstatSync(file);
+  if (!st.isFile()) throw new Error('not a regular file');
+  if (st.size > MAX_EXPORT_BYTES) throw new Error('export file is too large');
   let buf;
   if (extname(file).toLowerCase() === '.zip') {
     const list = execFileSync('/usr/bin/unzip', ['-Z1', file], { maxBuffer: 16 * 1024 * 1024 }).toString('utf8').split('\n').filter(Boolean);
     const entry = list.find((e) => basename(e) === '_chat.txt') ?? list.find((e) => /\.txt$/i.test(e) && !e.startsWith('__MACOSX'));
     if (!entry) return '';
     // unzip reads member names as wildcard patterns, so escape them.
-    buf = execFileSync('/usr/bin/unzip', ['-p', file, entry.replace(/[[\]*?\\]/g, '\\$&')], { maxBuffer: 512 * 1024 * 1024 });
+    // A leading "-" would read as an unzip option, so it goes in brackets too.
+    buf = execFileSync('/usr/bin/unzip', ['-p', file, entry.replace(/[[\]*?\\]/g, '\\$&').replace(/^-/, '[-]')], { maxBuffer: MAX_EXPORT_BYTES });
   } else buf = readFileSync(file);
   return buf.toString('utf8').replace(/^\ufeff/, '');
 }
@@ -176,14 +185,34 @@ function fileSig(file) {
   return `${st.size}:${Math.round(st.mtimeMs)}`;
 }
 
+// Chats the Mac app knows, by name, read from ChatStorage itself. Records of
+// an excluded chat never reach brain.db, so matching through the store alone
+// would leave an export of that chat with a made-up thread and name handles
+// that no handle or chat-id exclusion can match.
+function nativeSessions(ctx) {
+  const map = new Map();
+  const path = nativeDbPath(ctx);
+  if (!existsSync(path) || !canRead(path).ok) return map;
+  try {
+    const db = openCopy(ctx, path);
+    const c = columns(db, 'ZWACHATSESSION');
+    for (const s of db.prepare(`SELECT ZCONTACTJID AS jid, ${c.pick('ZPARTNERNAME', 'name')}, ${c.pick('ZSESSIONTYPE', 'type')} FROM ZWACHATSESSION`).all()) {
+      if (!s.jid || !s.name) continue;
+      const k = fold(s.name);
+      if (!map.has(k)) map.set(k, { thread: `whatsapp:${s.jid}`, group: Number(s.type) === 1 || String(s.jid).endsWith('@g.us'), jid: String(s.jid) });
+    }
+  } catch {}
+  return map;
+}
+
 // A native WhatsApp thread with the same chat name, if the Mac app has it.
 function nativeThreads(ctx) {
-  const map = new Map();
+  const map = nativeSessions(ctx);
   try {
     const rows = ctx.store.db
       .prepare("SELECT thread, json_extract(meta_json, '$.chat_name') AS name, MAX(json_extract(meta_json, '$.is_group')) AS grp FROM records WHERE source = 'whatsapp' GROUP BY thread, name")
       .all();
-    for (const r of rows) if (r.name && !map.has(fold(r.name))) map.set(fold(r.name), { thread: r.thread, group: !!r.grp });
+    for (const r of rows) if (r.name && !map.has(fold(r.name))) map.set(fold(r.name), { thread: r.thread, group: !!r.grp, jid: String(r.thread).replace(/^whatsapp:/, '') });
   } catch {}
   return map;
 }
@@ -211,6 +240,9 @@ function toRecords(ctx, file, parsed, native) {
   const thread = mapped?.thread ?? `whatsapp:export:${shortHash(key, 16)}`;
   const group = { handle: mapped ? groupHandle('whatsapp', mapped.thread.replace(/^whatsapp:/, '')) : groupHandle('whatsapp_export', shortHash(key, 16)), name: chat };
   const skip = mapped ? nativeKeys(ctx, mapped.thread) : new Set();
+  // A direct chat the Mac app knows: the partner's real phone handle.
+  const partnerUser = mapped?.jid && !mapped.group ? /^(\d{6,15})@s\.whatsapp\.net$/.exec(mapped.jid)?.[1] : null;
+  const partnerPhone = partnerUser ? phoneHandle(`+${partnerUser}`) : null;
   const seen = new Map();
   const out = [];
   for (const m of parsed.messages) {
@@ -220,7 +252,7 @@ function toRecords(ctx, file, parsed, native) {
     seen.set(base, n);
     const fromMe = m.sender === me;
     const phone = /^\+?[\d\s().-]{8,}$/.test(m.sender) ? phoneHandle(m.sender.startsWith('+') ? m.sender : `+${m.sender}`) : null;
-    const sender = fromMe ? ownerParty(ctx) : { handle: phone ?? nameHandle(m.sender), name: phone ? null : m.sender };
+    const sender = fromMe ? ownerParty(ctx) : { handle: phone ?? (isGroup ? null : partnerPhone) ?? nameHandle(m.sender), name: phone ? null : m.sender };
     const meta = { chat_name: chat, export_file: basename(file) };
     if (isGroup) meta.is_group = true;
     if (m.media) meta.media = m.media;
@@ -233,7 +265,7 @@ function toRecords(ctx, file, parsed, native) {
       thread,
       ts: m.ts,
       from: sender,
-      to: isGroup ? [group] : fromMe ? [{ handle: nameHandle(chat), name: chat }] : [],
+      to: isGroup ? [group] : fromMe ? [{ handle: partnerPhone ?? nameHandle(chat), name: chat }] : [],
       is_from_me: fromMe,
       title: isGroup ? chat : null,
       text: cleanText(m.text),
@@ -245,6 +277,7 @@ function toRecords(ctx, file, parsed, native) {
 }
 
 const EXPORT_FILE = /\.(zip|txt)$/i;
+const PARSED = new Map();
 
 async function runProbe(ctx) {
   const dir = exportDir(ctx);
@@ -269,7 +302,14 @@ async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
     const offset = cur?.file === name && cur.sig === sig ? cur.offset : 0;
     let parsed;
     try {
-      parsed = parseExport(readExport(file), { timeZone: ctx.tz ?? ctx.config?.timezone ?? 'UTC' });
+      // Parsed once per file version, not once per page.
+      const cacheKey = `${file}|${sig}|${ctx.tz ?? ''}`;
+      parsed = PARSED.get(cacheKey);
+      if (!parsed) {
+        parsed = parseExport(readExport(file), { timeZone: ctx.tz ?? ctx.config?.timezone ?? 'UTC' });
+        PARSED.clear();
+        PARSED.set(cacheKey, parsed);
+      }
     } catch (err) {
       ctx.log?.warn?.(`could not read WhatsApp export ${name}: ${err.message}`);
       files[name] = sig;

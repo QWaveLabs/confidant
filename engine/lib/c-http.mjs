@@ -109,11 +109,16 @@ export async function request(ctx, url, {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
-      res = await fetchFn(url, { method, headers: finalHeaders, body: finalBody, signal: controller.signal });
+      // No redirects: a hop to another host would carry the API key headers
+      // (and a POST body such as audio) somewhere we never meant to send them.
+      res = await fetchFn(url, { method, headers: finalHeaders, body: finalBody, signal: controller.signal, redirect: 'error' });
     } catch (err) {
       clearTimeout(timer);
-      lastErr = new HttpError(`${label}: ${err.name === 'AbortError' ? 'timed out' : err.message}`, {});
-      if (attempt === retries) throw lastErr;
+      // An invalid header value makes fetch echo the value (the key) in its
+      // message, so that case gets a fixed sentence instead.
+      const headerProblem = /header/i.test(err.message ?? '') && err.name !== 'AbortError';
+      lastErr = new HttpError(`${label}: ${err.name === 'AbortError' ? 'timed out' : headerProblem ? 'invalid request headers, check the saved key' : err.message}`, { needsKey: headerProblem });
+      if (attempt === retries || headerProblem) throw lastErr;
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -126,7 +131,7 @@ export async function request(ctx, url, {
       const text = await safeText(res);
       lastErr = new HttpError(`${label}: HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}`, { status: res.status, body: text });
       if (attempt === retries) throw lastErr;
-      const wait = retryAfterMs(res.headers?.get?.('retry-after'), clock) ?? backoffMs(attempt);
+      const wait = Math.min(retryAfterMs(res.headers?.get?.('retry-after'), clock) ?? backoffMs(attempt), 60000);
       await sleep(wait);
       continue;
     }

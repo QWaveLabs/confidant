@@ -164,7 +164,8 @@ test('whatsapp exports: zip and txt, owner, groups, stable ids, native dedupe', 
   assert.ok(!ana.some((r) => r.text === 'Hola Rob, ¿revisaste la propuesta?'));
   const mine = ana.find((r) => r.is_from_me);
   assert.equal(mine.from.name, 'Alex Rivera');
-  assert.deepEqual(mine.to, [{ handle: 'name:ana lópez', name: 'Ana López' }]);
+  assert.deepEqual(mine.to, [{ handle: 'tel:+5215512345678', name: 'Ana López' }], 'the real phone from the Mac app');
+  assert.ok(ana.filter((r) => !r.is_from_me).every((r) => r.from.handle === 'tel:+5215512345678'));
   assert.equal(ana.filter((r) => r.text === 'ok').length, 2, 'identical lines keep separate ids');
 
   const team = recs.filter((r) => r.meta.chat_name === 'Deal Team');

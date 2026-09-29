@@ -2,7 +2,7 @@
 // Sandbox, trust, wake schedule and login item setup, plus recording a
 // source's real status in config.json. Every subcommand supports --dry-run
 // and prints exactly what it will change before it changes anything.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, appendFileSync, copyFileSync, constants as fsc } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { ensureDir, writeFileAtomic } from './lib/files.mjs';
@@ -33,20 +33,23 @@ function runSandbox(args, ctx) {
 function runTrust(args, ctx, { home = HOME } = {}) {
   const homeConfigPath = join(expandHome(home), '.codex', 'config.toml');
   const before = existsSync(homeConfigPath) ? readFileSync(homeConfigPath, 'utf8') : '';
-  const { text: after, changed } = appendTrustedProject(before, ctx.vault);
+  const { text: after, changed, conflict = false } = appendTrustedProject(before, ctx.vault);
   const willWrite = changed && !!args.yes && !ctx.dryRun;
   let backupPath = null;
+  const diff = changed ? after.slice(before.length) : '';
   if (willWrite) {
     ensureDir(join(expandHome(home), '.codex'));
     if (existsSync(homeConfigPath)) {
+      // copyFileSync keeps the original's permissions (it may hold tokens).
       backupPath = `${homeConfigPath}.confidant-${Date.now()}.bak`;
-      writeFileSync(backupPath, before);
+      copyFileSync(homeConfigPath, backupPath, fsc.COPYFILE_EXCL);
     }
-    writeFileSync(homeConfigPath, after);
+    // Append only: whatever the Codex app wrote meanwhile is kept.
+    appendFileSync(homeConfigPath, diff);
   }
-  const diff = changed ? after.slice(before.length) : '';
-  const result = { path: homeConfigPath, alreadyTrusted: !changed, wouldChange: changed, written: willWrite, backupPath, diff };
+  const result = { path: homeConfigPath, alreadyTrusted: !changed && !conflict, conflict, wouldChange: changed, written: willWrite, backupPath, diff };
   ctx.log.out(result, () => {
+    if (conflict) return `${homeConfigPath} already has a setting for ${ctx.vault}, so nothing was changed. Set trust_level = "trusted" for it there by hand.\n`;
     if (!changed) return `${ctx.vault} is already trusted in ${homeConfigPath}.\n`;
     if (!willWrite) return `Would add to ${homeConfigPath} (pass --yes to write):\n${diff}`;
     return `Trusted ${ctx.vault} in ${homeConfigPath} (backup: ${backupPath}).\n${diff}`;
@@ -69,20 +72,32 @@ const STRICT_TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 export function buildWakeCommand(time) {
   if (!STRICT_TIME.test(time)) throw new Error(`Refusing to build a wake command for an invalid time: ${JSON.stringify(time)}`);
-  const pmset = `pmset repeat wakeorpoweron MTWRFSU ${time}:00`;
+  const pmset = `/usr/bin/pmset repeat wakeorpoweron MTWRFSU ${time}:00`;
   return { pmset, osascript: ['-e', `do shell script "${pmset}" with administrator privileges`] };
+}
+
+// pmset -g sched prints 12-hour times ("6:30AM"); accept either spelling.
+export function schedMentions(output, time) {
+  const [h, m] = time.split(':').map(Number);
+  const twelve = `${h % 12 || 12}:${String(m).padStart(2, '0')}${h < 12 ? 'AM' : 'PM'}`;
+  const text = String(output ?? '').toUpperCase().replace(/\s+(AM|PM)/g, '$1');
+  return text.includes(time) || text.includes(twelve);
 }
 
 function runWake(args, ctx, { exec = (cmd, a) => execFileSync(cmd, a, { encoding: 'utf8' }) } = {}) {
   const briefTime = args.time ?? ctx.config?.briefTime ?? '06:45';
+  if (!STRICT_TIME.test(String(briefTime))) {
+    ctx.log.error(`The brief time must look like 07:30 (24-hour), not ${JSON.stringify(briefTime)}.`);
+    return 2;
+  }
   const wakeTime = minutesBefore(briefTime, 15);
   const { pmset, osascript } = buildWakeCommand(wakeTime);
   const willRun = !!args.yes && !ctx.dryRun;
   let verified = null;
   if (willRun) {
-    exec('osascript', osascript);
+    exec('/usr/bin/osascript', osascript);
     try {
-      verified = exec('pmset', ['-g', 'sched']).includes(wakeTime);
+      verified = schedMentions(exec('/usr/bin/pmset', ['-g', 'sched']), wakeTime);
     } catch {
       verified = null;
     }
@@ -90,7 +105,7 @@ function runWake(args, ctx, { exec = (cmd, a) => execFileSync(cmd, a, { encoding
   const result = { briefTime, wakeTime, command: pmset, ran: willRun, verified };
   ctx.log.out(result, () => (willRun
     ? `Set wake at ${wakeTime} (15 minutes before your ${briefTime} brief). Verified: ${verified ? 'yes' : 'could not confirm'}.\n`
-    : `Would run (asks for your Mac password): ${pmset}\n`));
+    : `Would run (asks for your Mac password): ${pmset}\nThis replaces any repeating wake or power-on schedule already set on this Mac.\n`));
   return 0;
 }
 
@@ -103,7 +118,7 @@ export function buildLoginItemCommand(appPath = '/Applications/ChatGPT.app') {
 function runLoginItem(args, ctx, { exec = (cmd, a) => execFileSync(cmd, a, { encoding: 'utf8' }) } = {}) {
   const script = buildLoginItemCommand();
   const willRun = !!args.yes && !ctx.dryRun;
-  if (willRun) exec('osascript', script);
+  if (willRun) exec('/usr/bin/osascript', script);
   const result = { ran: willRun, appPath: '/Applications/ChatGPT.app' };
   ctx.log.out(result, () => (willRun ? 'Added ChatGPT as a login item.\n' : 'Would add ChatGPT as a login item.\n'));
   return 0;

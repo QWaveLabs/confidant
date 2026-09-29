@@ -23,7 +23,7 @@ Otherwise, page the person's Gmail through the Codex Gmail app:
    messages) to a temporary JSONL file under `.confidant/tmp/`, one JSON
    object per line.
 5. Store them:
-   `bin/confidant ingest --source gmail --file <path> --cursor-key gmail_window --cursor-value <the window's start date>`
+   `bin/confidant ingest --source gmail --account <the connected Gmail address> --file <path> --cursor-key gmail_window --cursor-value <the window's start date>`
 6. Move to the next older window and repeat. Cap how many windows you do in
    one run (a handful), then stop. The scheduled Brain Update continues the
    backfill automatically every 3 hours, using the saved `gmail_window`

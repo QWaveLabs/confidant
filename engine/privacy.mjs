@@ -14,6 +14,8 @@
 //   - A chat that is excluded is excluded whole: every message in it carries
 //     the same thread, chat name and counterpart, so the same rule fires.
 import { parseHandle, last10, normalizeEmail, normalizePhone, isShortCode, isAutomatedEmail, toHandle } from './lib/handles.mjs';
+import { sha1 } from './lib/hash.mjs';
+import { rowToRecord } from './lib/store.mjs';
 import {
   BANKING_DOMAINS, BANKING_DOMAIN_WORDS, BANK_NAMES, BANK_AMBIGUOUS, BANK_SUFFIX, BANKING_TEXT,
   HEALTH_DOMAINS, HEALTH_DOMAIN_WORDS, HEALTH_NAMES, HEALTH_TEXT, HEALTH_EVENT,
@@ -256,6 +258,49 @@ export function filterRecord(record, config) {
 
   const cat = categoryReason(record, v, c);
   return cat ? { keep: false, reason: cat } : { keep: true };
+}
+
+// One name rule everywhere: merge and identity ask this instead of comparing
+// names exactly, so "Carla" excluded also leaves out "Carla Diaz".
+export function isExcludedName(name, config) {
+  if (!name || !config?.exclusions) return false;
+  return nameMatches(name, compile(config).people);
+}
+
+// Deletes stored records the current exclusions leave out, so a person or
+// chat excluded after the install also disappears from brain.db and from
+// everything rebuilt from it (identity, dossiers, batches, digests). Runs only
+// when the exclusions change: a fingerprint is kept in the store's meta.
+export function purgeExcluded(ctx, { force = false } = {}) {
+  const store = ctx.store;
+  const fp = sha1(JSON.stringify({ exclusions: ctx.config?.exclusions ?? null, owner: ctx.config?.owner ?? null }));
+  if (!force && store.getMeta('privacy_fingerprint') === fp) return { checked: 0, removed: 0, skipped: true };
+  const page = store.db.prepare('SELECT rowid AS _rowid, * FROM records WHERE rowid > ? ORDER BY rowid LIMIT 2000');
+  const del = store.db.prepare('DELETE FROM records WHERE id = ?');
+  let after = 0;
+  let checked = 0;
+  const drop = [];
+  for (;;) {
+    const rows = page.all(after);
+    if (!rows.length) break;
+    after = rows.at(-1)._rowid;
+    for (const row of rows) {
+      checked++;
+      if (!filterRecord(rowToRecord(row), ctx.config).keep) drop.push(row.id);
+    }
+  }
+  if (!ctx.dryRun) {
+    store.db.exec('BEGIN');
+    try {
+      for (const id of drop) del.run(id);
+      store.db.exec('COMMIT');
+    } catch (err) {
+      store.db.exec('ROLLBACK');
+      throw err;
+    }
+    store.setMeta('privacy_fingerprint', fp);
+  }
+  return { checked, removed: drop.length };
 }
 
 // ---------- scrubText ----------

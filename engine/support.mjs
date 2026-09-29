@@ -27,6 +27,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { request, HttpError } from './lib/c-http.mjs';
 import { HOME, REPO_ROOT } from './lib/paths.mjs';
+import { scrubText } from './privacy.mjs';
 
 const REPORT_URL = 'https://meetconfidant.com/api/confidant/report';
 const SUPPORT_EMAIL = 'support@meetconfidant.com';
@@ -41,9 +42,13 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 // like a version number or a port are left alone.
 const PHONE_RE = /\+?\d[\d\s().-]{6,}\d/g;
 
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$/;
+
 function sanitizeString(s, home) {
   let out = String(s);
-  if (home) out = out.split(home).join('~');
+  if (ISO_TIME.test(out)) return out;
+  if (home) out = out.replace(new RegExp(`${home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=/|$)`, 'g'), '~');
+  out = out.replace(/\/(Users|Volumes)\/[^\s"']+/gi, '[redacted path]');
   out = out.replace(EMAIL_RE, '[redacted email]');
   out = out.replace(PHONE_RE, (m) => (m.replace(/\D/g, '').length >= 8 ? '[redacted phone]' : m));
   return out;
@@ -78,6 +83,47 @@ export function statusCounts(status) {
   };
 }
 
+// Allowlists: diagnostics keep booleans, counts, versions, fixed source ids
+// and problem codes only. Every free-text field (vault paths, Mail account
+// names, error messages, task names) is dropped, since any of them can carry
+// a person's or client's name.
+const bool = (v) => (v === true ? true : v === false ? false : null);
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const word = (v) => (typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(v) ? v : null);
+
+export function doctorCounts(d) {
+  if (!d) return null;
+  return {
+    node: { version: word(d.node?.version), ok: bool(d.node?.ok) },
+    sqlite3: bool(d.sqlite3?.ok),
+    macos: word(d.macos?.version),
+    disk: { freeGb: num(d.disk?.freeGb), ok: bool(d.disk?.ok) },
+    chatgpt: { installed: bool(d.chatgpt?.installed), version: word(d.chatgpt?.version) },
+    fullDiskAccess: { messages: bool(d.fullDiskAccess?.messages?.ok), mail: bool(d.fullDiskAccess?.mail?.ok) },
+    obsidianInstalled: bool(d.obsidian?.installed),
+    obsidianVaults: Array.isArray(d.vaults?.obsidian) ? d.vaults.obsidian.length : null,
+    confidantVaults: Array.isArray(d.vaults?.confidant) ? d.vaults.confidant.length : null,
+    mailAccounts: num(d.mail?.accounts),
+    whatsappInstalled: bool(d.whatsapp?.installed),
+    keys: Object.fromEntries(Object.entries(d.keys ?? {}).filter(([k]) => word(k)).map(([k, v]) => [k, v === true || v === false ? v : 'unknown'])),
+  };
+}
+
+export function healthCounts(h) {
+  if (!h) return null;
+  return {
+    ok: bool(h.ok),
+    checked_at: typeof h.checked_at === 'string' && ISO_TIME.test(h.checked_at) ? h.checked_at : null,
+    lastUpdateAgeHours: num(h.lastUpdate?.ageHours) == null ? null : Math.round(h.lastUpdate.ageHours),
+    sources: (h.sources ?? []).map((s) => ({ id: word(s.id), ok: bool(s.ok), reason_code: word(s.reason_code), needsKey: !!s.needsKey, needsFullDiskAccess: !!s.needsFullDiskAccess, count: num(s.count) })),
+    tasks: Array.isArray(h.tasks) ? h.tasks.map((t) => ({ key: word(t.key), ok: bool(t.ok) })) : null,
+    backlog: { remaining_batches: num(h.backlog?.remaining_batches), done: bool(h.backlog?.done), stuck: bool(h.backlog?.stuck) },
+    diskAvailableBytes: num(h.disk?.availableBytes),
+    vaultWritable: bool(h.vaultWritable),
+    problems: (h.problems ?? []).map((p) => word(p.area)).filter(Boolean),
+  };
+}
+
 // doctor, health and status are imported dynamically so a missing module
 // (health.mjs may not be built yet) never blocks a report; loaders are
 // injectable so tests never touch the real Mac doctor.mjs would inspect.
@@ -89,14 +135,14 @@ export async function collectDiagnostics(ctx, {
   const out = { doctor: null, health: null, status: null };
   try {
     const mod = await loadDoctor();
-    out.doctor = mod?.checkSystem ? await mod.checkSystem({ language: ctx.lang }) : null;
+    out.doctor = mod?.checkSystem ? doctorCounts(await mod.checkSystem({ language: ctx.lang })) : null;
   } catch {
     // doctor not available in this build; report without it
   }
   try {
     const mod = await loadHealth();
     const build = mod?.checkHealth ?? mod?.buildHealth;
-    out.health = build ? await build(ctx) : null;
+    out.health = build ? healthCounts(await build(ctx)) : null;
   } catch {
     // health.mjs is not built yet
   }
@@ -136,7 +182,11 @@ export function checkRateLimit(ctx, now = new Date()) {
 function recordSend(ctx, now = new Date()) {
   const sent = [...(ctx.state?.support?.sent ?? []), now.toISOString()].filter((iso) => new Date(iso).getTime() > now.getTime() - MONTH_MS);
   ctx.state = { ...ctx.state, support: { ...(ctx.state?.support ?? {}), sent } };
-  ctx.saveState();
+  // The report already left: failing to save the counter must not turn a
+  // successful send into "could not reach", which invites a second send.
+  try {
+    ctx.saveState();
+  } catch {}
 }
 
 function mailtoLink(payload, lang) {
@@ -183,7 +233,8 @@ export async function run(args, ctx, { loadDoctor, loadHealth, loadStatus } = {}
   }
   let message;
   try {
-    message = readFileSync(args.messageFile, 'utf8').trim();
+    // Card numbers, one-time codes and passwords pasted into a report are masked.
+    message = scrubText(readFileSync(args.messageFile, 'utf8').trim()).text;
   } catch (err) {
     ctx.log.error(`Could not read ${args.messageFile}: ${err.message}`);
     return 2;

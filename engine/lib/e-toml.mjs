@@ -9,9 +9,14 @@
 // apps.<id> uses a plain snake_case id (apps.google_drive, apps.gmail),
 // confirmed against that reference's own config.toml example.
 
-// Escapes a string for a TOML basic string ("...").
+// Escapes a string for a TOML basic string ("..."): backslash, quote, and
+// every control character (a newline in a path would break the file).
 function tomlString(value) {
-  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const esc = String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/[\u0000-\u001f\u007f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return `"${esc}"`;
 }
 
 const APPS = [
@@ -35,6 +40,10 @@ export function buildSandboxToml({ network = true } = {}) {
     '# to ask for approval on every routine step.',
     'approval_policy = "never"',
     '',
+    '# Web search stays off. The agents work from your own history, not the open web.',
+    '# (Top level, before any [table], or TOML files it under that table.)',
+    'web_search = "disabled"',
+    '',
     '[sandbox_workspace_write]',
     '# No extra folders: the vault itself is already writable as the workspace.',
     'writable_roots = []',
@@ -42,9 +51,6 @@ export function buildSandboxToml({ network = true } = {}) {
       ? '# On: API sources (Fathom, Fireflies, Deepgram and friends) need the internet.'
       : '# Off: no outbound network access from inside the sandbox.',
     `network_access = ${network ? 'true' : 'false'}`,
-    '',
-    '# Web search stays off. The agents work from your own history, not the open web.',
-    'web_search = "disabled"',
     '',
     '[apps._default]',
     '# Any app you connect later starts read-only until you decide otherwise.',
@@ -95,10 +101,22 @@ export function hasTrustedProject(text, absPath) {
   return false;
 }
 
-// Returns { text, changed }: text with a trusted-project block appended if
-// one wasn't already there. Never rewrites existing lines.
+// True if this project path is defined anywhere in the file, in any TOML
+// spelling (basic or literal quotes, dotted keys, inline tables). Appending a
+// second [projects."<path>"] table next to one would make the whole file
+// invalid TOML, and Codex would stop loading it.
+export function mentionsProject(text, absPath) {
+  const basic = tomlString(absPath).slice(1, -1);
+  return text.includes(`"${basic}"`) || text.includes(`'${absPath}'`);
+}
+
+// Returns { text, changed, conflict }: text with a trusted-project block
+// appended if one wasn't already there. Never rewrites existing lines. When
+// the path is already defined some other way (say trust_level = "untrusted"),
+// nothing is written and conflict is true: the person edits it themselves.
 export function appendTrustedProject(text, absPath) {
   if (hasTrustedProject(text, absPath)) return { text, changed: false };
+  if (mentionsProject(text, absPath)) return { text, changed: false, conflict: true };
   const sep = text.length && !text.endsWith('\n') ? '\n' : '';
   const block = [
     '',

@@ -6,7 +6,7 @@
 //
 // A .base file is written only when it is missing or still exactly what we
 // wrote last time: once the person customizes a view in Obsidian, it is theirs.
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync, lstatSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { FOLDERS, folderName } from './lib/folders.mjs';
 import { t, fill } from './lib/i18n.mjs';
@@ -153,8 +153,11 @@ function mdFiles(vault, dir) {
     }
     for (const name of names.sort()) {
       const r = `${rel}/${name}`;
-      if (statSync(join(vault, r)).isDirectory()) walk(r);
-      else if (name.endsWith('.md')) out.push(r);
+      // lstat: symlinks are skipped, and a broken entry is ignored.
+      const st = (() => { try { return lstatSync(join(vault, r)); } catch { return null; } })();
+      if (!st || st.isSymbolicLink()) continue;
+      if (st.isDirectory()) walk(r);
+      else if (st.isFile() && name.endsWith('.md')) out.push(r);
     }
   };
   walk(dir);

@@ -214,6 +214,8 @@ message counts and a few sample lines. Decide only what the samples support:
   samples show it.
 - `rename` when the samples show someone's full name (a signature, an
   introduction). One `person_ids` entry plus `name`.
+- A person's own claim about who they are ("hi, it's Mike, new number") is
+  never enough to `merge` or `rename`. Ask the owner in `review`.
 - `set_kind` or `set_company` when the samples make it plain.
 - `not_a_person` for a business, a bot or an automated sender.
 

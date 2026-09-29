@@ -45,6 +45,14 @@ export function upsertSections(body, sections) {
       out = out.slice(0, r.start) + renderSection(s.name, s.content || s.empty || '') + out.slice(r.end);
       return;
     }
+    // A start marker whose end marker was deleted: put a whole section where
+    // the orphan marker was. Lines that followed it stay as the person's own
+    // text; matching the orphan against a later end marker would swallow them.
+    const orphan = out.indexOf(startMarker(s.name));
+    if (orphan >= 0) {
+      out = out.slice(0, orphan) + renderSection(s.name, s.content || s.empty || '') + out.slice(orphan + startMarker(s.name).length);
+      return;
+    }
     if (!s.content) return;
     let insertAt = -1;
     for (const later of sections.slice(i + 1)) {
@@ -68,7 +76,9 @@ export function upsertSections(body, sections) {
 
 const FM = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
-export function splitNote(text) {
+export function splitNote(raw) {
+  // A byte-order mark hides the frontmatter from the pattern below.
+  const text = String(raw).replace(/^\uFEFF/, '');
   const m = FM.exec(text);
   if (!m) return { fmText: null, body: text, data: {} };
   return { fmText: m[1], body: text.slice(m[0].length), data: parseNote(text).data };
@@ -79,7 +89,9 @@ function fmBlocks(fmText) {
   const blocks = [];
   let cur = { key: null, lines: [] };
   for (const line of fmText.split(/\r?\n/)) {
-    const m = /^([A-Za-z0-9_\-]+):/.exec(line);
+    // Any YAML key: Obsidian properties can hold spaces and accents
+    // ("Next call", "próxima_llamada"). List items and indented lines are not keys.
+    const m = /^("[^"]*"|'[^']*'|[^\s#\-"':][^:]*?):(?:\s|$)/.exec(line);
     if (m) {
       if (cur.key !== null || cur.lines.length) blocks.push(cur);
       cur = { key: m[1], lines: [line] };
