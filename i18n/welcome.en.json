@@ -1,0 +1,69 @@
+{
+  "title": "Confidant has been installed",
+  "tagline": "Remembers everything. Keeps it close.",
+  "subtitle": "Your private second brain is set up on this Mac. Here is what it does and how to use it.",
+  "supportLine": "Questions? Email {email}.",
+  "sections": {
+    "whatItIs": {
+      "heading": "What it is",
+      "body": "Confidant is a private second brain built from your own working history: messages, meetings, email and notes, organized into a plain folder of notes on this Mac. Six agents read it on a schedule and tell you what needs your attention, so you stop having to remember everything yourself."
+    },
+    "whatItDoes": {
+      "heading": "What it does",
+      "notScheduledYet": "Not scheduled yet",
+      "planned": "Planned: {cadence}"
+    },
+    "howItWorks": {
+      "heading": "How it works",
+      "body": "Your connected sources feed a private folder of notes on this Mac. The six agents above read that folder on their own schedule and write back to it: briefs, radar, and updated notes on people, projects and commitments.",
+      "diagram": { "sources": "Your sources", "vault": "Second Brain (this Mac)", "agents": "Six agents" }
+    },
+    "howToUse": {
+      "heading": "How to use it",
+      "obsidian": "Open the vault in Obsidian to read and search everything it knows: {link}",
+      "briefs": "Your morning brief and weekly review land in the {folder} folder as plain notes.",
+      "scheduled": "Every agent run shows up in the Scheduled view inside the ChatGPT app, so you can see what ran and when.",
+      "ask": "Open this vault as a project in Codex and just ask. A few things people ask:",
+      "examples": [
+        "What am I forgetting?",
+        "Prep me for my 10:30 with Mike",
+        "What did I promise people this week?",
+        "Who is waiting on me?",
+        "What opportunities am I missing?"
+      ]
+    },
+    "connected": {
+      "heading": "What is connected",
+      "recordsLabel": "{count} records",
+      "lastSeen": "last seen {date}",
+      "backfilling": "The install sorted your most recent 60 days. The rest of your history keeps filling in on its own, oldest first, roughly every 3 hours.",
+      "empty": "Nothing connected yet."
+    },
+    "folders": {
+      "heading": "Your folders",
+      "notesLabel": "{count} notes",
+      "subfoldersLabel": "Including:"
+    },
+    "privacy": {
+      "heading": "Privacy",
+      "neverSees": "What it never sees",
+      "neverSeesEmpty": "You have not excluded anything specific yet. Ask Codex to update your setup any time to add banking, health, family chats, or anyone else you want left out.",
+      "whereItLives": "Where your data lives",
+      "whereItLivesBody": "Your notes live in a plain folder on this Mac, at {vault}. To do its work, Codex sends the context it needs to OpenAI's models through your own ChatGPT account. You control that account's own data settings from inside ChatGPT.",
+      "control": "Your controls",
+      "controlBody": "Every source stays read-only: Confidant never writes back to Gmail, Slack, or anywhere else it reads from. You can disconnect a source, add an exclusion, or change what it never sees at any time by asking Codex to update your setup."
+    },
+    "troubleshooting": {
+      "heading": "If something looks off",
+      "items": [
+        { "q": "A brief did not show up", "a": "Agents only run while this Mac is awake and the ChatGPT app is open. Check the Scheduled view in the ChatGPT app for the run and what it says." },
+        { "q": "Full Disk Access turned off", "a": "Open System Settings, then Privacy & Security, then Full Disk Access, and turn ChatGPT back on. Relaunch ChatGPT, then tell Codex \"continue setting up my second brain\"." },
+        { "q": "A connected app disconnected", "a": "Reconnect it from the ChatGPT app's connector settings, then tell Codex \"continue setting up my second brain\"." },
+        { "q": "An API key expired", "a": "Ask Codex to run confidant keys set for that source again." },
+        { "q": "Pause or change a task", "a": "Open the Scheduled view inside the ChatGPT app: you can pause, edit, or delete any of the six agents there directly." },
+        { "q": "Setup was interrupted", "a": "Tell Codex \"continue setting up my second brain\" in this vault's project. It resumes exactly where it left off." },
+        { "q": "You want to stop using Confidant", "a": "Delete the scheduled tasks for this vault from the Scheduled view, then delete the vault folder. Nothing else on your Mac depends on it." }
+      ]
+    }
+  }
+}

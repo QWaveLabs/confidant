@@ -1,0 +1,16 @@
+{
+  "sourceStatus": {
+    "connected": "Conectado",
+    "partial": "Conectado parcialmente",
+    "skipped": "Omitido",
+    "blocked": "Bloqueado",
+    "unused": "Sin usar"
+  },
+  "exclusionCategories": {
+    "banking": "temas bancarios",
+    "health": "salud",
+    "family": "conversaciones familiares",
+    "personal-email": "tu correo personal",
+    "passwords": "contraseñas y códigos de un solo uso"
+  }
+}
