@@ -12,7 +12,7 @@ function emailRecord(over = {}) {
     thread: 'email:t1',
     ts: over.ts ?? '2026-09-10T15:00:00.000Z',
     from: over.from ?? { handle: 'mailto:notifications@fathom.video', name: 'Fathom' },
-    to: over.to ?? [{ handle: 'mailto:rob@acme.com', name: 'Rob' }],
+    to: over.to ?? [{ handle: 'mailto:alex@acme.com', name: 'Alex' }],
     is_from_me: false,
     title: over.title ?? 'Meeting notes: Weekly sync',
     text: over.text ?? 'Summary of the call.\n\nAction items:\n- Send the deck\n- Book a follow-up\n\nThanks!',
