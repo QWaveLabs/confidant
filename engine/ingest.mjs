@@ -262,7 +262,16 @@ function mapSlack(item, { ownerHandles }) {
     title: null,
     text: item.text ?? item.message ?? '',
     url: item.permalink ?? null,
-    meta: { channel: channelId, channelName: slackChannelName(item), threadTs: item.thread_ts ?? item._context?.thread_ts ?? null },
+    meta: {
+      channel: channelId,
+      channelName: slackChannelName(item),
+      threadTs: item.thread_ts ?? item._context?.thread_ts ?? null,
+      // For the privacy rules: channel names can be excluded like chats, and
+      // a direct message (D...) is a one-to-one thread, not a group.
+      chat_name: slackChannelName(item) ?? null,
+      is_group: !String(channelId).startsWith('D'),
+      ...(Number(item._context?.num_members ?? item.num_members) > 0 ? { member_count: Number(item._context?.num_members ?? item.num_members) } : {}),
+    },
   };
 }
 
@@ -312,7 +321,7 @@ export async function run(args, ctx) {
   }
 
   const totals = { source, read: items.length, inserted: 0, updated: 0, unchanged: 0, excluded: 0, invalid: 0 };
-  const keep = [];
+  const valid = [];
   for (const item of items) {
     let record;
     try {
@@ -332,12 +341,12 @@ export async function run(args, ctx) {
       totals.invalid++;
       continue;
     }
-    if (!privacy.filterRecord(record, ctx.config).keep) {
-      totals.excluded++;
-      continue;
-    }
-    keep.push(record);
+    valid.push(record);
   }
+  // The thread rule, same as the extract runner: a Gmail thread or Slack DM
+  // with an excluded person goes whole, including the owner's replies.
+  const { keep, excluded } = privacy.threadGate(ctx).filter(valid);
+  totals.excluded += excluded;
 
   if (!ctx.dryRun) {
     const counts = ctx.store.upsertRecords(keep);

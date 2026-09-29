@@ -52,21 +52,26 @@ export async function extractSource(ctx, src, { limit = 2000, full = false, maxP
   const mod = await loadModule(src.module);
   if (!mod?.extract) return { id: src.id, ok: false, reason: 'not built' };
   const privacy = await loadPrivacy();
+  // Exclusions that cover a whole thread (an excluded person in a small
+  // chat, a bank short code) reach every record in it, whatever the order.
+  const gate = privacy.threadGate ? privacy.threadGate(ctx) : null;
   const totals = { id: src.id, ok: true, pages: 0, inserted: 0, updated: 0, unchanged: 0, excluded: 0, invalid: 0 };
   let cursor = full ? null : ctx.store.getCursor(src.id);
   for (let page = 0; page < maxPages; page++) {
     const result = await mod.extract(ctx, { cursor, limit });
-    const keep = [];
+    const valid = [];
     for (const r of result.records ?? []) {
-      if (check('record', r).length) {
-        totals.invalid++;
-        continue;
-      }
-      if (!privacy.filterRecord(r, ctx.config).keep) {
-        totals.excluded++;
-        continue;
-      }
-      keep.push(r);
+      if (check('record', r).length) totals.invalid++;
+      else valid.push(r);
+    }
+    let keep;
+    if (gate) {
+      const g = gate.filter(valid);
+      keep = g.keep;
+      totals.excluded += g.excluded;
+    } else {
+      keep = valid.filter((r) => privacy.filterRecord(r, ctx.config).keep);
+      totals.excluded += valid.length - keep.length;
     }
     if (!ctx.dryRun) {
       const c = ctx.store.upsertRecords(keep);
@@ -81,6 +86,7 @@ export async function extractSource(ctx, src, { limit = 2000, full = false, maxP
     cursor = result.cursor ?? cursor;
     if (result.done || !(result.records ?? []).length) break;
   }
+  if (gate?.removed) totals.removed = gate.removed;
   return totals;
 }
 

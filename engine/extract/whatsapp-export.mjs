@@ -243,6 +243,10 @@ function toRecords(ctx, file, parsed, native) {
   // A direct chat the Mac app knows: the partner's real phone handle.
   const partnerUser = mapped?.jid && !mapped.group ? /^(\d{6,15})@s\.whatsapp\.net$/.exec(mapped.jid)?.[1] : null;
   const partnerPhone = partnerUser ? phoneHandle(`+${partnerUser}`) : null;
+  const phoneOf = (name) => (/^\+?[\d\s().-]{8,}$/.test(name) ? phoneHandle(name.startsWith('+') ? name : `+${name}`) : null);
+  // Everyone who wrote in a group export: the privacy rules count them and
+  // match excluded people among them, like a native group's member list.
+  const participants = isGroup ? [...new Set(senders.filter((s) => s !== me).map((s) => phoneOf(s) ?? nameHandle(s)).filter(Boolean))] : null;
   const seen = new Map();
   const out = [];
   for (const m of parsed.messages) {
@@ -251,10 +255,13 @@ function toRecords(ctx, file, parsed, native) {
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
     const fromMe = m.sender === me;
-    const phone = /^\+?[\d\s().-]{8,}$/.test(m.sender) ? phoneHandle(m.sender.startsWith('+') ? m.sender : `+${m.sender}`) : null;
+    const phone = phoneOf(m.sender);
     const sender = fromMe ? ownerParty(ctx) : { handle: phone ?? (isGroup ? null : partnerPhone) ?? nameHandle(m.sender), name: phone ? null : m.sender };
     const meta = { chat_name: chat, export_file: basename(file) };
-    if (isGroup) meta.is_group = true;
+    if (isGroup) {
+      meta.is_group = true;
+      meta.participants = participants;
+    }
     if (m.media) meta.media = m.media;
     if (m.attachment) meta.attachments = [{ filename: m.attachment }];
     if (m.edited) meta.edited = true;

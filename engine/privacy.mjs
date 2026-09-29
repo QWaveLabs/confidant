@@ -188,37 +188,85 @@ function names(v) {
   return [...v.parties.map(partyName), ...v.chatNames, ...v.contactNames].filter(Boolean);
 }
 
+// A category that fires on who the thread is with (a bank's domain, a short
+// code, an automated sender) covers the whole thread: the owner's "YES"
+// reply to a bank text is banking too. One that fires on a person's words
+// covers only that record.
+const T = (reason) => ({ reason, scope: 'thread' });
+const R = (reason) => ({ reason, scope: 'record' });
+
 function categoryReason(record, v, c) {
   const kind = record.kind;
   if (c.cats.has('banking')) {
-    if (anyDomain(v, (d) => domainIn(d, BANKING_DOMAINS) || (!!d && BANKING_DOMAIN_WORDS.test(`${d}.`)))) return 'banking';
-    if (names(v).some(bankName)) return 'banking';
-    if (v.short && BANKING_TEXT.test(v.text) && (v.senderAutomated || BANK_NAMES.test(v.text))) return 'banking';
+    if (anyDomain(v, (d) => domainIn(d, BANKING_DOMAINS) || (!!d && BANKING_DOMAIN_WORDS.test(`${d}.`)))) return T('banking');
+    if (names(v).some(bankName)) return T('banking');
+    if (v.short && BANKING_TEXT.test(v.text) && v.senderAutomated) return T('banking');
+    if (v.short && BANKING_TEXT.test(v.text) && BANK_NAMES.test(v.text)) return R('banking');
   }
   if (c.cats.has('health')) {
-    if (anyDomain(v, (d) => domainIn(d, HEALTH_DOMAINS) || (!!d && HEALTH_DOMAIN_WORDS.test(`${d}.`)))) return 'health';
-    if ([...v.parties.map(partyName), ...v.chatNames].some((n) => HEALTH_NAMES.test(foldName(n)))) return 'health';
-    if (v.short && kind !== 'event' && HEALTH_TEXT.test(v.text)) return 'health';
-    if (kind === 'event' && (HEALTH_EVENT.test(fold(record.title)) || HEALTH_TEXT.test(v.text))) return 'health';
+    if (anyDomain(v, (d) => domainIn(d, HEALTH_DOMAINS) || (!!d && HEALTH_DOMAIN_WORDS.test(`${d}.`)))) return T('health');
+    if ([...v.parties.map(partyName), ...v.chatNames].some((n) => HEALTH_NAMES.test(foldName(n)))) return T('health');
+    if (v.short && kind !== 'event' && HEALTH_TEXT.test(v.text)) return v.senderAutomated ? T('health') : R('health');
+    if (kind === 'event' && (HEALTH_EVENT.test(fold(record.title)) || HEALTH_TEXT.test(v.text))) return R('health');
   }
   if (c.cats.has('passwords')) {
-    if (anyDomain(v, (d) => domainIn(d, PASSWORD_DOMAINS))) return 'passwords';
-    if (v.parties.some((p) => PASSWORD_NAMES.test(foldName(partyName(p))))) return 'passwords';
-    if ((kind === 'message' || kind === 'email') && PASSWORD_TEXT.test(v.text)) return 'passwords';
+    if (anyDomain(v, (d) => domainIn(d, PASSWORD_DOMAINS))) return T('passwords');
+    if (v.parties.some((p) => PASSWORD_NAMES.test(foldName(partyName(p))))) return T('passwords');
+    if ((kind === 'message' || kind === 'email') && PASSWORD_TEXT.test(v.text)) return v.senderAutomated ? T('passwords') : R('passwords');
   }
   if (c.cats.has('family')) {
     const relative = (n) => {
       const f = foldName(n);
       return (FAMILY_WHOLE.test(f) || FAMILY_PREFIX.test(f)) && !FAMILY_NOT.test(f);
     };
-    if (v.chatNames.some((n) => (FAMILY_CHAT.test(foldName(n)) || relative(n)) && !FAMILY_NOT.test(foldName(n)))) return 'family';
-    if (!v.isGroup && v.counterparts.length && v.counterparts.length <= SMALL_CIRCLE && v.counterparts.some((p) => relative(partyName(p)))) return 'family';
-    if (v.contactNames.some(relative)) return 'family';
-    if (kind === 'event' && FAMILY_EVENT.test(fold(record.title)) && !FAMILY_NOT.test(fold(record.title))) return 'family';
+    if (v.chatNames.some((n) => (FAMILY_CHAT.test(foldName(n)) || relative(n)) && !FAMILY_NOT.test(foldName(n)))) return T('family');
+    if (!v.isGroup && v.counterparts.length && v.counterparts.length <= SMALL_CIRCLE && v.counterparts.some((p) => relative(partyName(p)))) return T('family');
+    if (v.contactNames.some(relative)) return R('family');
+    if (kind === 'event' && FAMILY_EVENT.test(fold(record.title)) && !FAMILY_NOT.test(fold(record.title))) return R('family');
   }
   return null;
 }
 
+// Conversations (messages and emails) follow the thread rule; meetings,
+// events, calls and contacts keep the per-record rules.
+const CONVERSATION = new Set(['message', 'email']);
+export const LARGE_GROUP = 8;
+
+function partyReason(p, c) {
+  if (!p) return null;
+  if (c.people.length && nameMatches(partyName(p), c.people)) return 'person';
+  if (handleMatches(p.handle, c)) return 'handle';
+  if (c.domains.length && domainIn(domainOf(p.handle), c.domains)) return 'domain';
+  return null;
+}
+
+// How many people are in the conversation. Groups: the member count or list
+// (null when unknown, for example a Slack channel). Emails and direct chats:
+// the addresses on the record, owner included.
+function conversationSize(v) {
+  const count = Number(v.meta.member_count);
+  if (Number.isFinite(count) && count > 0) return count;
+  if (Array.isArray(v.meta.participants)) return new Set(v.meta.participants).size + (v.isGroup ? 1 : 0);
+  if (v.isGroup) return null;
+  return new Set(v.people.map((p) => p.handle ?? foldName(partyName(p)))).size;
+}
+
+// A message in a large group that names or quotes an excluded person.
+function mentionsExcluded(v, c) {
+  const folded = ` ${foldName(v.text)} `;
+  if (c.people.some((n) => folded.includes(` ${n} `))) return true;
+  const digits = v.text.replace(/\D/g, '');
+  for (const h of c.handles) {
+    const { scheme, value } = parseHandle(h);
+    if (scheme === 'mailto' && v.text.includes(value)) return true;
+  }
+  for (const tail of c.handleTails) if (digits.includes(tail)) return true;
+  return false;
+}
+
+// { keep, reason?, scope? }. scope 'thread' means every record in the same
+// thread goes too (threadGate and purgeExcluded apply that); 'record' means
+// only this one.
 export function filterRecord(record, config) {
   if (!record || !config?.exclusions) return { keep: true };
   const c = compile(config);
@@ -226,38 +274,102 @@ export function filterRecord(record, config) {
 
   // Whole mail accounts (and the personal-email category).
   const account = normalizeEmail(v.meta.account);
-  if (account && c.personalAccounts.has(account)) return { keep: false, reason: 'email-account' };
+  if (account && c.personalAccounts.has(account)) return { keep: false, reason: 'email-account', scope: 'thread' };
 
-  if (c.people.length) {
-    if (v.from && !v.fromIsMe && nameMatches(partyName(v.from), c.people)) return { keep: false, reason: 'person' };
-    const circle = v.counterparts.length <= SMALL_CIRCLE && !v.isGroup;
-    if (circle && v.counterparts.some((p) => nameMatches(partyName(p), c.people))) return { keep: false, reason: 'person' };
-    if (v.contactNames.some((n) => nameMatches(n, c.people))) return { keep: false, reason: 'person' };
-  }
-
-  if (c.handles.size || c.handleTails.size) {
-    const all = [...v.parties.map((p) => p.handle), ...v.contactHandles];
-    if (all.some((h) => handleMatches(h, c))) return { keep: false, reason: 'handle' };
-  }
-
-  if (c.domains.length && anyDomain(v, (d) => domainIn(d, c.domains))) return { keep: false, reason: 'domain' };
-
+  // Excluded chats, by name, id or group handle: always the whole thread.
   if (c.chats.length) {
     const folded = v.chatNames.map(foldName);
     const ids = [record.thread, ...v.groups.map((g) => g.handle)].filter(Boolean);
     for (const x of c.chats) {
-      if (x.folded && folded.includes(x.folded)) return { keep: false, reason: 'chat' };
-      if (ids.some((id) => id === x.raw || id.endsWith(`:${x.raw}`))) return { keep: false, reason: 'chat' };
+      if (x.folded && folded.includes(x.folded)) return { keep: false, reason: 'chat', scope: 'thread' };
+      if (ids.some((id) => id === x.raw || id.endsWith(`:${x.raw}`))) return { keep: false, reason: 'chat', scope: 'thread' };
     }
+  }
+  if (v.groups.some((g) => handleMatches(g.handle, c))) return { keep: false, reason: 'handle', scope: 'thread' };
+
+  // People, handles and domains.
+  const senderHit = v.from && !v.fromIsMe ? partyReason(v.from, c) : null;
+  if (CONVERSATION.has(record.kind)) {
+    const members = [...v.people, ...(v.meta.participants ?? []).map((h) => ({ handle: h, name: null }))];
+    const otherHit = members.filter((p) => p !== v.from && !isOwner(p, c)).map((p) => partyReason(p, c)).find(Boolean) ?? null;
+    if (senderHit || otherHit) {
+      const size = conversationSize(v);
+      const large = size == null ? v.isGroup : size >= LARGE_GROUP;
+      // A small thread with an excluded person in it goes whole. In a large
+      // group only their own messages and the ones that name them go.
+      if (!large) return { keep: false, reason: senderHit ?? otherHit, scope: 'thread' };
+      if (senderHit || mentionsExcluded(v, c)) return { keep: false, reason: senderHit ?? otherHit, scope: 'record' };
+    }
+  } else {
+    if (senderHit) return { keep: false, reason: senderHit, scope: 'record' };
+    if (c.people.length) {
+      const circle = v.counterparts.length <= SMALL_CIRCLE && !v.isGroup;
+      if (circle && v.counterparts.some((p) => nameMatches(partyName(p), c.people))) return { keep: false, reason: 'person', scope: 'record' };
+      if (v.contactNames.some((n) => nameMatches(n, c.people))) return { keep: false, reason: 'person', scope: 'record' };
+    }
+    if (c.handles.size || c.handleTails.size) {
+      const all = [...v.parties.map((p) => p.handle), ...v.contactHandles];
+      if (all.some((h) => handleMatches(h, c))) return { keep: false, reason: 'handle', scope: 'record' };
+    }
+    if (c.domains.length && anyDomain(v, (d) => domainIn(d, c.domains))) return { keep: false, reason: 'domain', scope: 'record' };
   }
 
   if (c.keywords.length) {
     const hay = fold(`${record.title ?? ''}\n${record.text ?? ''}\n${v.meta.summary ?? ''}`);
-    if (c.keywords.some((re) => re.test(hay))) return { keep: false, reason: 'keyword' };
+    if (c.keywords.some((re) => re.test(hay))) return { keep: false, reason: 'keyword', scope: 'record' };
   }
 
   const cat = categoryReason(record, v, c);
-  return cat ? { keep: false, reason: cat } : { keep: true };
+  return cat ? { keep: false, ...cat } : { keep: true };
+}
+
+// Threads excluded whole are remembered in brain.db (excluded_threads), so a
+// later reply in the same thread is left out too, and records already stored
+// from that thread are deleted when it is first excluded. Each page is read
+// twice: first to find newly excluded threads, then to decide, so the order
+// records arrive in never matters.
+const THREADS_SQL = 'CREATE TABLE IF NOT EXISTS excluded_threads (thread TEXT PRIMARY KEY, reason TEXT, at TEXT NOT NULL)';
+
+export function threadGate(ctx) {
+  const memory = new Set();
+  const store = ctx.store;
+  const persist = !ctx.dryRun && !!store;
+  let has = null;
+  let add = null;
+  let drop = null;
+  if (store) {
+    store.ensureTable(THREADS_SQL);
+    has = store.db.prepare('SELECT 1 AS x FROM excluded_threads WHERE thread = ?');
+    add = store.db.prepare('INSERT OR IGNORE INTO excluded_threads (thread, reason, at) VALUES (?, ?, ?)');
+    drop = store.db.prepare('DELETE FROM records WHERE thread = ?');
+  }
+  const excluded = (thread) => !!thread && (memory.has(thread) || !!has?.get(thread));
+  let removed = 0;
+  return {
+    excluded,
+    get removed() {
+      return removed;
+    },
+    // records -> { keep, excluded } after the thread rule.
+    filter(records) {
+      const checked = records.map((r) => ({ r, res: filterRecord(r, ctx.config) }));
+      for (const { r, res } of checked) {
+        if (res.keep || res.scope !== 'thread' || !r.thread || excluded(r.thread)) continue;
+        memory.add(r.thread);
+        if (persist) {
+          add.run(r.thread, res.reason ?? null, new Date().toISOString());
+          removed += drop.run(r.thread).changes;
+        }
+      }
+      const keep = [];
+      let out = 0;
+      for (const { r, res } of checked) {
+        if (!res.keep || excluded(r.thread)) out++;
+        else keep.push(r);
+      }
+      return { keep, excluded: out };
+    },
+  };
 }
 
 // One name rule everywhere: merge and identity ask this instead of comparing
@@ -277,18 +389,29 @@ export function purgeExcluded(ctx, { force = false } = {}) {
   if (!force && store.getMeta('privacy_fingerprint') === fp) return { checked: 0, removed: 0, skipped: true };
   const page = store.db.prepare('SELECT rowid AS _rowid, * FROM records WHERE rowid > ? ORDER BY rowid LIMIT 2000');
   const del = store.db.prepare('DELETE FROM records WHERE id = ?');
-  let after = 0;
-  let checked = 0;
-  const drop = [];
-  for (;;) {
-    const rows = page.all(after);
-    if (!rows.length) break;
-    after = rows.at(-1)._rowid;
-    for (const row of rows) {
-      checked++;
-      if (!filterRecord(rowToRecord(row), ctx.config).keep) drop.push(row.id);
+  const gate = threadGate(ctx);
+  const each = (fn) => {
+    let after = 0;
+    for (;;) {
+      const rows = page.all(after);
+      if (!rows.length) break;
+      after = rows.at(-1)._rowid;
+      fn(rows.map(rowToRecord));
     }
-  }
+  };
+  // Pass 1: which threads are now excluded whole (the gate deletes their records).
+  let checked = 0;
+  each((records) => {
+    checked += records.length;
+    gate.filter(records);
+  });
+  // Pass 2: single records the rules now leave out.
+  const drop = [];
+  each((records) => {
+    const { keep } = gate.filter(records);
+    const kept = new Set(keep.map((r) => r.id));
+    for (const r of records) if (!kept.has(r.id)) drop.push(r.id);
+  });
   if (!ctx.dryRun) {
     store.db.exec('BEGIN');
     try {
@@ -300,7 +423,7 @@ export function purgeExcluded(ctx, { force = false } = {}) {
     }
     store.setMeta('privacy_fingerprint', fp);
   }
-  return { checked, removed: drop.length };
+  return { checked, removed: drop.length + gate.removed };
 }
 
 // ---------- scrubText ----------
