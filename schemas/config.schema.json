@@ -1,62 +1,219 @@
 {
   "$comment": ".confidant/config.json, written by `confidant init` and the install skill.",
   "type": "object",
-  "required": ["version", "vault", "language", "role", "briefTime", "timezone", "sources"],
+  "required": [
+    "version",
+    "vault",
+    "language",
+    "role",
+    "briefTime",
+    "timezone",
+    "sources"
+  ],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 1 },
-    "vault": { "type": "string" },
-    "language": { "enum": ["en", "es"] },
-    "role": { "enum": ["founder", "agency", "consultant", "investor", "sales", "executive", "recruiter"] },
-    "companySize": { "enum": ["solo", "2-10", "11-50", "51-200", "200+"] },
-    "briefTime": { "type": "string", "format": "time" },
-    "timezone": { "type": "string" },
-    "meetingsPerWeek": { "type": "integer", "minimum": 0 },
-    "slips": { "type": "array", "items": { "enum": ["followups", "promises", "delegated", "decisions", "leads", "ideas", "context", "somewhere"] } },
-    "forgetText": { "type": "string" },
-    "valueText": { "type": "string" },
+    "version": {
+      "const": 1
+    },
+    "vault": {
+      "type": "string"
+    },
+    "language": {
+      "enum": [
+        "en",
+        "es"
+      ]
+    },
+    "role": {
+      "enum": [
+        "founder",
+        "agency",
+        "consultant",
+        "investor",
+        "sales",
+        "executive",
+        "recruiter"
+      ]
+    },
+    "companySize": {
+      "enum": [
+        "solo",
+        "2-10",
+        "11-50",
+        "51-200",
+        "200+"
+      ]
+    },
+    "briefTime": {
+      "type": "string",
+      "format": "time"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "meetingsPerWeek": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "slips": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "followups",
+          "promises",
+          "delegated",
+          "decisions",
+          "leads",
+          "ideas",
+          "context",
+          "somewhere"
+        ]
+      }
+    },
+    "forgetText": {
+      "type": "string"
+    },
+    "valueText": {
+      "type": "string"
+    },
     "owner": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string" },
-        "emails": { "type": "array", "items": { "type": "string" } },
-        "phones": { "type": "array", "items": { "type": "string" } },
-        "company": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "emails": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "phones": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "company": {
+          "type": "string"
+        }
       }
     },
     "exclusions": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "categories": { "type": "array", "items": { "enum": ["banking", "health", "family", "personal-email", "passwords"] } },
-        "people": { "type": "array", "items": { "type": "string" }, "$comment": "names to leave out entirely" },
-        "handles": { "type": "array", "items": { "type": "string" } },
-        "domains": { "type": "array", "items": { "type": "string" } },
-        "chats": { "type": "array", "items": { "type": "string" }, "$comment": "chat or group names to leave out" },
-        "keywords": { "type": "array", "items": { "type": "string" } },
-        "emailAccounts": { "type": "array", "items": { "type": "string" }, "$comment": "whole mail accounts to skip, e.g. a personal address" }
+        "categories": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "banking",
+              "health",
+              "family",
+              "personal-email",
+              "passwords"
+            ]
+          }
+        },
+        "people": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "$comment": "names to leave out entirely"
+        },
+        "handles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "chats": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "$comment": "chat or group names to leave out"
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "emailAccounts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "$comment": "whole mail accounts to skip, e.g. a personal address"
+        }
       }
     },
     "sources": {
       "type": "object",
       "additionalProperties": {
         "type": "object",
-        "required": ["enabled"],
+        "required": [
+          "enabled"
+        ],
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "status": { "enum": ["connected", "partial", "skipped", "blocked", "unused"] },
-          "note": { "type": "string" },
-          "since": { "type": "string", "format": "date-time" }
+          "enabled": {
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "connected",
+              "partial",
+              "skipped",
+              "blocked",
+              "unused"
+            ]
+          },
+          "note": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       }
     },
-    "installedAt": { "type": "string", "format": "date-time" },
+    "installedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
     "installer": {
       "type": "object",
       "additionalProperties": false,
-      "properties": { "version": { "type": "string" }, "tag": { "type": "string" }, "sha": { "type": "string" }, "repo": { "type": "string" } }
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        }
+      }
+    },
+    "installId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]{16,40}$",
+      "$comment": "random id created at init, used only for support and feedback reports"
     }
   }
 }
