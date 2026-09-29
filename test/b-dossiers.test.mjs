@@ -117,3 +117,46 @@ test('changed since: only new records, with earlier lines as context', async () 
   assert.ok(items.slice(0, -1).every((i) => i.context), 'the rest is context');
   assert.equal(d.meetings.length, 0);
 });
+
+test('records shaped like the local extractors: groups, business senders, call recordings', async () => {
+  const ctx = makeVault();
+  const A = 'tel:+15550102000';
+  const B = 'tel:+15550103000';
+  const C = 'tel:+15550104000';
+  const G = 'group:imessage:chat777';
+  const group = (id, from, text, me = false) => ({
+    ...msg(id, { thread: 'imessage:chat777', ts: days(4), from: me ? 'tel:+13055550100' : from, me, to: [{ handle: G, name: 'Launch crew' }], title: 'Launch crew', text }),
+    meta: { is_group: true, chat_name: 'Launch crew', participants: [A, B, C] },
+  });
+  ctx.store.upsertRecords([
+    group('g1', A, 'Launch moved to the 14th.'),
+    group('g2', B, 'I will update the press kit.'),
+    group('g3', null, 'Thanks, I will tell the board.', true),
+    { ...msg('biz', { thread: 'imessage:chase', ts: days(2), from: 'name:chase', fromName: 'Chase', text: 'Your statement is ready to view online.' }), meta: { alphanumeric_sender: true } },
+    { id: 'call_recordings:r1', source: 'call_recordings', kind: 'call', thread: `calls:${A}`, ts: days(3).toISOString(), from: null, to: [{ handle: A, name: null }], is_from_me: false, title: 'Call with Ana', text: 'Ana: We need the budget approved before the launch on the 14th.\nSam: I will send the revised budget tomorrow.\nAna: Great, and loop in finance please.\nSam: Will do.'.repeat(2), url: null, meta: { duration_s: 600 } },
+    { id: 'call_recordings:r2', source: 'call_recordings', kind: 'call', thread: `calls:${B}`, ts: days(3).toISOString(), from: null, to: [{ handle: B, name: null }], is_from_me: false, title: 'Call', text: '', url: null, meta: { needs_transcript: true, duration_s: 240 } },
+    meeting('wait', { ts: days(1), title: 'Board prep', attendees: [{ handle: A, name: null }], transcript: '', duration_s: 1800 }),
+  ]);
+  ctx.store.upsertRecords([{ ...meeting('wait', { ts: days(1), title: 'Board prep', attendees: [{ handle: A, name: null }], transcript: '' }), meta: { needs_transcript: true } }]);
+  const id = buildIdentity(ctx);
+  const g = id.groupByThread('imessage:chat777');
+  assert.ok(g, 'a group with only its group handle in `to`');
+  assert.equal(g.name, 'Launch crew');
+  assert.equal(g.members.length, 3, 'members come from meta.participants, including one who never wrote');
+  assert.equal(id.byHandle('name:chase').kind, 'system', 'business sender ids are automated');
+  assert.ok(id.byHandle(A).two_way, 'a recorded call counts as talking');
+
+  const d = await buildDossiers(ctx);
+  const thread = d.threads.find((t) => t.thread.kind === 'group');
+  assert.equal(thread.thread.participants.length, 3);
+  assert.equal(thread.items.length, 3);
+  assert.ok(!d.people.some((p) => p.person.name === 'Chase'));
+  const call = d.meetings.find((m) => m.meeting.ref === 'call_recordings:r1');
+  assert.ok(call, 'a call transcript is sorted like a meeting');
+  assert.equal(call.meeting.attendees[0].person_id, id.byHandle(A).id);
+  assert.ok(call.chunks[0].text.includes('revised budget'));
+  const ben = d.people.find((p) => p.id === id.byHandle(B).id);
+  assert.ok(ben.items.some((i) => i.ref === 'call_recordings:r2' && i.text === 'Call (4 min)'), 'a call still waiting for its transcript is a short line');
+  assert.ok(!d.meetings.some((m) => m.meeting.ref === 'fathom:wait'));
+  assert.equal(d.stats.waiting, 1);
+});
