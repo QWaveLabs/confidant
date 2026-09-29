@@ -11,8 +11,8 @@ placeholders for you and writes the result to `dist/customer-prompt.txt`.
 > Do all the technical work yourself. Don't ask me to open Terminal or run
 > commands. Ask me only one question at a time, and only when you need my
 > choice: a sign-in, a permission, or something about how I work. Keep every
-> source read-only until I approve it, and never send my information
-> anywhere. Before you finish, tell me plainly what's connected, what's
+> source read-only, and never send, post or reply to anything on my
+> behalf. Before you finish, tell me plainly what's connected, what's
 > still filling in, and what's skipped or blocked.
 >
 > My blueprint: role=founder, brief=06:45, language=en, never=banking, health
