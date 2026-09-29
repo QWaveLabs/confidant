@@ -19,7 +19,7 @@ import { resetCaches } from './fixtures/a-fixtures.mjs';
 import { buildMac, laterMessages, fathomFetch, OWNER } from './fixtures/b-e2e-apple.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const SOURCES = ['imessage', 'whatsapp', 'contacts', 'calls', 'fathom'];
+const SOURCES = ['imessage', 'whatsapp', 'email', 'calendar', 'contacts', 'calls', 'fathom'];
 
 // Runs one command the way engine/cli.mjs does, with the test's fetch and key.
 async function cli(vault, line) {
@@ -54,9 +54,11 @@ const clip = (s, n = 180) => (s.length > n ? `${s.slice(0, n - 1).trim()}.` : s)
 
 function sortPerson(d, c) {
   const lines = d.items.filter((i) => !i.context);
-  const said = lines.filter((i) => i.dir === 'in' && !i.type).slice(-3);
+  const said = lines.filter((i) => i.dir === 'in' && !i.type && i.ch !== 'Email').slice(-3);
   const bullets = said.map((i) => ({ date: i.date, text: clip(`Wrote: ${i.text}`), source_refs: [i.ref] }));
   for (const i of lines.filter((x) => x.type === 'call')) bullets.push({ date: i.date, text: 'Had a phone call', source_refs: [i.ref] });
+  for (const i of lines.filter((x) => x.type === 'event')) bullets.push({ date: i.date, text: `Met for ${i.text}`, source_refs: [i.ref] });
+  for (const i of lines.filter((x) => x.ch === 'Email' && x.dir === 'in')) bullets.push({ date: i.date, text: clip(`Emailed about ${i.subject}: ${i.text}`), source_refs: [i.ref] });
   if (bullets.length) c.people.push({ person_id: d.id, name: d.person.name, ...(d.person.company ? { company: d.person.company } : {}), bullets });
   for (const i of lines) {
     if (i.dir === 'in' && /revised proposal by/i.test(i.text)) {
@@ -196,16 +198,21 @@ test('end to end: install, three hours later, and Spanish', async () => {
   const { vault, identity, dossiers, spec, welcome } = await install('en');
   assert.equal(vault, join(FAKE_HOME, 'Second Brain 2'), 'a new vault next to the old one');
   assert.equal(identity.stats.people, 3, 'Ana, Ben and Carla; the code sender and an unknown missed call left out');
-  // Ben only shows up in the group chat and the meeting, so he has no
-  // one-to-one dossier of his own.
-  assert.deepEqual([dossiers.people, dossiers.threads, dossiers.meetings], [2, 1, 1]);
+  // Ana, Ben (email) and Carla; the group chat; the Fathom meeting.
+  assert.deepEqual([dossiers.people, dossiers.threads, dossiers.meetings], [3, 1, 1]);
 
   const people = notesIn(vault, 'People');
   for (const n of ['People/Ana Ruiz.md', 'People/Ben Cole.md', 'People/Carla Diaz.md']) assert.ok(people.includes(n), `${n} in ${people}`);
   const ana = readFileSync(join(vault, 'People/Ana Ruiz.md'), 'utf8');
-  assert.equal(parseNote(ana).data.company, 'Acme', 'company from Contacts');
+  assert.equal(parseNote(ana).data.company, '[[Acme]]', 'Acme came up for two people, so it has a note');
+  assert.ok(existsSync(join(vault, 'Companies/Acme.md')));
   assert.ok(ana.includes('_(iMessage)_') && ana.includes('_(WhatsApp)_'), 'one person across channels');
   assert.ok(ana.includes('Had a phone call. _(Call)_'));
+  assert.ok(ana.includes('Met for [[Acme]] roadmap review. _(Calendar)_'));
+  assert.ok(!ana.includes('Focus time'), 'calendar noise is left out');
+  const ben = readFileSync(join(vault, 'People/Ben Cole.md'), 'utf8');
+  assert.ok(ben.includes('Emailed about Contract draft: Contract draft attached. Can we sign by October 15?. _(Email)_') || ben.includes('Emailed about Contract draft: Contract draft attached. Can we sign by October 15? _(Email)_'), 'mail, with the reply quote and signature removed');
+  assert.ok(!people.some((n) => /news|weekly/i.test(n)), 'newsletters never become people');
   assert.ok(!ana.includes('Loved'), 'reactions never reach a note');
   assert.deepEqual(notesIn(vault, 'Meetings').filter((n) => !n.endsWith('/Meetings.md')).length, 1);
   const commitment = join(vault, 'Commitments/Send Ana the revised proposal.md');
@@ -266,7 +273,7 @@ test('end to end: install, three hours later, and Spanish', async () => {
   assert.equal(es.vault, join(FAKE_HOME, 'Segundo cerebro'));
   for (const f of ['Personas', 'Empresas', 'Proyectos', 'Decisiones', 'Compromisos', 'Ideas', 'Reuniones', 'Oportunidades', 'Conocimiento', 'Resúmenes']) assert.ok(existsSync(join(es.vault, f)), f);
   const anaEs = readFileSync(join(es.vault, 'Personas/Ana Ruiz.md'), 'utf8');
-  assert.ok(anaEs.includes('## Cronología') && anaEs.includes('**Empresa:** Acme'));
+  assert.ok(anaEs.includes('## Cronología') && anaEs.includes('**Empresa:** [[Acme]]'));
   assert.ok(anaEs.includes('_(Llamada)_'));
   assert.ok(existsSync(join(es.vault, 'Compromisos/Send Ana the revised proposal.md')));
   const homeEs = readFileSync(join(es.vault, 'Home.md'), 'utf8');

@@ -1,9 +1,9 @@
 // The fake Mac for the end-to-end install test, built with Unit A's fixture
-// builders: Contacts, iMessage, WhatsApp and call history, with dates
+// builders: Contacts, iMessage, WhatsApp, Mail, Calendar and call history, with dates
 // relative to now so everything falls inside the 60-day install window.
 // Plus one Fathom page served through ctx.fetch. All people are invented.
 import { insert } from './a-fixtures.mjs';
-import { addressBook, chatDb, addMessage, whatsappDb, whatsappContacts, addWa, callHistory, appleSeconds } from './a-apple.mjs';
+import { addressBook, chatDb, addMessage, whatsappDb, whatsappContacts, addWa, callHistory, appleSeconds, mailStore, calendarStore, MAIL_WORK } from './a-apple.mjs';
 import { mockFetch } from '../c-shared.test.mjs';
 
 const DAY = 86400000;
@@ -55,6 +55,22 @@ export function buildMac(home) {
   addWa(wa, { chat: 1, text: 'Happy to introduce you to Dan Park at Northwind Ventures. He invests in pilots like yours.', at: at(3), fromJid: CARLA_JID });
   addWa(wa, { chat: 1, text: 'That would be great, thank you Carla.', at: at(3, 16), fromMe: true, toJid: CARLA_JID });
   addWa(wa, { chat: 2, text: 'Sharing the pilot usage numbers on Monday.', at: at(9), fromJid: ANA_JID });
+
+  const mail = mailStore(home, {
+    mailboxes: [{ id: 1, account: MAIL_WORK, path: 'INBOX' }, { id: 2, account: MAIL_WORK, path: 'Sent Messages' }],
+    addresses: { sam: [OWNER.email, OWNER.name], ben: ['ben@acme.example', 'Ben Cole'], news: ['news@list.example', 'Weekly News'] },
+    accounts: [{ uuid: MAIL_WORK, address: OWNER.email }],
+  });
+  mail.add({ rowid: 1001, box: 1, from: 'ben', subject: 'Contract draft', at: at(4), to: ['sam'], conv: 7, mid: 'c1@acme.example',
+    file: `From: Ben Cole <ben@acme.example>\nTo: ${OWNER.email}\nSubject: Contract draft\nMessage-ID: <c1@acme.example>\nContent-Type: text/plain; charset=utf-8\n\nContract draft attached. Can we sign by October 15?\n` });
+  mail.add({ rowid: 1002, box: 2, from: 'sam', subject: 'Contract draft', prefix: 'Re: ', at: at(4, 18), to: ['ben'], conv: 7,
+    file: `From: ${OWNER.name} <${OWNER.email}>\nTo: ben@acme.example\nSubject: Re: Contract draft\nContent-Type: text/plain; charset=utf-8\n\nI will review it and get back to you by Monday.\n\nSent from my iPhone\n` });
+  mail.add({ rowid: 1003, box: 1, from: 'news', subject: 'This week in pilots', at: at(3), to: ['sam'], listId: 77,
+    file: 'From: Weekly News <news@list.example>\nSubject: This week in pilots\nList-Unsubscribe: <mailto:u@list.example>\nContent-Type: text/plain\n\nTen tips for better pilots.\n' });
+
+  const cal = calendarStore(home);
+  cal.addEvent({ title: 'Acme roadmap review', start: at(2, 18), end: at(2, 19), organizer: { email: 'ana@acme.example', name: 'Ana Ruiz' }, attendees: [{ email: 'ana@acme.example', name: 'Ana Ruiz' }, { email: OWNER.email, name: OWNER.name, self: true }] });
+  cal.addEvent({ title: 'Focus time', start: at(1, 14), end: at(1, 16), attendees: [{ email: 'ana@acme.example', name: 'Ana Ruiz' }] });
 
   const calls = callHistory(home);
   insert(calls, 'ZCALLRECORD', [
