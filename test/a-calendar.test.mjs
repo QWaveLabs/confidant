@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
-import { makeCtx, tempHome, createDb, insert, runSource, schemaErrors, resetCaches } from './fixtures/a-fixtures.mjs';
-import { appleSeconds } from './fixtures/a-apple.mjs';
+import { makeCtx, tempHome, runSource, schemaErrors, resetCaches } from './fixtures/a-fixtures.mjs';
+import { appleSeconds, calendarStore } from './fixtures/a-apple.mjs';
 import * as calendar from '../engine/extract/calendar.mjs';
 
 const NOW = new Date('2026-09-28T16:00:00Z');
@@ -11,44 +10,26 @@ const wall = (s) => appleSeconds(`${s}Z`);
 
 function fixture() {
   const home = tempHome();
-  const db = createDb(
-    join(home, 'Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb'),
-    `CREATE TABLE Store (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, type INTEGER, disabled INTEGER, external_id TEXT);
-     CREATE TABLE Calendar (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER, title TEXT, flags INTEGER, color TEXT, type TEXT, UUID TEXT);
-     CREATE TABLE CalendarItem (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT, location_id INTEGER, description TEXT, start_date REAL, start_tz TEXT,
-       end_date REAL, end_tz TEXT, all_day INTEGER, calendar_id INTEGER, orig_item_id INTEGER, orig_date REAL, organizer_id INTEGER, self_attendee_id INTEGER,
-       status INTEGER, invitation_status INTEGER, availability INTEGER, url TEXT, last_modified REAL, birthday_id INTEGER, external_id TEXT,
-       unique_identifier TEXT, hidden INTEGER, has_recurrences INTEGER, has_attendees INTEGER, UUID TEXT, entity_type INTEGER, conference_url TEXT,
-       conference_url_detected TEXT);
-     CREATE TABLE Participant (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, entity_type INTEGER, type INTEGER, status INTEGER, pending_status INTEGER, role INTEGER,
-       identity_id INTEGER, owner_id INTEGER, UUID TEXT, email TEXT, phone_number TEXT, is_self INTEGER, comment TEXT);
-     CREATE TABLE Identity (display_name TEXT, address TEXT, first_name TEXT, last_name TEXT);
-     CREATE TABLE Location (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, address TEXT, latitude REAL, longitude REAL, item_owner_id INTEGER);
-     CREATE TABLE OccurrenceCache (day REAL, event_id INTEGER, calendar_id INTEGER, store_id INTEGER, occurrence_date REAL, occurrence_start_date REAL, occurrence_end_date REAL);`,
-  );
-  insert(db, 'Store', [{ ROWID: 1, name: 'iCloud', type: 1, disabled: 0 }, { ROWID: 2, name: 'Other', type: 5, disabled: 0 }, { ROWID: 3, name: 'Old Exchange', type: 2, disabled: 1 }]);
-  insert(db, 'Calendar', [
-    { ROWID: 1, store_id: 1, title: 'Work' },
-    { ROWID: 2, store_id: 1, title: 'US Holidays' },
-    { ROWID: 3, store_id: 2, title: 'Birthdays' },
-    { ROWID: 4, store_id: 3, title: 'Legacy' },
-  ]);
-  insert(db, 'Identity', [{ display_name: 'Ana López', address: 'mailto:ana@acme.test' }, { display_name: null, address: 'mailto:mike@acme.test', first_name: 'Mike', last_name: 'Brennan' }]);
-  insert(db, 'Location', { ROWID: 1, title: 'Acme HQ', address: '1 Main St, Miami' });
-  const item = (row) => insert(db, 'CalendarItem', { entity_type: 2, hidden: 0, calendar_id: 1, start_tz: 'America/New_York', all_day: 0, last_modified: appleSeconds('2026-08-01T00:00:00Z'), ...row });
-  item({ ROWID: 1, summary: 'Acme kickoff', UUID: 'U-1', unique_identifier: 'ical-1@acme', start_date: appleSeconds('2026-09-01T14:00:00Z'), end_date: appleSeconds('2026-09-01T15:00:00Z'),
-    location_id: 1, organizer_id: 1, description: 'Agenda: pricing.\nJoin: https://us02web.zoom.us/j/81234567890?pwd=abc', status: 1 });
-  insert(db, 'Participant', [
-    { ROWID: 1, owner_id: 1, identity_id: 1, email: null, status: 2, role: 1, is_self: 0 },
-    { ROWID: 2, owner_id: 1, email: 'rob@qwave.test', status: 4, is_self: 1 },
-    { ROWID: 3, owner_id: 1, identity_id: 2, email: 'mike@acme.test', status: 3, is_self: 0 },
-  ]);
+  const { db, item, addEvent } = calendarStore(home, {
+    stores: [{ ROWID: 1, name: 'iCloud', type: 1, disabled: 0 }, { ROWID: 2, name: 'Other', type: 5, disabled: 0 }, { ROWID: 3, name: 'Old Exchange', type: 2, disabled: 1 }],
+    calendars: [
+      { ROWID: 1, store_id: 1, title: 'Work' },
+      { ROWID: 2, store_id: 1, title: 'US Holidays' },
+      { ROWID: 3, store_id: 2, title: 'Birthdays' },
+      { ROWID: 4, store_id: 3, title: 'Legacy' },
+    ],
+  });
+  addEvent({
+    rowid: 1, title: 'Acme kickoff', uuid: 'U-1', uid: 'ical-1@acme', start: '2026-09-01T14:00:00Z', end: '2026-09-01T15:00:00Z', status: 1,
+    location: { title: 'Acme HQ', address: '1 Main St, Miami' }, description: 'Agenda: pricing.\nJoin: https://us02web.zoom.us/j/81234567890?pwd=abc',
+    organizer: { email: 'ana@acme.test', name: 'Ana López' },
+    attendees: [{ email: 'rob@qwave.test', status: 4, self: true }, { email: 'mike@acme.test', name: 'Mike Brennan', status: 3 }],
+  });
   item({ ROWID: 2, summary: 'Offsite', UUID: 'U-2', all_day: 1, start_tz: '_float', start_date: wall('2026-09-10T00:00:00'), end_date: wall('2026-09-11T00:00:00') });
-  item({ ROWID: 3, summary: '1:1 Sara', UUID: 'U-3', unique_identifier: 'series-3', has_recurrences: 1, start_date: appleSeconds('2026-09-07T13:00:00Z'), end_date: appleSeconds('2026-09-07T13:30:00Z'),
-    conference_url: 'https://meet.google.com/abc-defg-hij' });
-  for (const d of ['2026-09-07', '2026-09-14', '2026-09-28', '2026-10-05', '2026-12-28']) {
-    insert(db, 'OccurrenceCache', { event_id: 3, calendar_id: 1, store_id: 1, occurrence_date: appleSeconds(`${d}T13:00:00Z`), occurrence_end_date: appleSeconds(`${d}T13:30:00Z`) });
-  }
+  addEvent({
+    rowid: 3, title: '1:1 Sara', uuid: 'U-3', uid: 'series-3', start: '2026-09-07T13:00:00Z', end: '2026-09-07T13:30:00Z', conferenceUrl: 'https://meet.google.com/abc-defg-hij',
+    occurrences: ['2026-09-07', '2026-09-14', '2026-09-28', '2026-10-05', '2026-12-28'].map((d) => `${d}T13:00:00Z`),
+  });
   item({ ROWID: 4, summary: '1:1 Sara (moved)', UUID: 'U-4', orig_item_id: 3, orig_date: appleSeconds('2026-09-21T13:00:00Z'), start_date: appleSeconds('2026-09-22T15:00:00Z'), end_date: appleSeconds('2026-09-22T15:30:00Z') });
   item({ ROWID: 5, summary: 'Far future', UUID: 'U-5', start_date: appleSeconds('2027-01-15T15:00:00Z'), end_date: appleSeconds('2027-01-15T16:00:00Z') });
   item({ ROWID: 6, summary: 'Labor Day', UUID: 'U-6', calendar_id: 2, all_day: 1, start_tz: '_float', start_date: wall('2026-09-07T00:00:00') });
@@ -124,4 +105,18 @@ test('calendar: later runs pick up edits and events entering the window', async 
 
 test('calendar: probe without a database', async () => {
   assert.equal((await calendar.probe(makeCtx({ home: tempHome() }))).ok, false);
+});
+
+test('calendarStore.addEvent: all-day, self organizer and generated ids', async () => {
+  const home = tempHome();
+  const { addEvent } = calendarStore(home);
+  const id = addEvent({ title: 'Offsite', start: '2026-09-10', end: '2026-09-11', allDay: true, organizer: 'self', attendees: [{ email: 'ana@acme.test', name: 'Ana López' }] });
+  addEvent({ title: 'Sync', start: '2026-09-12T15:00:00Z', end: '2026-09-12T15:30:00Z', attendees: [{ email: 'mike@acme.test' }] });
+  const ctx = makeCtx({ home, now: NOW });
+  await runSource(ctx, 'calendar');
+  const off = ctx.store.record(`calendar:EV-${id}`);
+  assert.equal(off.meta.start, '2026-09-10');
+  assert.equal(off.is_from_me, true);
+  assert.deepEqual(off.to, [{ handle: 'mailto:ana@acme.test', name: 'Ana López' }]);
+  assert.equal(ctx.store.records({ source: 'calendar' }).length, 2);
 });

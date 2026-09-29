@@ -1,76 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { makeCtx, tempHome, createDb, insert, runSource, schemaErrors, writeFile, resetCaches } from './fixtures/a-fixtures.mjs';
+import { makeCtx, tempHome, insert, runSource, schemaErrors, writeFile, resetCaches } from './fixtures/a-fixtures.mjs';
+import { mailStore, emlx, MAIL_WORK, MAIL_HOME } from './fixtures/a-apple.mjs';
 import * as mail from '../engine/extract/mail.mjs';
 
-const WORK = 'AAAAAAAA-1111-4111-8111-111111111111';
-const HOME = 'BBBBBBBB-2222-4222-8222-222222222222';
-const STORE = 'CCCCCCCC-3333-4333-8333-333333333333';
+const WORK = MAIL_WORK;
+const HOME = MAIL_HOME;
 const unix = (iso) => Math.floor(new Date(iso).getTime() / 1000);
-const shard = (rowid) => String(Math.floor(rowid / 1000)).split('').reverse().join('/');
-
-function emlx(message) {
-  const body = Buffer.from(message.replace(/\n/g, '\r\n'));
-  return Buffer.concat([Buffer.from(`${body.length}\n`), body, Buffer.from('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>flags</key><integer>8590195713</integer></dict></plist>\n')]);
-}
 
 function fixture({ withAccounts = true } = {}) {
   const home = tempHome();
-  const v10 = join(home, 'Library/Mail/V10');
-  const db = createDb(
-    join(v10, 'MailData/Envelope Index'),
-    `CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url UNIQUE, total_count INTEGER DEFAULT 0, unread_count INTEGER DEFAULT 0, source INTEGER);
-     CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject COLLATE RTRIM);
-     CREATE TABLE summaries (ROWID INTEGER PRIMARY KEY, summary TEXT);
-     CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address COLLATE NOCASE, comment);
-     CREATE TABLE message_global_data (ROWID INTEGER PRIMARY KEY, message_id INTEGER, model_category INTEGER, message_id_header TEXT);
-     CREATE TABLE messages (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL DEFAULT 0, global_message_id INTEGER, remote_id INTEGER,
-       document_id TEXT, sender INTEGER, subject_prefix TEXT, subject INTEGER NOT NULL, summary INTEGER, date_sent INTEGER, date_received INTEGER,
-       mailbox INTEGER NOT NULL, remote_mailbox INTEGER, flags INTEGER NOT NULL DEFAULT 0, read INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0,
-       deleted INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, conversation_id INTEGER NOT NULL DEFAULT 0, list_id_hash INTEGER, unsubscribe_type INTEGER);
-     CREATE TABLE recipients (ROWID INTEGER PRIMARY KEY, message INTEGER NOT NULL, address INTEGER NOT NULL, type INTEGER, position INTEGER);
-     CREATE TABLE labels (message_id INTEGER NOT NULL, mailbox_id INTEGER NOT NULL, PRIMARY KEY (message_id, mailbox_id));`,
-  );
-  insert(db, 'mailboxes', [
-    { ROWID: 1, url: `imap://${WORK}/INBOX` },
-    { ROWID: 2, url: `imap://${WORK}/Sent%20Messages` },
-    { ROWID: 3, url: `imap://${WORK}/Junk` },
-    { ROWID: 4, url: `imap://${HOME}/INBOX` },
-    { ROWID: 5, url: `imap://${HOME}/%5BGmail%5D/Sent%20Mail` },
-    { ROWID: 6, url: `imap://${HOME}/%5BGmail%5D/Spam` },
-    { ROWID: 7, url: `imap://${HOME}/%5BGmail%5D/All%20Mail` },
-  ]);
-  const addr = { rob: 1, ana: 2, maria: 3, mike: 4, news: 5, robh: 6, sara: 7 };
-  insert(db, 'addresses', [
-    { ROWID: 1, address: 'rob@qwave.test', comment: 'Rob Hernandez' },
-    { ROWID: 2, address: 'ana@acme.test', comment: 'Ana López' },
-    { ROWID: 3, address: 'maria@northwind.test', comment: 'María Ruiz' },
-    { ROWID: 4, address: 'mike@acme.test', comment: '' },
-    { ROWID: 5, address: 'news@list.test', comment: 'Weekly News' },
-    { ROWID: 6, address: 'rob.h@gmail.com', comment: 'Rob' },
-    { ROWID: 7, address: 'sara@kim.test', comment: 'Sara Kim' },
-  ]);
-  let subj = 0;
-  const files = {};
-  const add = ({ rowid, box, from, subject, prefix = null, at, to = [], cc = [], conv = 0, deleted = 0, summary = null, file, partial = false, mid, listId = null, labels = [] }) => {
-    insert(db, 'subjects', { ROWID: ++subj, subject });
-    if (summary) insert(db, 'summaries', { ROWID: subj, summary });
-    if (mid) insert(db, 'message_global_data', { ROWID: rowid, message_id: rowid * 7, message_id_header: mid });
-    insert(db, 'messages', {
-      ROWID: rowid, message_id: 9007199254740993n + BigInt(rowid), global_message_id: mid ? rowid : null, sender: addr[from], subject_prefix: prefix, subject: subj,
-      summary: summary ? subj : null, date_sent: unix(at), date_received: unix(at) + 5, mailbox: box, deleted, conversation_id: conv, list_id_hash: listId,
-    });
-    to.forEach((a, i) => insert(db, 'recipients', { message: rowid, address: addr[a], type: 0, position: i }));
-    cc.forEach((a, i) => insert(db, 'recipients', { message: rowid, address: addr[a], type: 1, position: i }));
-    for (const l of labels) insert(db, 'labels', { message_id: rowid, mailbox_id: l });
-    if (file) {
-      const account = box <= 3 ? WORK : HOME;
-      const mbox = { 1: 'INBOX.mbox', 2: 'Sent Messages.mbox', 3: 'Junk.mbox', 4: 'INBOX.mbox', 5: '[Gmail].mbox/Sent Mail.mbox', 6: '[Gmail].mbox/Spam.mbox', 7: '[Gmail].mbox/All Mail.mbox' }[box];
-      const path = join(v10, account, mbox, STORE, 'Data', shard(rowid), 'Messages', `${rowid}${partial ? '.partial' : ''}.emlx`);
-      files[rowid] = writeFile(path, emlx(file));
-    }
-  };
+  const store = mailStore(home, {
+    mailboxes: [
+      { id: 1, account: WORK, path: 'INBOX' },
+      { id: 2, account: WORK, path: 'Sent Messages' },
+      { id: 3, account: WORK, path: 'Junk' },
+      { id: 4, account: HOME, path: 'INBOX' },
+      { id: 5, account: HOME, path: '[Gmail]/Sent Mail' },
+      { id: 6, account: HOME, path: '[Gmail]/Spam' },
+      { id: 7, account: HOME, path: '[Gmail]/All Mail' },
+    ],
+    addresses: {
+      rob: ['rob@qwave.test', 'Rob Hernandez'],
+      ana: ['ana@acme.test', 'Ana López'],
+      maria: ['maria@northwind.test', 'María Ruiz'],
+      mike: ['mike@acme.test', ''],
+      news: ['news@list.test', 'Weekly News'],
+      robh: ['rob.h@gmail.com', 'Rob'],
+      sara: ['sara@kim.test', 'Sara Kim'],
+    },
+    accounts: withAccounts ? [{ uuid: WORK, address: 'rob@qwave.test', viaParent: true }] : [],
+  });
+  const { add, db } = store;
   add({ rowid: 1001, box: 1, from: 'ana', subject: 'Proposal', at: '2026-09-01T14:00:00Z', to: ['rob'], cc: ['mike'], conv: 5, mid: 'p1@acme.test',
     file: 'From: Ana López <ana@acme.test>\nTo: rob@qwave.test\nSubject: Proposal\nMessage-ID: <p1@acme.test>\nContent-Type: text/plain; charset=utf-8\n\nHi Rob, can we sign Friday?\n\nOn Sun, Aug 31, 2026 at 9:00 AM Rob Hernandez <rob@qwave.test> wrote:\n> Send me the draft\n' });
   add({ rowid: 1002, box: 1, from: 'maria', subject: 'Reunión mañana', at: '2026-09-02T09:00:00Z', to: ['rob'],
@@ -87,13 +49,9 @@ function fixture({ withAccounts = true } = {}) {
   add({ rowid: 1010, box: 5, from: 'robh', subject: 'Dinner', prefix: 'Re: ', at: '2026-09-04T21:30:00Z', to: ['sara'], file: 'Subject: Re: Dinner\n\nGreat' });
   add({ rowid: 1011, box: 1, from: 'mike', subject: 'Found elsewhere', at: '2026-09-05T10:00:00Z', to: ['rob'] });
   add({ rowid: 23456, box: 1, from: 'ana', subject: 'Signed contract', at: '2026-09-06T10:00:00Z', to: ['rob'], partial: true, file: 'Subject: Signed contract\nContent-Type: text/plain\n\nAttached, signed.\n' });
-  // 1011 lives outside the usual shard: move it.
-  writeFile(join(v10, WORK, 'Archive (old).mbox', 'Messages', '1011.emlx'), emlx('Subject: Found elsewhere\n\nThe file lives in an odd folder'));
-  if (withAccounts) {
-    const adb = createDb(join(home, 'Library/Accounts/Accounts4.sqlite'), 'CREATE TABLE ZACCOUNT (Z_PK INTEGER PRIMARY KEY, ZIDENTIFIER VARCHAR, ZUSERNAME VARCHAR, ZPARENTACCOUNT INTEGER, ZACCOUNTDESCRIPTION VARCHAR);');
-    insert(adb, 'ZACCOUNT', [{ Z_PK: 1, ZIDENTIFIER: 'PARENT-1', ZUSERNAME: 'rob@qwave.test', ZACCOUNTDESCRIPTION: 'Work' }, { Z_PK: 2, ZIDENTIFIER: WORK, ZUSERNAME: null, ZPARENTACCOUNT: 1 }]);
-  }
-  return { home, db, files };
+  // 1011 lives outside the usual shard, so only the fallback walk finds it.
+  writeFile(join(store.root, WORK, 'Archive (old).mbox', 'Messages', '1011.emlx'), emlx('Subject: Found elsewhere\n\nThe file lives in an odd folder'));
+  return { home, db };
 }
 
 test('mail: bodies, threads, quoting, charsets, bulk and skipped boxes', async () => {
