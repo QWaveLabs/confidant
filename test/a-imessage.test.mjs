@@ -27,7 +27,7 @@ function fixture() {
   ]);
   const m = {};
   m.plain = addMessage(db, { chat: 1, handle: 1, text: 'Can you send the deck?', at: '2026-09-01T14:00:00Z' });
-  m.body = addMessage(db, { chat: 1, handle: 1, body: 'Sent from attributedBody ✓', at: '2026-09-01T14:01:00Z', fromMe: true, myId: 'rob@qwave.test' });
+  m.body = addMessage(db, { chat: 1, handle: 1, body: 'Sent from attributedBody ✓', at: '2026-09-01T14:01:00Z', fromMe: true, myId: 'alex@owner.test' });
   m.long = addMessage(db, { chat: 1, handle: 1, body: 'x'.repeat(300), at: '2026-09-01T14:02:00Z' });
   m.tapback = addMessage(db, { chat: 1, handle: 1, text: 'Loved "Can you send the deck?"', at: '2026-09-01T14:03:00Z', assoc: 2000 });
   m.group = addMessage(db, { chat: 2, handle: 2, text: 'Board meets Friday', at: '2026-09-02T10:00:00Z' });
@@ -71,7 +71,7 @@ test('imessage: full history in pages, newest first, valid records', async () =>
   const mine = byId[m.body.guid];
   assert.equal(mine.text, 'Sent from attributedBody ✓');
   assert.equal(mine.is_from_me, true);
-  assert.deepEqual(mine.from, { handle: 'mailto:rob@qwave.test', name: 'Rob Hernandez' });
+  assert.deepEqual(mine.from, { handle: 'mailto:alex@owner.test', name: 'Alex Rivera' });
   assert.deepEqual(mine.to, [{ handle: 'tel:+13055551234', name: 'Mike Brennan' }]);
   assert.equal(byId[m.long.guid].text.length, 300);
 
@@ -81,7 +81,7 @@ test('imessage: full history in pages, newest first, valid records', async () =>
   assert.deepEqual(group.to, [{ handle: 'group:imessage:iMessage;+;chat900', name: 'Acme deal room' }]);
   assert.deepEqual(group.from, { handle: 'mailto:ana@acme.test', name: 'Ana López' });
   assert.deepEqual(group.meta.participants.sort(), ['mailto:ana@acme.test', 'tel:+13055551234', 'tel:+525512345678']);
-  assert.equal(byId[m.groupMine.guid].from.name, 'Rob Hernandez');
+  assert.equal(byId[m.groupMine.guid].from.name, 'Alex Rivera');
 
   const photo = byId[m.photo.guid];
   assert.equal(photo.text, '');

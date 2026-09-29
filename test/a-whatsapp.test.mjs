@@ -72,7 +72,7 @@ test('whatsapp native: DMs, groups, captions, lids, and skipped system rows', as
   assert.deepEqual(by(pk.diego).from, { handle: 'tel:+528111112222', name: 'Diego Ruiz' }, 'lid mapped through ContactsV2');
   assert.deepEqual(by(pk.tomas).from, { handle: 'name:tomás', name: 'Tomás' }, 'unmapped lid uses the push name');
   assert.equal(by(pk.tomas).meta.lid, '99001122334455@lid');
-  assert.equal(by(pk.mine).from.name, 'Rob Hernandez');
+  assert.equal(by(pk.mine).from.name, 'Alex Rivera');
 });
 
 test('whatsapp native: resumable and probe', async () => {
@@ -89,11 +89,11 @@ test('whatsapp native: resumable and probe', async () => {
 const IOS = [
   '[03/01/2024, 09:05:12] Ana López: ‎Messages and calls are end-to-end encrypted. No one outside of this chat, not even WhatsApp, can read or listen to them.',
   '[03/01/2024, 09:05:12] Ana López: Hola Rob, ¿revisaste la propuesta?',
-  '[03/01/2024, 09:07:40] Rob Hernandez: Sí, te mando comentarios',
+  '[03/01/2024, 09:07:40] Alex Rivera: Sí, te mando comentarios',
   'mañana temprano',
   '[13/01/2024, 18:30:00] Ana López: ‎image omitted',
   '[13/01/2024, 18:31:00] Ana López: Perfecto <This message was edited>',
-  '[14/01/2024, 08:00:00] Rob Hernandez: ‎This message was deleted.',
+  '[14/01/2024, 08:00:00] Alex Rivera: ‎This message was deleted.',
   '[14/01/2024, 08:01:00] Ana López: ‎<attached: 00000012-PHOTO-2024-01-14-08-01-00.jpg>',
   '[14/01/2024, 08:02:00] Ana López: ok',
   '[14/01/2024, 08:02:00] Ana López: ok',
@@ -108,7 +108,7 @@ const ANDROID_US = [
   '1/15/24, 12:01 AM - ~ Lucía: 👍',
 ].join('\n');
 
-const ANDROID_ES = ['05/02/24, 3:15 p. m. - Carlos: Nos vemos en la oficina', '05/02/24, 3:20 p. m. - Rob Hernandez: Listo', '06/02/24, 9:00 a. m. - Carlos: <Multimedia omitido>'].join('\n');
+const ANDROID_ES = ['05/02/24, 3:15 p. m. - Carlos: Nos vemos en la oficina', '05/02/24, 3:20 p. m. - Alex Rivera: Listo', '06/02/24, 9:00 a. m. - Carlos: <Multimedia omitido>'].join('\n');
 
 test('export parser: iOS day-first with seconds, system, media, edits and multi-line', () => {
   const { messages, order } = parseExport(IOS, { timeZone: 'America/New_York' });
@@ -163,7 +163,7 @@ test('whatsapp exports: zip and txt, owner, groups, stable ids, native dedupe', 
   assert.ok(ana.every((r) => r.thread === `whatsapp:${ANA}`), 'joins the native thread');
   assert.ok(!ana.some((r) => r.text === 'Hola Rob, ¿revisaste la propuesta?'));
   const mine = ana.find((r) => r.is_from_me);
-  assert.equal(mine.from.name, 'Rob Hernandez');
+  assert.equal(mine.from.name, 'Alex Rivera');
   assert.deepEqual(mine.to, [{ handle: 'name:ana lópez', name: 'Ana López' }]);
   assert.equal(ana.filter((r) => r.text === 'ok').length, 2, 'identical lines keep separate ids');
 

@@ -10,7 +10,7 @@ test('contacts: cards from every source database, groups skipped', async () => {
     { pk: 1, first: 'Mike', last: 'Brennan', org: 'Acme', job: 'CFO', phones: ['(305) 555-1234', '+1 305 555 1234'], emails: ['Mike@Acme.test'] },
     { pk: 2, org: 'Northwind Logistics', emails: ['ops@northwind.test'] },
     { pk: 3, group: 'Board' },
-    { pk: 4, first: 'Rob', last: 'Hernandez', phones: ['+1 305 555 0100'] },
+    { pk: 4, first: 'Alex', last: 'Rivera', phones: ['+1 305 555 0100'] },
   ]);
   addressBook(home, 'SRC-B', [{ pk: 1, first: 'Ana', last: 'López', nickname: 'Anita', phones: ['+52 55 1234 5678'] }]);
   const ctx = makeCtx({ home });
@@ -29,7 +29,7 @@ test('contacts: cards from every source database, groups skipped', async () => {
   assert.equal(mike.text, '');
   assert.deepEqual(recs.find((r) => r.title === 'Northwind Logistics').meta.names, ['Northwind Logistics']);
   assert.deepEqual(recs.find((r) => r.title === 'Ana López').meta.names, ['Ana López', 'Anita']);
-  assert.equal(recs.find((r) => r.title === 'Rob Hernandez').is_from_me, true);
+  assert.equal(recs.find((r) => r.title === 'Alex Rivera').is_from_me, true);
 });
 
 test('contacts: edited cards come back, unchanged ones do not', async () => {

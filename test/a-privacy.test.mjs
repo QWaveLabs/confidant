@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { filterRecord, scrubText, emailQuery } from '../engine/privacy.mjs';
 
-const owner = { name: 'Rob Hernandez', emails: ['rob@qwave.test', 'rob.h@gmail.com'], phones: ['+1 305 555 0100'] };
+const owner = { name: 'Alex Rivera', emails: ['alex@owner.test', 'alex.r@gmail.com'], phones: ['+1 305 555 0100'] };
 const cfg = (exclusions) => ({ owner, exclusions });
 const ALL = cfg({ categories: ['banking', 'health', 'passwords', 'family', 'personal-email'] });
 
 let n = 0;
 const msg = (over = {}) => ({ id: `imessage:${++n}`, source: 'imessage', kind: 'message', ts: '2026-09-01T12:00:00Z', thread: 'imessage:t1', from: { handle: 'tel:+13055551234', name: 'Ana Lopez' }, to: [], is_from_me: false, title: null, text: 'See you at 3', meta: {}, ...over });
-const email = (over = {}) => ({ id: `email:${++n}`, source: 'email', kind: 'email', ts: '2026-09-01T12:00:00Z', thread: 'email:c1', from: { handle: 'mailto:ana@acme.com', name: 'Ana Lopez' }, to: [{ handle: 'mailto:rob@qwave.test', name: 'Rob Hernandez' }], is_from_me: false, title: 'Proposal', text: 'Here is the proposal.', meta: {}, ...over });
+const email = (over = {}) => ({ id: `email:${++n}`, source: 'email', kind: 'email', ts: '2026-09-01T12:00:00Z', thread: 'email:c1', from: { handle: 'mailto:ana@acme.com', name: 'Ana Lopez' }, to: [{ handle: 'mailto:alex@owner.test', name: 'Alex Rivera' }], is_from_me: false, title: 'Proposal', text: 'Here is the proposal.', meta: {}, ...over });
 const keep = (r, c = ALL) => filterRecord(r, c).keep;
 const reason = (r, c = ALL) => filterRecord(r, c).reason;
 
@@ -89,7 +89,7 @@ test('passwords: meeting invites and code reviews are kept', () => {
 test('family: relatives in DMs and family chats, not family offices', () => {
   assert.equal(reason(msg({ from: { handle: 'tel:+13055559999', name: 'Mom' } })), 'family');
   assert.equal(reason(msg({ from: { handle: 'tel:+13055559999', name: 'Mamá Rosa' } })), 'family');
-  assert.equal(reason(msg({ is_from_me: true, from: { handle: 'tel:+13055550100', name: 'Rob Hernandez' }, to: [{ handle: 'tel:+13055559999', name: 'Tío Juan' }] })), 'family', 'my messages to a relative too');
+  assert.equal(reason(msg({ is_from_me: true, from: { handle: 'tel:+13055550100', name: 'Alex Rivera' }, to: [{ handle: 'tel:+13055559999', name: 'Tío Juan' }] })), 'family', 'my messages to a relative too');
   assert.equal(reason(msg({ to: [{ handle: 'group:imessage:chat1', name: 'Familia Hernández' }], meta: { chat_name: 'Familia Hernández', is_group: true } })), 'family');
   assert.equal(keep(msg({ from: { handle: 'tel:+13055559999', name: 'Mama Juana Bar Miami' } })), true);
   assert.equal(keep(msg({ from: { handle: 'tel:+13055559999', name: 'Son Nguyen' } })), true);
@@ -100,7 +100,7 @@ test('family: relatives in DMs and family chats, not family offices', () => {
 test('people: excluded names drop the whole DM thread, only their own lines in groups', () => {
   const c = cfg({ people: ['María José Pérez'] });
   assert.equal(reason(msg({ from: { handle: 'tel:+1', name: 'Maria Jose Perez' } }), c), 'person');
-  assert.equal(reason(msg({ is_from_me: true, from: { handle: 'tel:+13055550100', name: 'Rob' }, to: [{ handle: 'tel:+13055557777', name: 'María José Pérez' }] }), c), 'person');
+  assert.equal(reason(msg({ is_from_me: true, from: { handle: 'tel:+13055550100', name: 'Alex' }, to: [{ handle: 'tel:+13055557777', name: 'María José Pérez' }] }), c), 'person');
   assert.equal(reason(msg({ from: { handle: 'name:perez maria jose', name: null } }), c), 'person', 'token order does not matter');
   const group = { to: [{ handle: 'group:whatsapp:9@g.us', name: 'Deal room' }], meta: { is_group: true, chat_name: 'Deal room' } };
   assert.equal(keep(msg({ ...group, from: { handle: 'tel:+15550001111', name: 'Ana Lopez' } }), c), true);
@@ -126,10 +126,10 @@ test('handles, domains, chats and keywords always apply', () => {
 });
 
 test('personal email accounts: explicit list and the consumer address heuristic', () => {
-  assert.equal(reason(email({ meta: { account: 'rob.h@gmail.com' } }), cfg({ emailAccounts: ['Rob.H@gmail.com'] })), 'email-account');
-  assert.equal(keep(email({ meta: { account: 'rob@qwave.test' } }), cfg({ emailAccounts: ['rob.h@gmail.com'] })), true);
-  assert.equal(reason(email({ meta: { account: 'rob.h@gmail.com' } }), cfg({ categories: ['personal-email'] })), 'email-account');
-  assert.equal(keep(email({ meta: { account: 'rob.h@gmail.com' } }), { owner: { emails: ['rob.h@gmail.com'] }, exclusions: { categories: ['personal-email'] } }), true, 'a gmail-only owner keeps it');
+  assert.equal(reason(email({ meta: { account: 'alex.r@gmail.com' } }), cfg({ emailAccounts: ['Alex.R@gmail.com'] })), 'email-account');
+  assert.equal(keep(email({ meta: { account: 'alex@owner.test' } }), cfg({ emailAccounts: ['alex.r@gmail.com'] })), true);
+  assert.equal(reason(email({ meta: { account: 'alex.r@gmail.com' } }), cfg({ categories: ['personal-email'] })), 'email-account');
+  assert.equal(keep(email({ meta: { account: 'alex.r@gmail.com' } }), { owner: { emails: ['alex.r@gmail.com'] }, exclusions: { categories: ['personal-email'] } }), true, 'a gmail-only owner keeps it');
 });
 
 test('scrubText masks Luhn-valid cards only', () => {

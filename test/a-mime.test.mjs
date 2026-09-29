@@ -35,7 +35,7 @@ test('address lists with quotes, commas, comments and groups', () => {
 
 test('multipart: nested mixed/alternative/related, prefers text/plain, lists attachments', () => {
   const raw = crlf(`From: Ana <ana@acme.test>
-To: rob@qwave.test
+To: alex@owner.test
 Subject: =?UTF-8?B?UHJvcHVlc3Rh?=
 Date: Mon, 1 Sep 2026 10:00:00 -0400 (EDT)
 Message-ID: <abc123@acme.test>
@@ -106,7 +106,7 @@ test('trimQuoted: EN, ES, Outlook, signatures, and forwards kept', () => {
   assert.equal(trimQuoted('Listo\nDe: Ana López\nEnviado el: lunes\nPara: Rob\nAsunto: X'), 'Listo');
   assert.equal(trimQuoted('Yes\n\nSent from my iPhone'), 'Yes');
   assert.equal(trimQuoted('Sí\n\nEnviado desde mi iPhone'), 'Sí');
-  assert.equal(trimQuoted('Thanks\n-- \nRob Hernandez\nCEO'), 'Thanks');
+  assert.equal(trimQuoted('Thanks\n-- \nAlex Rivera\nCEO'), 'Thanks');
   assert.equal(trimQuoted('inline\n> quoted line\nanswer'), 'inline\nanswer');
   const fwd = 'FYI\n\n---------- Forwarded message ---------\nFrom: Ana <ana@acme.test>\nDate: Mon\nSubject: Deal\nTo: Rob\n\nThe actual deal terms';
   assert.ok(trimQuoted(fwd).includes('The actual deal terms'));

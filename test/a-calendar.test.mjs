@@ -23,7 +23,7 @@ function fixture() {
     rowid: 1, title: 'Acme kickoff', uuid: 'U-1', uid: 'ical-1@acme', start: '2026-09-01T14:00:00Z', end: '2026-09-01T15:00:00Z', status: 1,
     location: { title: 'Acme HQ', address: '1 Main St, Miami' }, description: 'Agenda: pricing.\nJoin: https://us02web.zoom.us/j/81234567890?pwd=abc',
     organizer: { email: 'ana@acme.test', name: 'Ana López' },
-    attendees: [{ email: 'rob@qwave.test', status: 4, self: true }, { email: 'mike@acme.test', name: 'Mike Brennan', status: 3 }],
+    attendees: [{ email: 'alex@owner.test', status: 4, self: true }, { email: 'mike@acme.test', name: 'Mike Brennan', status: 3 }],
   });
   item({ ROWID: 2, summary: 'Offsite', UUID: 'U-2', all_day: 1, start_tz: '_float', start_date: wall('2026-09-10T00:00:00'), end_date: wall('2026-09-11T00:00:00') });
   addEvent({
@@ -60,7 +60,7 @@ test('calendar: events, attendees, all-day, floating, recurring series and filte
   assert.equal(k.kind, 'event');
   assert.equal(k.ts, '2026-09-01T14:00:00.000Z');
   assert.deepEqual(k.from, { handle: 'mailto:ana@acme.test', name: 'Ana López' });
-  assert.deepEqual(k.to, [{ handle: 'mailto:rob@qwave.test', name: null }, { handle: 'mailto:mike@acme.test', name: 'Mike Brennan' }]);
+  assert.deepEqual(k.to, [{ handle: 'mailto:alex@owner.test', name: null }, { handle: 'mailto:mike@acme.test', name: 'Mike Brennan' }]);
   assert.equal(k.is_from_me, false);
   assert.equal(k.meta.location, 'Acme HQ, 1 Main St, Miami');
   assert.equal(k.meta.calendar, 'Work');

@@ -16,7 +16,7 @@ function wisprFixture(home) {
   );
   insert(db, 'Meetings', [
     { id: 'm-1', title: 'Acme pricing', createdAt: '2026-09-10 14:00:00.000 +00:00', modifiedAt: '2026-09-10 15:00:05.000 +00:00', endedAt: '2026-09-10 14:45:00.000 +00:00',
-      participantNames: JSON.stringify(['Rob Hernandez', 'Ana López']), summary: 'Agreed on a pilot.', speakerMap: JSON.stringify({ spk_0: 'Rob Hernandez', spk_1: 'Ana López' }), calendarEventExternalId: 'ical-1@acme' },
+      participantNames: JSON.stringify(['Alex Rivera', 'Ana López']), summary: 'Agreed on a pilot.', speakerMap: JSON.stringify({ spk_0: 'Alex Rivera', spk_1: 'Ana López' }), calendarEventExternalId: 'ical-1@acme' },
     { id: 'm-2', title: 'Deleted one', createdAt: '2026-09-11 14:00:00', modifiedAt: '2026-09-11 14:00:00', isDeleted: 1 },
     { id: 'm-3', title: 'Still processing', createdAt: '2026-09-12T14:00:00.000Z', modifiedAt: '2026-09-12T14:00:00.000Z', participantNames: 'Sara Kim, Mike Brennan' },
   ]);
@@ -45,7 +45,7 @@ test('wispr: meetings with speaker names, participants and summaries; dictations
   assert.equal(m.kind, 'meeting');
   assert.equal(m.thread, 'meeting:wispr:m-1');
   assert.equal(m.ts, '2026-09-10T14:00:00.000Z');
-  assert.equal(m.text, 'Rob Hernandez: Thanks for joining. Let us talk pricing.\nAna López: We can do a pilot.\nSpeaker 2: Sounds good.');
+  assert.equal(m.text, 'Alex Rivera: Thanks for joining. Let us talk pricing.\nAna López: We can do a pilot.\nSpeaker 2: Sounds good.');
   assert.deepEqual(m.to, [{ handle: 'name:ana lópez', name: 'Ana López' }], 'the owner is not an attendee of their own meeting');
   assert.equal(m.meta.summary, 'Agreed on a pilot.');
   assert.equal(m.meta.duration_s, 2700);
@@ -75,11 +75,11 @@ test('zoom local: VTT, closed captions, chat, audio transcription, and folder na
   const home = tempHome();
   const root = join(home, 'Documents/Zoom');
   const a = join(root, '2026-09-15 14.30.12 Acme Weekly 81234567890');
-  writeFile(join(a, 'recording.transcript.vtt'), 'WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nAna López: Welcome everyone.\n\n2\n00:00:04.500 --> 00:00:09.250\n<v Rob Hernandez>Thanks, quick update on pricing.</v>\n\n3\n00:10:00.000 --> 00:10:05.500\nAna López: Let us sign.\n');
+  writeFile(join(a, 'recording.transcript.vtt'), 'WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nAna López: Welcome everyone.\n\n2\n00:00:04.500 --> 00:00:09.250\n<v Alex Rivera>Thanks, quick update on pricing.</v>\n\n3\n00:10:00.000 --> 00:10:05.500\nAna López: Let us sign.\n');
   writeFile(join(a, 'meeting_saved_chat.txt'), '14:31:02 From Mike Brennan to Everyone:\n\tdeck link: https://example.test/deck\n14:32:10 From  Ana López  to  Everyone:\n\tthanks\n');
   writeFile(join(a, 'audio1234567890.m4a'), 'audio');
-  const b = join(root, "2026-09-16 10.00.00 Rob Hernandez's Zoom Meeting");
-  writeFile(join(b, 'closed_caption.txt'), '[Sara Kim] 10:00:05\nMorning.\n\n[Sara Kim] 10:00:09\nReady when you are.\n\n[Rob Hernandez] 10:00:15\nLet us start.\n');
+  const b = join(root, "2026-09-16 10.00.00 Alex Rivera's Zoom Meeting");
+  writeFile(join(b, 'closed_caption.txt'), '[Sara Kim] 10:00:05\nMorning.\n\n[Sara Kim] 10:00:09\nReady when you are.\n\n[Alex Rivera] 10:00:15\nLet us start.\n');
   const c = join(root, '2026-09-17 09.00.00 Board call');
   writeFile(join(c, 'audio0001.m4a'), 'audio');
   writeFile(join(root, 'empty folder', '.DS_Store'), '');
@@ -94,12 +94,12 @@ test('zoom local: VTT, closed captions, chat, audio transcription, and folder na
   assert.equal(weekly.title, 'Acme Weekly');
   assert.equal(weekly.ts, '2026-09-15T18:30:12.000Z');
   assert.equal(weekly.meta.meeting_id, '81234567890');
-  assert.equal(weekly.text, 'Ana López: Welcome everyone.\nRob Hernandez: Thanks, quick update on pricing.\nAna López: Let us sign.');
+  assert.equal(weekly.text, 'Ana López: Welcome everyone.\nAlex Rivera: Thanks, quick update on pricing.\nAna López: Let us sign.');
   assert.equal(weekly.meta.duration_s, 606);
   assert.equal(weekly.meta.chat, 'Mike Brennan: deck link: https://example.test/deck\nAna López: thanks');
   assert.deepEqual(weekly.to.map((p) => p.name).sort(), ['Ana López', 'Mike Brennan']);
-  assert.equal(captions.title, "Rob Hernandez's Zoom Meeting");
-  assert.equal(captions.text, 'Sara Kim: Morning. Ready when you are.\nRob Hernandez: Let us start.');
+  assert.equal(captions.title, "Alex Rivera's Zoom Meeting");
+  assert.equal(captions.text, 'Sara Kim: Morning. Ready when you are.\nAlex Rivera: Let us start.');
   assert.equal(board.text, 'Board agreed.');
   assert.equal(board.meta.transcript_source, 'deepgram');
   assert.deepEqual(seen, ['audio/mp4']);

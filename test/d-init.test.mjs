@@ -133,7 +133,7 @@ test('every --exclude-* flag lands in the right config.exclusions key on a fresh
     excludeDomain: ['nda-client.com', 'nda-client.com'], // duplicate on purpose
     excludeChat: 'Family Group',
     excludeKeyword: 'diagnosis',
-    excludeEmailAccount: 'rob.personal@gmail.com',
+    excludeEmailAccount: 'alex.personal@gmail.com',
     _: [],
   }, ctx);
 
@@ -145,7 +145,7 @@ test('every --exclude-* flag lands in the right config.exclusions key on a fresh
     domains: ['nda-client.com'],
     chats: ['Family Group'],
     keywords: ['diagnosis'],
-    emailAccounts: ['rob.personal@gmail.com'],
+    emailAccounts: ['alex.personal@gmail.com'],
   });
 });
 

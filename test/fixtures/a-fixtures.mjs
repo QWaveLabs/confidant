@@ -28,7 +28,7 @@ export function makeCtx({ home = tempHome(), config = {}, lang = 'en', tz = 'Ame
     home,
     vault,
     paths: { vault, root: join(vault, '.confidant'), tmp, exports: join(vault, '.confidant', 'exports') },
-    config: { version: 1, vault, language: lang, role: 'founder', briefTime: '08:00', timezone: tz, sources: {}, owner: { name: 'Rob Hernandez', emails: ['rob@qwave.test'], phones: ['+1 305 555 0100'] }, ...config },
+    config: { version: 1, vault, language: lang, role: 'founder', briefTime: '08:00', timezone: tz, sources: {}, owner: { name: 'Alex Rivera', emails: ['alex@owner.test'], phones: ['+1 305 555 0100'] }, ...config },
     state: {},
     store,
     lang,

@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -63,7 +64,7 @@ test('--include-diagnostics collects doctor, health and status counts, sanitized
       agents: [{ scheduled: true }, { scheduled: false }],
     }),
   };
-  const fakeDoctor = { checkSystem: async () => ({ mail: { names: ['rob@example.com'] }, vaults: { confidant: ['/Users/rob/Second Brain'] } }) };
+  const fakeDoctor = { checkSystem: async () => ({ mail: { names: ['alex@example.com'] }, vaults: { confidant: [`${homedir()}/Second Brain`] } }) };
   const fakeHealth = { checkHealth: async () => ({ ok: true, phone: 'call me at 555-123-4567' }) };
   const ctx = withState(fakeCtx({}));
   const code = await run(
@@ -97,7 +98,7 @@ test('collectDiagnostics tolerates a missing health module without throwing', as
 });
 
 test('sanitizeDiagnostics strips emails, phone numbers and home-directory paths anywhere in a nested shape', () => {
-  const home = '/Users/rob';
+  const home = '/Users/alex';
   const out = sanitizeDiagnostics(
     {
       a: 'contact ana@acme.com or +1 (555) 123-4567',
