@@ -1,0 +1,106 @@
+{
+  "exact_duplicates": [
+    {
+      "type": "person",
+      "reason": "same_handles",
+      "keep": {
+        "id": "p_a79ff35159",
+        "path": "People/Ben Cole.md",
+        "name": "Ben Cole"
+      },
+      "remove": [
+        {
+          "id": "p_96a453109f",
+          "path": "People/Ben Cole 2.md",
+          "name": "Ben Cole"
+        }
+      ]
+    }
+  ],
+  "probable_duplicates": [
+    {
+      "type": "person",
+      "reason": "similar_name_same_company",
+      "a": {
+        "id": "p_60bfeeffd3",
+        "path": "People/Ana Ruiz.md",
+        "name": "Ana Ruiz"
+      },
+      "b": {
+        "id": "p_7a1e739efb",
+        "path": "People/Ana Ruiz Gomez.md",
+        "name": "Ana Ruiz Gomez"
+      }
+    }
+  ],
+  "broken_links": [
+    {
+      "file": "People/Ana Ruiz.md",
+      "link": "[[Acme Inc]]",
+      "target": "Acme Inc",
+      "fix": "Acme"
+    },
+    {
+      "file": "People/Ana Ruiz.md",
+      "link": "[[Nobody Here]]",
+      "target": "Nobody Here"
+    }
+  ],
+  "maybe_done": [
+    {
+      "commitment": {
+        "id": "c_128cbcbd7fd08d3b",
+        "path": "Commitments/Send the signed contract after legal review.md",
+        "name": "Send the signed contract after legal review"
+      },
+      "text": "Send the signed contract after legal review",
+      "evidence": [
+        {
+          "ref": "whatsapp:bw1",
+          "date": "2026-09-28"
+        }
+      ]
+    },
+    {
+      "commitment": {
+        "id": "c_f7769a19835ce557",
+        "path": "Commitments/Loop in Acme legal on the contract.md",
+        "name": "Loop in Acme legal on the contract"
+      },
+      "text": "Loop in Acme legal on the contract",
+      "evidence": [
+        {
+          "ref": "whatsapp:bw1",
+          "date": "2026-09-28"
+        }
+      ]
+    }
+  ],
+  "stale_projects": [
+    {
+      "project": {
+        "id": "pr_7dab1b7188",
+        "path": "Projects/Website refresh.md",
+        "name": "Website refresh"
+      },
+      "last_activity": "2026-07-31"
+    }
+  ],
+  "sensitive": [
+    {
+      "where": "generated",
+      "target": "p_33def1a026",
+      "path": "People/Maya Lin.md",
+      "item": "af922065bed721cd"
+    }
+  ],
+  "summary": {
+    "exact_duplicates": 1,
+    "probable_duplicates": 1,
+    "broken_links": 2,
+    "fixable_links": 1,
+    "maybe_done": 2,
+    "stale_projects": 1,
+    "sensitive": 1
+  }
+}
