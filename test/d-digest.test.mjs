@@ -133,6 +133,16 @@ test('weekly_review digest has all ten sections, in order', () => {
   }
 });
 
+test('weekly_review digest leads with raw meetings and conversations, since no note type backs team blockers, recurring problems or developments', () => {
+  const ctx = buildFixture();
+  const text = buildDigest(ctx, 'weekly_review');
+  ctx.close();
+  const contextIdx = text.indexOf("## This week's meetings and conversations");
+  const decisionsIdx = text.indexOf('## Major decisions');
+  assert.ok(contextIdx >= 0 && contextIdx < decisionsIdx);
+  assert.match(text, /Can you send the pricing/); // the week's inbound message, for Codex to mine
+});
+
 test('brain_update digest reports backlog and record counts without crashing', () => {
   const ctx = buildFixture();
   const text = buildDigest(ctx, 'brain_update');

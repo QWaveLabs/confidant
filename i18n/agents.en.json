@@ -35,6 +35,7 @@
       "open": "Open opportunities"
     },
     "weekly_review": {
+      "context": "This week's meetings and conversations",
       "decisions": "Major decisions",
       "commitments": "Unfinished commitments",
       "stalled": "Stalled projects",

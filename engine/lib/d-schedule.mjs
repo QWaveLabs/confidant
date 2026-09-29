@@ -69,8 +69,14 @@ function rawSlots(config, { includeFinish = false } = {}) {
   const meetingHours = meetingPrepHours(config?.meetingsPerWeek);
   const scan = shiftMinutes(briefHour, briefMinute, -15);
   const out = [
-    // Every 3 hours, every day. The backbone cadence: nothing else moves it.
-    { key: 'brain_update', notify: 'heartbeat', days: ALL_DAYS, hours: [0, 3, 6, 9, 12, 15, 18, 21], minute: 0, fallback: 'hourly3' },
+    // Every 3 hours, every day, at :10 rather than on the hour: that keeps
+    // this off every fixed single-time task's own minute (follow_up_radar
+    // :00, weekly_review :00, meeting_prep :30) so those stay at their exact
+    // documented times, and still lands a fresh update at 06:10, just ahead
+    // of the 06:30 scanner and the 06:45 brief. The HOURLY;INTERVAL=3
+    // fallback cannot carry this :10 offset (there is no DTSTART): it
+    // anchors to whatever minute the automation is created at instead.
+    { key: 'brain_update', notify: 'heartbeat', days: ALL_DAYS, hours: [0, 3, 6, 9, 12, 15, 18, 21], minute: 10, fallback: 'hourly3' },
     // The person's own chosen time. Kept exact unless it truly collides.
     { key: 'morning_brief', notify: 'heartbeat', days: WEEKDAYS, hours: [briefHour], minute: briefMinute },
     { key: 'meeting_prep', notify: 'heartbeat', days: WEEKDAYS, hours: meetingHours, minute: 30, fallback: 'split' },

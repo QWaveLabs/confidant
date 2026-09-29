@@ -245,6 +245,19 @@ function weeklyReview(ctx, identity, strings) {
   const weekAgo = localDate(new Date(ctx.now.getTime() - 7 * DAY_MS), ctx.tz);
   const inWeek = (d) => d && d >= weekAgo && d <= today;
 
+  // No note type covers "team blocker", "recurring problem" or "biggest
+  // development" (three of the ten headings below), so there is no note
+  // query that can fill them. Give the run the week's raw meetings and
+  // conversations instead; prompts/tasks/weekly_review.md has it infer
+  // those three sections from this material rather than from notes.
+  const weekStart = dayBounds(weekAgo, ctx.tz, ctx.now).since;
+  const weekMeetings = ctx.store.records({ kind: 'meeting', since: weekStart, until: ctx.now.toISOString(), order: 'desc', limit: 20 })
+    .map((m) => `- ${localDate(m.ts, ctx.tz)} ${m.title || 'Meeting'}: ${(m.meta?.summary || m.text || '').slice(0, 200)}`);
+  const weekThreads = ctx.store.records({ since: weekStart, until: ctx.now.toISOString(), order: 'desc', limit: 150 })
+    .filter((r) => !r.is_from_me && r.kind !== 'meeting')
+    .slice(0, 30)
+    .map((r) => `- ${localDate(r.ts, ctx.tz)} ${r.source}: ${(r.text || r.title || '').slice(0, 160)}`);
+
   const decisions = notesOfType(ctx.vault, 'decision').filter((n) => inWeek(n.data.date)).map((n) => `- ${n.data.date}: ${firstLine(n.body, n.data.confidant_id)}`);
   const commitmentsAll = notesOfType(ctx.vault, 'commitment');
   const opened = commitmentsAll.filter((n) => inWeek(n.data.date)).map((n) => `- Opened: ${firstLine(n.body, n.data.confidant_id)}`);
@@ -259,6 +272,7 @@ function weeklyReview(ctx, identity, strings) {
   const nextWeek = ctx.store.records({ kind: 'event', since, until, order: 'asc' }).map((m) => `- ${localDate(m.ts, ctx.tz)}: ${m.title || 'Meeting'}`);
 
   return [
+    section(h.context, list([...weekMeetings, ...weekThreads])),
     section(h.decisions, list(decisions)),
     section(h.commitments, list([...opened, ...closed])),
     section(h.stalled, list(stalled)),

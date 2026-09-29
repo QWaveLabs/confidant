@@ -25,17 +25,28 @@ function assertNoCollisions(schedule) {
 test('the default 06:45 brief, no meetings, produces the documented schedule', () => {
   const schedule = buildSchedule({ briefTime: '06:45', meetingsPerWeek: 0 });
   const byKey = Object.fromEntries(schedule.map((s) => [s.key, s]));
-  assert.equal(byKey.brain_update.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=0,3,6,9,12,15,18,21;BYMINUTE=0');
+  // brain_update runs at :10, not on the hour, so it never collides with
+  // any fixed single-time task (those all sit at :00 or :30). That leaves
+  // follow_up_radar and weekly_review free to keep their exact documented
+  // times below.
+  assert.equal(byKey.brain_update.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=0,3,6,9,12,15,18,21;BYMINUTE=10');
   assert.deepEqual(byKey.brain_update.fallbackRrules, ['FREQ=HOURLY;INTERVAL=3']);
   assert.equal(byKey.morning_brief.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=45');
   assert.equal(byKey.opportunity_scanner.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=30');
   assert.equal(byKey.meeting_prep.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7,12;BYMINUTE=30');
   assert.equal(byKey.follow_up_radar.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=0');
-  // Fridays 15:00 is inside brain_update's own every-3-hours grid (it runs
-  // every day, including Friday, at :00 past 0,3,6,9,12,15,18,21). Weekly
-  // review is the lower-priority task, so it is the one nudged, by the
-  // smallest possible amount: one minute.
-  assert.equal(byKey.weekly_review.rrule, 'FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=1');
+  assert.equal(byKey.weekly_review.rrule, 'FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0');
+});
+
+test('a brief time that lands opportunity_scanner on brain_update\'s own :10 minute gets nudged, not brain_update', () => {
+  // 06:25 - 15 minutes = 06:10, which collides with brain_update's 06:10.
+  // opportunity_scanner is the lowest-priority task, so it moves instead.
+  const schedule = buildSchedule({ briefTime: '06:25', meetingsPerWeek: 0 });
+  const byKey = Object.fromEntries(schedule.map((s) => [s.key, s]));
+  assert.equal(byKey.brain_update.minute, 10);
+  assert.equal(byKey.morning_brief.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=25');
+  assert.notEqual(byKey.opportunity_scanner.minute, 10);
+  assertNoCollisions(schedule);
 });
 
 test('meeting_prep scales with meetingsPerWeek', () => {

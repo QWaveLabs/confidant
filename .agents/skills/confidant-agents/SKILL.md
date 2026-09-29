@@ -107,6 +107,12 @@ estancados / Oportunidades de ingresos / Personas que te esperan / Bloqueos
 del equipo / Problemas recurrentes / Ideas que vale la pena retomar /
 Novedades más importantes / Prioridades para la próxima semana.
 
+The digest also opens with a raw list of the week's meetings and
+conversations. That is working material for you, not an eleventh section:
+use it to infer team blockers, recurring problems and biggest developments,
+the three headings above with no note type behind them, then write only the
+ten sections in the file.
+
 ## The heartbeat
 
 Every run, whatever it did, ends with exactly one line:
