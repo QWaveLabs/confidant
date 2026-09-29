@@ -84,6 +84,21 @@ Sort inline, without subagents, and keep batches small.
   run id is in the merge result) restores every file it changed. Then sort
   that batch again and merge.
 
+## Questions for the person
+
+When the sort prompt is unsure (which person, which project, whether
+something is a promise), the contribution carries a `review` question
+instead of a guess. The merge puts it in `Needs review.md` (`Por revisar.md`
+in Spanish) at the vault root. Mention in your summary how many are waiting,
+without quoting them.
+
+When the person answers one in the chat, record it:
+`confidant review --resolve <id> --answer "<their answer>" --json`. The id
+is at the end of each line in that note, and `confidant review --json`
+lists them. Every later batch carries the answers in `known.resolutions`,
+and `confidant cleanup --apply` acts on answers to its own questions
+(merging confirmed duplicates, closing confirmed commitments).
+
 ## Checking progress
 
 `confidant batch status --json` shows, for install, update and backlog, how

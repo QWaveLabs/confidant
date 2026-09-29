@@ -131,7 +131,9 @@
     "backfill_left": "Tu historial más antiguo se sigue ordenando, de lo más reciente a lo más antiguo. Faltan unos {n} lotes, ordenado hasta {date}.",
     "backfill_started": "Sigue el historial más antiguo. Se ordenará poco a poco, de lo más reciente a lo más antiguo.",
     "backfill_done": "Todo tu historial ya está ordenado.",
-    "updated": "Actualizado el {date}."
+    "updated": "Actualizado el {date}.",
+    "review_one": "Hay una cosa por revisar: {link}",
+    "review_many": "Hay {n} cosas por revisar: {link}"
   },
   "index": {
     "other": "Otras notas",
@@ -173,5 +175,27 @@
     "col_tier": "Nivel",
     "col_last": "Último contacto",
     "col_relationship": "Relación"
-  }
+  },
+  "review": {
+    "title": "Por revisar",
+    "intro": "Algunas cosas en las que el ordenamiento no estaba seguro, así que no adivinó. Responde cualquiera en Codex, por ejemplo \"Para el punto r_1a2b, la respuesta es Mike Brennan\", y el próximo ordenamiento seguirá tu respuesta.",
+    "none": "No hay nada por revisar ahora.",
+    "options": "Opciones: {options}.",
+    "about": "Sobre: {subject}.",
+    "answered": "Respondido hace poco",
+    "answer": "Respuesta: {answer}.",
+    "dup_person": "¿{a} y {b} son la misma persona?",
+    "dup_note": "¿{a} y {b} son la misma nota ({kind})?",
+    "maybe_done": "¿Ya está hecho \"{text}\"? Un mensaje más reciente sugiere que sí.",
+    "stale_project": "¿Sigue activo {name}? No ha pasado nada en más de 30 días.",
+    "yes_merge": "Sí, unirlas",
+    "no_keep": "No, mantener ambas",
+    "yes_done": "Sí, está hecho",
+    "no_open": "No, sigue abierto",
+    "yes_active": "Sí, sigue activo",
+    "waiting": "En espera",
+    "stalled": "Estancado",
+    "done": "Terminado"
+  },
+  "merged_from": "Unido desde {name}"
 }

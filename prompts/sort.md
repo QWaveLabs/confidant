@@ -20,9 +20,16 @@ The batch file (a JSON file) has:
 - `persona`: the owner's role. `focus` says what matters most to them. Use
   `person_kinds` for a person's `kind`, `company_kinds` for a company's
   `kind`, and give extra attention to `opportunity_focus`.
-- `known`: notes that already exist: `people`, `companies`, `projects` (by
-  name), open `commitments` and open `opportunities`. When you mean one of
-  them, use its name exactly as written there.
+- `known`: what the second brain already has. When you mean one of these,
+  use its name exactly as written there.
+  - `people`: `{ name, person_id, aliases, company }`, the people in this
+    batch first.
+  - `companies`: names.
+  - `projects`: `{ name, status, company, people, last_activity }`.
+  - `meetings`: recent meetings with these people: `{ title, date, project, people }`.
+  - `commitments` and `opportunities`: the open ones.
+  - `resolutions`: answers the owner already gave to earlier questions,
+    `{ question, answer, subject }`. Always follow them.
 - `items`: the dossiers to sort (shapes below).
 - `output`: the path where you write your JSON file.
 
@@ -70,9 +77,42 @@ sorted before. Do not write new facts that rest only on context lines.
    or the exact name from `known.people`. A first name alone is fine in
    bullet text, but in a `people`, `counterpart` or `decided_by` field use the
    fullest name the batch gives.
-10. **Your file is one JSON object** that matches the contribution shape
+10. **Never touch the owner's own text.** You only write the JSON file; you
+    never edit a note. If the batch seems to contradict something the second
+    brain already holds, do not correct it yourself; ask in `review`.
+11. **Your file is one JSON object** that matches the contribution shape
     below. Use only the fields listed. No comments, no trailing commas, no
     extra keys. Leave out a list you have nothing for.
+
+## Matching people, projects and companies
+
+The second brain must never confuse itself. A wrong link is worse than a
+missing one.
+
+1. **Handles before names.** A dossier's `person_id` comes from the
+   person's phone numbers and email addresses, so it is always right. In
+   threads and meetings, use the `person_id` of each participant or
+   attendee. Match by name only when there is no `person_id`, and then only
+   against `known.people` names and aliases.
+2. **Reuse what exists.** Before naming a person, company or project, look
+   in `known`. The same company, the same people involved or a matching
+   alias tell you it is the same one. Use the known name exactly, never a
+   near copy ("Acme Inc" when "Acme" is known, "Mike" when "Mike Brennan" is
+   in the batch).
+3. **Attach to a project by context.** A line belongs to a known project
+   only when the context shows it: the same participants, the same company,
+   the same topic, or a recent meeting about it in `known.meetings`. If it
+   could belong to two projects, attach it to neither and ask.
+4. **No new project or company from one passing mention.** List a project in
+   `projects` only when the batch shows real work on it: several lines, a
+   meeting, a decision or a commitment. The same goes for companies.
+5. **When unsure, ask instead of guessing.** Add an item to `review` with a
+   short `question`, `options` when there are clear choices, the `subject`
+   (the name or note it is about) and `source_refs`, and leave the uncertain
+   fact itself out. Good questions: which of two people named Mike this is;
+   whether a message belongs to one project or another; whether "I will look
+   into it" is a real promise. Ask only what the owner can answer in a few
+   words, and never ask again what `known.resolutions` already answers.
 
 ## What to extract
 
@@ -177,8 +217,9 @@ message counts and a few sample lines. Decide only what the samples support:
 - `set_kind` or `set_company` when the samples make it plain.
 - `not_a_person` for a business, a bot or an automated sender.
 
-Write these in `identity`. When you are not sure, write nothing for that
-item. A wrong merge is worse than a missed one.
+Write these in `identity`. When you are not sure, do not merge: ask the
+owner in `review` instead, or write nothing for that item. A wrong merge is
+worse than a missed one.
 
 ### update
 
@@ -228,7 +269,8 @@ facts from context lines.
   "ideas": [{ "title": "Pilot to annual discount", "text": "The idea.", "date": "2026-09-26", "project": "Acme pilot", "source_refs": ["wispr:d1"] }],
   "opportunities": [{ "title": "Intro to Northwind Ventures", "type": "introduction", "counterpart": "Carla Diaz", "company": "Northwind Ventures", "next_step": "Wait for the intro email", "status": "open", "date": "2026-09-25", "source_refs": ["whatsapp:c1"] }],
   "knowledge": [{ "title": "Acme procurement signatures", "text": "The fact.", "tags": ["acme"], "date": "2026-09-20", "source_refs": ["imessage:g1"] }],
-  "identity": [{ "action": "merge", "person_ids": ["p_keep", "p_other"], "name": "Mike Brennan" }]
+  "identity": [{ "action": "merge", "person_ids": ["p_keep", "p_other"], "name": "Mike Brennan" }],
+  "review": [{ "question": "Is this about the Acme pilot or the Acme renewal?", "options": ["Acme pilot", "Acme renewal"], "subject": "Acme", "source_refs": ["email:e7"] }]
 }
 ```
 
@@ -236,7 +278,7 @@ Limits: bullet `text` 3 to 600 characters; `relationship` up to 300;
 company `summary` up to 600; project `goal` up to 400; meeting `summary` up to
 2000; decision `rationale` up to 800 and `against` up to 600; commitment
 `text` 3 to 400; idea `text` up to 1200; opportunity `next_step` up to 300;
-knowledge `text` up to 3000. Leave out optional fields you have nothing for
+knowledge `text` up to 3000; review `question` 5 to 400. Leave out optional fields you have nothing for
 instead of writing empty strings.
 
 ## Before you finish
@@ -246,4 +288,7 @@ instead of writing empty strings.
   `ref` from this batch.
 - Directions are right: who promised, who is waiting, who was asked.
 - Nothing is invented, nothing sensitive, no small talk, no em dashes.
+- Every person, company and project you name either comes from this batch's
+  handles, matches `known`, or has real work behind it. Anything you were not
+  sure about is a `review` question, not a guess.
 - Write the file to the batch's `output` path.

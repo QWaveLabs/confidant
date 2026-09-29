@@ -21,6 +21,7 @@ import { bPaths, bTables, takeLock, patchState, sourceLabel, isoNow, loadScrub }
 import { loadPersona, personaText } from './lib/b-persona.mjs';
 import { buildIdentity, loadIdentity } from './identity.mjs';
 import { buildDossiers } from './dossiers.mjs';
+import { resolutionsFor } from './review.mjs';
 
 const DAY = 86400000;
 export const INSTALL_DAYS = 60;
@@ -31,6 +32,8 @@ const MAX_ITEMS = { people: 25, threads: 12, meetings: 6, update: 20, identity_r
 const KNOWN_PEOPLE = 300;
 const KNOWN_COMPANIES = 300;
 const KNOWN_PROJECTS = 200;
+const KNOWN_DETAILED = 120;
+const KNOWN_MEETINGS = 20;
 const INSTRUCTIONS = join(REPO_ROOT, 'prompts', 'sort.md');
 
 const meta = (ctx, key, fallback = null) => ctx.store.getMeta(`b.${key}`, fallback);
@@ -106,21 +109,42 @@ function knownFor(ctx, items, identity) {
   const ids = participantIds(items);
   const rows = (type) => db.prepare('SELECT id, title, data FROM b_notes WHERE type = ?').all(type).map((r) => ({ ...r, data: JSON.parse(r.data) }));
   const people = rows('person');
+  const companies = rows('company');
+  const projects = rows('project');
   const strength = (id) => identity.byId(id)?.strength ?? 0;
   people.sort((a, b) => (ids.has(b.id) ? 1 : 0) - (ids.has(a.id) ? 1 : 0) || strength(b.id) - strength(a.id) || a.title.localeCompare(b.title));
-  const titleOf = new Map([...people, ...rows('company'), ...rows('project')].map((r) => [r.id, r.title]));
+  const titleOf = new Map([...people, ...companies, ...projects].map((r) => [r.id, r.title]));
+  const lastActivity = (id) => db.prepare(`SELECT MAX(date) d FROM b_items WHERE target = ? AND section = 'timeline'`).get(id)?.d ?? undefined;
   const open = (type) =>
     rows(type)
       .filter((r) => (r.data.status ?? 'open') === 'open' && (ids.has(r.data.counterpart_id) || !r.data.counterpart_id))
       .sort((a, b) => String(b.data.date ?? '').localeCompare(String(a.data.date ?? '')));
   const counterpart = (d) => titleOf.get(d.counterpart_id) ?? d.counterpart_name ?? undefined;
+  const company = (d) => titleOf.get(d.company_id) ?? d.company_name ?? undefined;
+  const meetings = rows('meeting')
+    .filter((m) => !ids.size || (m.data.people ?? []).some((p) => ids.has(p.id)))
+    .sort((a, b) => String(b.data.date ?? '').localeCompare(String(a.data.date ?? '')))
+    .slice(0, KNOWN_MEETINGS);
   return {
-    people: people.slice(0, KNOWN_PEOPLE).map((r) => r.title),
-    companies: rows('company').map((r) => r.title).sort().slice(0, KNOWN_COMPANIES),
-    projects: rows('project')
+    // Everyone with a note. Batch participants come first, with the details
+    // that tell two people with similar names apart.
+    people: people.slice(0, KNOWN_PEOPLE).map((r, i) => {
+      const ip = identity.byId(r.id);
+      const detailed = i < KNOWN_DETAILED;
+      const aliases = detailed ? [...new Set([...(r.data.aliases ?? []), ...(ip?.aliases ?? [])])].filter((a) => a !== r.title).slice(0, 4) : [];
+      const co = detailed ? company(r.data) ?? ip?.company ?? undefined : undefined;
+      return { name: r.title, ...(ip && !identity.isOwner(ip) ? { person_id: ip.id } : {}), ...(aliases.length ? { aliases } : {}), ...(co ? { company: co } : {}) };
+    }),
+    companies: companies.map((r) => r.title).sort().slice(0, KNOWN_COMPANIES),
+    projects: projects
       .sort((a, b) => a.title.localeCompare(b.title))
       .slice(0, KNOWN_PROJECTS)
-      .map((r) => ({ name: r.title, status: r.data.status ?? 'active' })),
+      .map((r) => {
+        const names = (r.data.people ?? []).map((p) => titleOf.get(p.id) ?? p.name).filter(Boolean).slice(0, 5);
+        const last = lastActivity(r.id);
+        return { name: r.title, status: r.data.status ?? 'active', ...(company(r.data) ? { company: company(r.data) } : {}), ...(names.length ? { people: names } : {}), ...(last ? { last_activity: last } : {}) };
+      }),
+    meetings: meetings.map((m) => ({ title: m.data.title ?? m.title, date: m.data.date, ...(titleOf.get(m.data.project_id) ?? m.data.project_name ? { project: titleOf.get(m.data.project_id) ?? m.data.project_name } : {}), people: (m.data.people ?? []).map((p) => titleOf.get(p.id) ?? p.name).slice(0, 6) })),
     commitments: open('commitment')
       .filter((r) => ids.has(r.data.counterpart_id))
       .slice(0, 80)
@@ -128,6 +152,7 @@ function knownFor(ctx, items, identity) {
     opportunities: open('opportunity')
       .slice(0, 40)
       .map((r) => ({ title: r.data.title, type: r.data.opportunity_type, ...(counterpart(r.data) ? { counterpart: counterpart(r.data) } : {}) })),
+    resolutions: resolutionsFor(ctx),
   };
 }
 

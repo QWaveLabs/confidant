@@ -93,23 +93,54 @@ function serializeKey(key, value) {
   return stringifyFrontmatter({ [key]: value }).replace(/^---\n/, '').replace(/---\n$/, '').replace(/\n$/, '');
 }
 
-// Our keys are rewritten in place (or appended); the person's keys are kept.
-// Keys we own but no longer have a value for are removed.
+// Our keys are rewritten in place; a key of ours that is new goes right
+// after the one before it in our order. The person's keys are kept as they
+// are. Keys we own but no longer have a value for are removed.
 export function mergeFrontmatter(fmText, ours, ownedKeys) {
   const owned = new Set(ownedKeys);
   if (fmText == null) return stringifyFrontmatter(ours);
-  const lines = [];
+  const out = [];
   const done = new Set();
-  let afterOwned = 0;
   for (const b of fmBlocks(fmText)) {
     if (b.key && owned.has(b.key)) {
-      if (ours[b.key] !== undefined && !done.has(b.key)) lines.push(serializeKey(b.key, ours[b.key]));
+      if (ours[b.key] !== undefined && !done.has(b.key)) out.push({ key: b.key, lines: [serializeKey(b.key, ours[b.key])] });
       done.add(b.key);
-      afterOwned = lines.length;
-    } else lines.push(...b.lines);
+    } else out.push(b);
   }
-  const missing = Object.entries(ours).filter(([k, v]) => v !== undefined && !done.has(k)).map(([k, v]) => serializeKey(k, v));
-  lines.splice(afterOwned, 0, ...missing);
+  const keys = Object.keys(ours).filter((k) => ours[k] !== undefined);
+  keys.forEach((k, i) => {
+    if (out.some((b) => b.key === k)) return;
+    let pos = -1;
+    for (let j = i - 1; j >= 0 && pos < 0; j--) pos = out.findIndex((b) => b.key === keys[j]);
+    const at = pos >= 0 ? pos + 1 : Math.max(0, out.findIndex((b) => b.key && owned.has(b.key)));
+    out.splice(at, 0, { key: k, lines: [serializeKey(k, ours[k])] });
+  });
+  const lines = out.flatMap((b) => b.lines);
   while (lines.length && lines[lines.length - 1] === '') lines.pop();
   return `---\n${lines.join('\n')}\n---\n`;
+}
+
+// The person's own part of a note body: everything except the title line and
+// our managed sections (with their headings).
+export function personalText(body, headings = []) {
+  let out = String(body ?? '').replace(/<!-- confidant:start ([a-z_]+) -->[\s\S]*?<!-- confidant:end \1 -->/g, '');
+  for (const h of headings) out = out.replace(new RegExp(`^## ${escapeRegExp(h)}\\s*$`, 'gm'), '');
+  return out.replace(/^# .*$/m, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Raw frontmatter blocks for keys we do not own, so they can move with a note.
+export function foreignFrontmatter(fmText, ownedKeys) {
+  if (fmText == null) return [];
+  const owned = new Set(ownedKeys);
+  return fmBlocks(fmText).filter((b) => b.key && !owned.has(b.key));
+}
+
+export function addFrontmatterBlocks(text, blocks) {
+  if (!blocks.length) return text;
+  const { fmText, body } = splitNote(text);
+  if (fmText == null) return text;
+  const have = new Set(fmBlocks(fmText).map((b) => b.key));
+  const extra = blocks.filter((b) => !have.has(b.key)).flatMap((b) => b.lines);
+  if (!extra.length) return text;
+  return `---\n${fmText}\n${extra.join('\n')}\n---\n${body}`;
 }

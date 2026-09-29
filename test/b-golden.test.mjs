@@ -93,6 +93,14 @@ test('golden vault: an update keeps the person’s prose, closes the commitment 
   assert.ok(update.items[0].items.some((i) => i.ref === 'imessage:a5' && !i.context), 'the new message is in the batch');
   assert.ok(update.items[0].items.some((i) => i.context), 'earlier lines come along as context');
   assert.ok(update.known.commitments.some((c) => c.text === 'Send Ana the revised proposal'), 'open commitments are offered for reuse');
+  const knownAna = update.known.people[0];
+  assert.equal(knownAna.name, 'Ana Ruiz', 'batch participants come first');
+  assert.equal(knownAna.person_id, update.items[0].id);
+  assert.equal(knownAna.company, 'Acme');
+  assert.deepEqual(knownAna.aliases, ['Ana']);
+  assert.deepEqual(update.known.projects, [{ name: 'Acme pilot', status: 'active', company: 'Acme', people: ['Ana Ruiz', 'Ben Cole'] }]);
+  assert.equal(update.known.meetings[0].title, 'Pilot review');
+  assert.deepEqual(update.known.resolutions, []);
   const [res] = await sortAll(ctx, batches);
 
   const after = readFileSync(ana, 'utf8');

@@ -99,7 +99,8 @@ export class NoteWriter {
     this.created = [];
     this.updated = [];
     this.vaultIndex = null;
-    this.extraFiles = [];
+    this.itemPre = new Map();
+    this.removed = new Set();
   }
 
   // ---------- registry ----------
@@ -113,14 +114,14 @@ export class NoteWriter {
   }
 
   note(id) {
-    if (!id) return null;
+    if (!id || this.removed.has(id)) return null;
     if (this.rows.has(id)) return this.rows.get(id);
     return this.loadRow(this.db.prepare('SELECT * FROM b_notes WHERE id = ?').get(id));
   }
 
   all(type) {
     for (const r of this.db.prepare('SELECT * FROM b_notes WHERE type = ?').all(type)) if (!this.rows.has(r.id)) this.loadRow(r);
-    return [...this.rows.values()].filter((r) => r.type === type).sort((a, b) => a.id.localeCompare(b.id));
+    return [...this.rows.values()].filter((r) => r.type === type && !this.removed.has(r.id)).sort((a, b) => a.id.localeCompare(b.id));
   }
 
   buildIndex() {
@@ -150,7 +151,7 @@ export class NoteWriter {
     const k = keyFor(type, name);
     if (!k) return [];
     const ids = this.buildIndex().get(type)?.get(k);
-    return ids ? [...ids].sort().map((id) => this.note(id)).filter(Boolean) : [];
+    return ids ? [...ids].sort().filter((id) => !this.removed.has(id)).map((id) => this.note(id)).filter(Boolean) : [];
   }
 
   markDirty(row) {
@@ -171,7 +172,36 @@ export class NoteWriter {
     this.rows.set(id, row);
     this.addToIndex(type, id, [cleanTitle, ...(data.aliases ?? [])]);
     this.markDirty(row);
+    this.backfillLinks(row);
     return row;
+  }
+
+  // Notes that named this company, project or person before it had a note
+  // now link to it.
+  backfillLinks(row) {
+    const keys = { company: ['company'], project: ['project'], person: ['counterpart'] }[row.type];
+    if (!keys) return;
+    const names = new Set([row.title, ...(row.data.aliases ?? [])].map((n) => keyFor(row.type, n)));
+    for (const r of this.db.prepare('SELECT id FROM b_notes').all()) {
+      if (r.id === row.id) continue;
+      const other = this.note(r.id);
+      for (const key of keys) {
+        const name = other.data[`${key}_name`];
+        if (other.data[`${key}_id`] || !name || !names.has(keyFor(row.type, name))) continue;
+        other.data[`${key}_id`] = row.id;
+        this.markDirty(other);
+      }
+    }
+  }
+
+  // Drops a note row (and optionally its file) inside this run, for undo.
+  removeNote(row, { deleteFile = true } = {}) {
+    this.markDirty(row);
+    this.dirty.delete(row.id);
+    this.touched.delete(row.id);
+    this.removed.add(row.id);
+    const rel = this.locate(row);
+    if (deleteFile && rel) this.deleteFile(rel);
   }
 
   // Latest fact wins: a field is replaced only by a fact dated the same day
@@ -209,6 +239,18 @@ export class NoteWriter {
 
   // ---------- items ----------
 
+  // Change an existing item (retarget, scrub), keeping its first state for undo.
+  updateItem(fp, patch) {
+    const before = this.db.prepare('SELECT * FROM b_items WHERE fp = ?').get(fp);
+    if (!before) return false;
+    if (!this.itemPre.has(fp)) this.itemPre.set(fp, { fp, target: before.target, section: before.section, text: before.text });
+    const next = { target: patch.target ?? before.target, section: patch.section ?? before.section, text: patch.text ?? before.text };
+    if (!this.ctx.dryRun) this.db.prepare('UPDATE b_items SET target = ?, section = ?, text = ? WHERE fp = ?').run(next.target, next.section, next.text, fp);
+    this.touched.add(before.target);
+    this.touched.add(next.target);
+    return true;
+  }
+
   hasItem(fp) {
     return !!this.db.prepare('SELECT 1 FROM b_items WHERE fp = ?').get(fp);
   }
@@ -224,7 +266,7 @@ export class NoteWriter {
       this.db.prepare('INSERT INTO b_items (fp, target, section, date, text, refs, run_id, batch_id, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(fp, target, section, date, text, JSON.stringify(refs), this.runId, this.batchId, seq);
     }
     this.itemsAdded.push(fp);
-    if (section !== 'alias' && section !== 'dup') this.touched.add(target);
+    if (section !== 'alias' && section !== 'dup' && section !== 'mention') this.touched.add(target);
     return true;
   }
 
@@ -356,7 +398,12 @@ export class NoteWriter {
   }
 
   linkOrName(data, key) {
-    return this.link(data[`${key}_id`], data[`${key}_name`]);
+    const id = data[`${key}_id`];
+    if (id && this.note(id)) return this.link(id);
+    const name = data[`${key}_name`];
+    if (!name) return '';
+    const found = this.findByName(key === 'counterpart' ? 'person' : key, name)[0];
+    return found ? this.link(found.id) : oneLine(name);
   }
 
   linker() {
@@ -508,6 +555,31 @@ export class NoteWriter {
     }
   }
 
+  deleteFile(rel) {
+    const abs = join(this.ctx.vault, rel);
+    if (!existsSync(abs)) return false;
+    this.preserve(rel);
+    if (!this.ctx.dryRun) unlinkSync(abs);
+    return true;
+  }
+
+  // A file where only the frontmatter keys in fm and one section are ours.
+  writeManaged(rel, { fm, title, section, content }) {
+    const owned = Object.keys(fm).concat('updated');
+    const before = readText(join(this.ctx.vault, rel));
+    const compose = (updated) => {
+      const data = { ...fm, updated };
+      const sections = [{ name: section, heading: null, content }];
+      if (before == null) return composeNote(data, composeBody(title, sections));
+      const { fmText, body } = splitNote(before);
+      return `${mergeFrontmatter(fmText, data, owned)}${upsertSections(body, sections)}`;
+    };
+    const prev = before == null ? null : splitNote(before).data.updated;
+    let text = compose(prev ?? this.today);
+    if (before != null && text !== before) text = compose(this.today);
+    return this.writeFile(rel, text);
+  }
+
   // Any vault file, with a pre-image backup the first time a run touches it.
   writeFile(rel, content) {
     const abs = join(this.ctx.vault, rel);
@@ -548,8 +620,9 @@ export class NoteWriter {
         const row = this.rows.get(id);
         up.run(row.id, row.type, row.path, row.title, row.norm, JSON.stringify(row.data), row.created_run ?? this.runId, this.runId);
       }
+      for (const id of this.removed) this.db.prepare('DELETE FROM b_notes WHERE id = ?').run(id);
     }
-    const changed = this.files.length || rowsChanged.length || this.itemsAdded.length || (batch && batch.statusBefore !== 'merged') || identityChanged;
+    const changed = this.files.length || rowsChanged.length || this.removed.size || this.itemPre.size || this.itemsAdded.length || (batch && batch.statusBefore !== 'merged') || identityChanged;
     if (changed && !this.ctx.dryRun) {
       const manifest = {
         run_id: this.runId,
@@ -557,8 +630,9 @@ export class NoteWriter {
         batch_id: this.batchId,
         at: isoNow(this.ctx),
         files: this.files,
-        notes: Object.fromEntries([...this.preimages].filter(([id]) => this.dirty.has(id))),
+        notes: Object.fromEntries([...this.preimages].filter(([id]) => this.dirty.has(id) || this.removed.has(id))),
         items: this.itemsAdded,
+        items_before: [...this.itemPre.values()],
         ...(batch ? { batch: { id: batch.id, status_before: batch.statusBefore ?? null } } : {}),
       };
       writeJson(join(this.backupDir(), 'manifest.json'), manifest);
@@ -868,6 +942,7 @@ export function restoreRun(ctx, runId) {
         );
     }
     db.prepare('DELETE FROM b_items WHERE run_id = ?').run(runId);
+    for (const it of manifest.items_before ?? []) db.prepare('UPDATE b_items SET target = ?, section = ?, text = ? WHERE fp = ?').run(it.target, it.section, it.text, it.fp);
     if (manifest.batch?.id) db.prepare('UPDATE b_batches SET status = ?, merged_at = NULL, run_id = NULL WHERE id = ?').run(manifest.batch.status_before && manifest.batch.status_before !== 'merged' ? 'written' : manifest.batch.status_before ?? 'written', manifest.batch.id);
     db.prepare('UPDATE b_runs SET undone_at = ? WHERE id = ?').run(isoNow(ctx), runId);
     db.exec('COMMIT');

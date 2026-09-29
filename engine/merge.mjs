@@ -17,6 +17,7 @@ import { bPaths, bTables, takeLock, loadScrub, patchState } from './lib/b-common
 import { NoteWriter, companyKey } from './notes.mjs';
 import { loadIdentity, recordFixes } from './identity.mjs';
 import { batchRow, setBatchStatus, estimateBacklog } from './batch.mjs';
+import { addReviewItems, writeReviewNote } from './review.mjs';
 
 // Values that are ids, dates or enums: never rewritten.
 const RAW_KEYS = new Set(['source_refs', 'person_ids', 'person_id', 'date', 'due', 'direction', 'status', 'type', 'action', 'batch_id']);
@@ -77,7 +78,38 @@ class Merger {
     this.ownerName = owner;
     this.ownerNorm = normalizeName(owner);
     this.ownerFirst = nameTokens(owner)[0] ?? null;
-    this.report = { added: 0, duplicates: 0, bad_refs: 0, dropped: [], skipped_people: [], identity_fixes: 0 };
+    this.report = { added: 0, duplicates: 0, bad_refs: 0, dropped: [], skipped_people: [], identity_fixes: 0, review_added: 0 };
+    this.explicit = { company: new Set(), project: new Set() };
+  }
+
+  // A company or project gets its own note when the sorter lists it, when it
+  // already exists, or once it has come up in two separate items (in this
+  // batch or earlier ones). One passing mention stays plain text.
+  countMentions(c) {
+    for (const co of c.companies ?? []) this.explicit.company.add(companyKey(co.name));
+    for (const p of c.projects ?? []) this.explicit.project.add(normalizeName(p.name));
+    const seen = [];
+    const add = (type, name, section, i, date, refs) => name && seen.push({ type, name, section, i, date, refs: [...new Set((refs ?? []).filter((r) => this.refs.has(r)))] });
+    (c.people ?? []).forEach((x, i) => add('company', x.company, 'people', i, maxDate(x.bullets ?? []), (x.bullets ?? []).flatMap((b) => b.source_refs)));
+    (c.projects ?? []).forEach((x, i) => add('company', x.company, 'projects', i, maxDate(x.bullets ?? []), (x.bullets ?? []).flatMap((b) => b.source_refs)));
+    for (const [section, fields] of [['meetings', ['company', 'project']], ['decisions', ['company', 'project']], ['commitments', ['company', 'project']], ['opportunities', ['company']], ['ideas', ['project']]]) {
+      (c[section] ?? []).forEach((x, i) => {
+        for (const f of fields) add(f, x[f], section, i, x.date, x.source_refs);
+      });
+    }
+    for (const m of seen) {
+      const key = m.type === 'company' ? companyKey(m.name) : normalizeName(m.name);
+      if (!key) continue;
+      this.w.addItem({ fp: fingerprint('mention', m.type, key, this.batch.id, m.section, m.i), target: `mention:${m.type}:${key}`, section: 'mention', date: m.date, refs: m.refs });
+    }
+  }
+
+  canCreate(type, name) {
+    const key = type === 'company' ? companyKey(name) : normalizeName(name);
+    if (!key) return false;
+    if (this.explicit[type].has(key) || this.w.findByName(type, name).length) return true;
+    const n = bTables(this.ctx.store).prepare(`SELECT COUNT(*) n FROM b_items WHERE target = ? AND section = 'mention'`).get(`mention:${type}:${key}`).n;
+    return n >= 2;
   }
 
   validRefs(refs) {
@@ -155,7 +187,7 @@ class Merger {
     if (fields.role) set.role = oneLine(fields.role);
     if (fields.relationship) set.relationship = oneLine(fields.relationship);
     if (fields.company) {
-      const co = this.ensureCompany(fields.company, null, date);
+      const co = this.ensureCompany(fields.company, null, date, { create: this.canCreate('company', fields.company) });
       if (co) Object.assign(set, { company_id: co.id, company_name: co.title });
     }
     w.setFields(row, set, date);
@@ -308,7 +340,7 @@ class Merger {
     for (const p of list ?? []) {
       const bullets = p.bullets ?? [];
       const date = maxDate(bullets) ?? this.batchDate;
-      const co = p.company ? this.ensureCompany(p.company, null, date) : null;
+      const co = p.company ? this.ensureCompany(p.company, null, date, { create: this.canCreate('company', p.company) }) : null;
       const row = this.ensureProject(p.name, { status: p.status, goal: p.goal ? oneLine(p.goal) : undefined, ...this.linkFields('company', co, p.company) }, date);
       if (!row) continue;
       const people = (p.people ?? []).filter((n) => !this.isOwnerName(n)).map((n) => this.personRef(n));
@@ -346,8 +378,8 @@ class Merger {
       const primary = refs.find((r) => this.meetingRefs.has(r)) ?? [...refs].sort()[0];
       const id = `m_${shortHash(primary, 10)}`;
       const row = w.note(id) ?? w.create('meeting', id, m.title, { title: oneLine(m.title), date: m.date, primary_ref: primary });
-      const co = m.company ? this.ensureCompany(m.company, null, m.date) : null;
-      const pr = m.project ? this.ensureProject(m.project, null, m.date) : null;
+      const co = m.company ? this.ensureCompany(m.company, null, m.date, { create: this.canCreate('company', m.company) }) : null;
+      const pr = m.project ? this.ensureProject(m.project, null, m.date, { create: this.canCreate('project', m.project) }) : null;
       const people = [];
       for (const n of m.people ?? []) {
         if (this.isOwnerName(n)) continue;
@@ -384,8 +416,8 @@ class Merger {
       }
       const fp = fingerprint('decision', d.date, d.title);
       const row = w.note(`d_${fp}`) ?? this.similar('decision', d.title, (x) => x.data.date === d.date, 0.6) ?? w.create('decision', `d_${fp}`, d.title, { title: oneLine(d.title), date: d.date });
-      const co = d.company ? this.ensureCompany(d.company, null, d.date) : null;
-      const pr = d.project ? this.ensureProject(d.project, null, d.date) : null;
+      const co = d.company ? this.ensureCompany(d.company, null, d.date, { create: this.canCreate('company', d.company) }) : null;
+      const pr = d.project ? this.ensureProject(d.project, null, d.date, { create: this.canCreate('project', d.project) }) : null;
       const by = [];
       for (const n of d.decided_by ?? []) {
         const ref = this.personRef(n);
@@ -451,8 +483,8 @@ class Merger {
       const cp = res && !res.owner ? (w.note(res.id) ?? ((res.person || res.fresh) ? this.ensurePerson(res, {}, k.date) : null)) : null;
       const key = cp?.id ?? normalizeName(k.counterpart);
       const fp = fingerprint('commitment', k.direction, key, k.text);
-      const co = k.company ? this.ensureCompany(k.company, null, k.date, { create: false }) : null;
-      const pr = k.project ? this.ensureProject(k.project, null, k.date, { create: false }) : null;
+      const co = k.company ? this.ensureCompany(k.company, null, k.date, { create: this.canCreate('company', k.company) }) : null;
+      const pr = k.project ? this.ensureProject(k.project, null, k.date, { create: this.canCreate('project', k.project) }) : null;
       const row = this.tracked('commitment', k, {
         key,
         fp,
@@ -474,7 +506,7 @@ class Merger {
       }
       const res = o.counterpart ? this.resolvePerson({ name: o.counterpart }) : null;
       const cp = res && !res.owner ? (w.note(res.id) ?? ((res.person || res.fresh) ? this.ensurePerson(res, {}, o.date) : null)) : null;
-      const co = o.company ? this.ensureCompany(o.company, null, o.date) : null;
+      const co = o.company ? this.ensureCompany(o.company, null, o.date, { create: this.canCreate('company', o.company) }) : null;
       const key = cp?.id ?? co?.id ?? normalizeName(o.counterpart ?? o.company ?? '');
       const fp = fingerprint('opportunity', o.type, key, o.title);
       const row = this.tracked('opportunity', o, {
@@ -500,7 +532,7 @@ class Merger {
       }
       const fp = fingerprint('idea', i.title);
       const row = w.note(`i_${fp}`) ?? this.similar('idea', i.title, null, 0.7) ?? w.create('idea', `i_${fp}`, i.title, { title: oneLine(i.title), date: i.date, status: 'new' });
-      const pr = i.project ? this.ensureProject(i.project, null, i.date, { create: false }) : null;
+      const pr = i.project ? this.ensureProject(i.project, null, i.date, { create: this.canCreate('project', i.project) }) : null;
       const people = (i.people ?? []).filter((n) => !this.isOwnerName(n)).map((n) => this.personRef(n));
       w.setFields(row, { text: i.text, ...this.linkFields('project', pr, i.project) }, i.date);
       if (people.length) w.unionField(row, 'people', people.filter((x) => !(row.data.people ?? []).some((y) => normalizeName(y.name) === normalizeName(x.name))), 20);
@@ -525,7 +557,23 @@ class Merger {
     }
   }
 
+  // Questions the sorter could not answer from the batch.
+  review(list) {
+    const items = [];
+    for (const r of list ?? []) {
+      const refs = this.validRefs(r.source_refs);
+      if (!refs.length) {
+        this.drop('review', r.question);
+        continue;
+      }
+      items.push({ ...r, source_refs: refs });
+    }
+    this.report.review_added = addReviewItems(this.w, items, { origin: 'sort', batchId: this.batch.id });
+    if (this.report.review_added) writeReviewNote(this.w);
+  }
+
   apply(c) {
+    this.countMentions(c);
     this.identityFixes(c.identity);
     this.companies(c.companies);
     this.people(c.people);
@@ -537,6 +585,7 @@ class Merger {
     this.opportunities(c.opportunities);
     this.ideas(c.ideas);
     this.knowledge(c.knowledge);
+    this.review(c.review);
   }
 }
 

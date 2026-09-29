@@ -11,13 +11,12 @@ import { basename, join } from 'node:path';
 import { FOLDERS, folderName } from './lib/folders.mjs';
 import { t, fill } from './lib/i18n.mjs';
 import { sha1 } from './lib/hash.mjs';
-import { composeNote } from './lib/frontmatter.mjs';
-import { composeBody, upsertSections, mergeFrontmatter, splitNote } from './lib/b-sections.mjs';
 import { takeLock, readText } from './lib/b-common.mjs';
 import { loadPersona, personaText } from './lib/b-persona.mjs';
 import { NoteWriter, TYPE_FOLDER } from './notes.mjs';
 import { loadIdentity } from './identity.mjs';
 import { batchStatus } from './batch.mjs';
+import { openCount, reviewNoteName, writeReviewNote, loadReview } from './review.mjs';
 
 const INDEX_LIMIT = 300;
 const TYPE_BY_FOLDER = Object.fromEntries(Object.entries(TYPE_FOLDER).map(([type, key]) => [key, type]));
@@ -205,23 +204,6 @@ function indexContent(w, key, rows, other, baseLinks) {
   return parts.join('\n\n') || tr('index.none');
 }
 
-// Managed file: frontmatter keys and one section are ours, the rest is kept.
-function managedNote(w, rel, { fm, title, section, content }) {
-  const owned = Object.keys(fm).concat('updated');
-  const before = readText(join(w.ctx.vault, rel));
-  const compose = (updated) => {
-    const data = { ...fm, updated };
-    const sections = [{ name: section, heading: null, content }];
-    if (before == null) return composeNote(data, composeBody(title, sections));
-    const { fmText, body } = splitNote(before);
-    return `${mergeFrontmatter(fmText, data, owned)}${upsertSections(body, sections)}`;
-  };
-  const prev = before == null ? null : splitNote(before).data.updated;
-  let text = compose(prev ?? w.today);
-  if (before != null && text !== before) text = compose(w.today);
-  return w.writeFile(rel, text);
-}
-
 function latestBrief(ctx) {
   const dir = folderName('briefs', ctx.lang);
   const files = mdFiles(ctx.vault, dir);
@@ -235,6 +217,8 @@ function homeContent(w, counts, baseLinks) {
   const parts = [];
   const brief = latestBrief(ctx);
   parts.push(brief ? fill(tr('home.latest_brief'), { link: link(brief) }) : tr('home.no_brief'));
+  const toReview = openCount(ctx);
+  if (toReview) parts.push(fill(tr(toReview === 1 ? 'home.review_one' : 'home.review_many'), { n: toReview, link: `[[${reviewNoteName(ctx.lang)}]]` }));
   const folderLines = FOLDERS.map((f) => {
     const n = counts[f.key] ?? 0;
     return `- ${fill(tr('home.folder_line'), { link: `[[${folderName(f.key, ctx.lang)}]]`, count: n === 1 ? tr('home.notes_one') : fill(tr('home.notes_many'), { n }) })}`;
@@ -267,12 +251,14 @@ function homeContent(w, counts, baseLinks) {
   return parts.join('\n\n');
 }
 
-export async function buildMocs(ctx) {
-  const release = takeLock(ctx, 'vault');
+// With `writer`, runs inside the caller's run (and lock) and leaves finish()
+// to the caller, so one undo covers both.
+export async function buildMocs(ctx, { writer } = {}) {
+  const release = writer ? () => {} : takeLock(ctx, 'vault');
   try {
-    const identity = loadIdentity(ctx, { build: true });
+    const identity = writer?.identity ?? loadIdentity(ctx, { build: true });
     const persona = loadPersona(ctx);
-    const w = new NoteWriter(ctx, { identity, persona, kind: 'mocs' });
+    const w = writer ?? new NoteWriter(ctx, { identity, persona, kind: 'mocs' });
     const tr = t('notes', ctx.lang);
 
     // Pick up the person's edits, then refresh notes that show derived data.
@@ -310,7 +296,7 @@ export async function buildMocs(ctx) {
       const files = mdFiles(ctx.vault, dir).filter((p) => p !== indexRel);
       counts[f.key] = files.length;
       const other = files.filter((p) => !tracked.has(p));
-      managedNote(w, indexRel, {
+      w.writeManaged(indexRel, {
         fm: { type: 'index', confidant_id: `index_${f.key}`, folder: f.key, tags: ['index'] },
         title: dir,
         section: 'index',
@@ -318,15 +304,18 @@ export async function buildMocs(ctx) {
       });
     }
 
+    // The review queue, once there has ever been something in it.
+    if (loadReview(ctx).items.length) writeReviewNote(w);
+
     // Home.
-    managedNote(w, 'Home.md', {
+    w.writeManaged('Home.md', {
       fm: { type: 'home', confidant_id: 'home', tags: ['home'] },
       title: tr('home.title'),
       section: 'home',
       content: homeContent(w, counts, baseLinks),
     });
 
-    const out = w.finish({});
+    const out = writer ? { run_id: null, created: [], updated: [] } : w.finish({});
     return { ...out, counts, bases: baseOut };
   } finally {
     release();

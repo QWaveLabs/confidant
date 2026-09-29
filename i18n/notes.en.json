@@ -131,7 +131,9 @@
     "backfill_left": "Older history is still being sorted, newest first. About {n} batches left, sorted back to {date}.",
     "backfill_started": "Older history is next. It will be sorted a little at a time, newest first.",
     "backfill_done": "All of your history has been sorted.",
-    "updated": "Updated {date}."
+    "updated": "Updated {date}.",
+    "review_one": "One thing needs your review: {link}",
+    "review_many": "{n} things need your review: {link}"
   },
   "index": {
     "other": "Other notes",
@@ -173,5 +175,27 @@
     "col_tier": "Tier",
     "col_last": "Last contact",
     "col_relationship": "Relationship"
-  }
+  },
+  "review": {
+    "title": "Needs review",
+    "intro": "A few things the sorter was not sure about, so it did not guess. Answer any of them in Codex, for example \"For review item r_1a2b, the answer is Mike Brennan\", and the next sort follows your answer.",
+    "none": "Nothing needs your review right now.",
+    "options": "Options: {options}.",
+    "about": "About: {subject}.",
+    "answered": "Recently answered",
+    "answer": "Answer: {answer}.",
+    "dup_person": "Are {a} and {b} the same person?",
+    "dup_note": "Are {a} and {b} the same {kind}?",
+    "maybe_done": "Is \"{text}\" done? A newer message suggests it might be.",
+    "stale_project": "Is {name} still active? Nothing has happened on it in over 30 days.",
+    "yes_merge": "Yes, merge them",
+    "no_keep": "No, keep both",
+    "yes_done": "Yes, it is done",
+    "no_open": "No, still open",
+    "yes_active": "Yes, still active",
+    "waiting": "Waiting",
+    "stalled": "Stalled",
+    "done": "Done"
+  },
+  "merged_from": "Merged from {name}"
 }
