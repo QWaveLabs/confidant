@@ -36,7 +36,7 @@ export const COMMANDS = {
 };
 
 // Flags that never take a value, so `--dry-run foo` keeps foo positional.
-const BOOLEAN_FLAGS = new Set(['json', 'dryRun', 'quiet', 'probe', 'full', 'help', 'debug', 'force', 'yes', 'finish', 'all']);
+const BOOLEAN_FLAGS = new Set(['json', 'dryRun', 'quiet', 'probe', 'full', 'help', 'debug', 'force', 'yes', 'finish', 'all', 'checkIn', 'send', 'apply', 'plan', 'resume', 'open', 'includeFinish', 'includeDiagnostics']);
 
 export function parseArgs(argv) {
   const args = { _: [] };
