@@ -50,12 +50,14 @@ test('golden vault: tree and note contents', async () => {
   assert.deepEqual(people.skipped_people, ['Invented Person'], 'a person with only made-up sources is left out');
   assert.ok(people.dropped.some((d) => d.includes('no real source')), 'a commitment with only made-up sources is dropped');
   const snap = snapshot(ctx.vault);
-  if (process.env.UPDATE_GOLDEN || !existsSync(GOLDEN)) writeFileSync(GOLDEN, `${JSON.stringify(snap, null, 2)}\n`);
+  if (process.env.UPDATE_GOLDEN) writeFileSync(GOLDEN, `${JSON.stringify(snap, null, 2)}\n`);
+  assert.ok(existsSync(GOLDEN), 'golden snapshot exists (UPDATE_GOLDEN=1 creates it)');
   const expected = JSON.parse(readFileSync(GOLDEN, 'utf8'));
   assert.deepEqual(Object.keys(snap).sort(), Object.keys(expected).sort(), 'vault tree');
   for (const [path, content] of Object.entries(expected)) assert.equal(snap[path], content, path);
   for (const [path, content] of Object.entries(snap)) {
-    assert.ok(!/—|--/.test(content.replace(/^---$/gm, '')), `${path} has no em dash or double hyphen`);
+    const prose = content.replace(/^---$/gm, '').replace(/<!-- confidant:(start|end) [a-z_]+ -->/g, '');
+    assert.ok(!/—|--/.test(prose), `${path} has no em dash or double hyphen`);
   }
 });
 

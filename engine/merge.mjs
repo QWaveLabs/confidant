@@ -425,16 +425,28 @@ class Merger {
         row.data._dates = { ...(row.data._dates ?? {}), status: item.date };
         w.markDirty(row);
         bullet = status === 'open' ? text : this.w.tr(`marked.${status}`);
-      } else if (status === cur) bullet = closeWith ?? text;
+      } else if (status === cur) {
+        // A later mention adds a line only when it brings new sources.
+        const cited = new Set(w.itemRows(row.id, 'timeline').flatMap((it) => JSON.parse(it.refs)));
+        if (!refs.every((r) => cited.has(r))) bullet = closeWith ?? text;
+      }
     }
     if (bullet) this.addBullets(row.id, [{ date: item.date, text: bullet, source_refs: refs }]);
     for (const k of ['counterpart_id', 'company_id', 'project_id']) if (row.data[k]) w.touch(row.data[k]);
     return row;
   }
 
+  isExcluded(name) {
+    return !!name && this.excluded.has(normalizeName(name));
+  }
+
   commitments(list) {
     const w = this.w;
     for (const k of list ?? []) {
+      if (this.isExcluded(k.counterpart)) {
+        this.drop('commitment', k.text);
+        continue;
+      }
       const res = this.resolvePerson({ name: k.counterpart });
       const cp = res && !res.owner ? (w.note(res.id) ?? ((res.person || res.fresh) ? this.ensurePerson(res, {}, k.date) : null)) : null;
       const key = cp?.id ?? normalizeName(k.counterpart);
@@ -456,6 +468,10 @@ class Merger {
   opportunities(list) {
     const w = this.w;
     for (const o of list ?? []) {
+      if (this.isExcluded(o.counterpart)) {
+        this.drop('opportunity', o.title);
+        continue;
+      }
       const res = o.counterpart ? this.resolvePerson({ name: o.counterpart }) : null;
       const cp = res && !res.owner ? (w.note(res.id) ?? ((res.person || res.fresh) ? this.ensurePerson(res, {}, o.date) : null)) : null;
       const co = o.company ? this.ensureCompany(o.company, null, o.date) : null;
