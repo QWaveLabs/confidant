@@ -334,10 +334,10 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 
 | Unit | Model | Owns |
 |---|---|---|
-| A | Opus | `engine/extract/{imessage,whatsapp,whatsapp-export,mail,calendar,contacts,calls,call-recordings,voice-memos,wispr,zoom-local}.mjs`, `engine/privacy.mjs`, `engine/lib/a-*.mjs` (MIME, protobuf, MP4 atoms), `test/a-*.test.mjs` |
-| B | Opus | `engine/{identity,dossiers,batch,merge,notes,mocs,undo}.mjs`, `engine/lib/b-*.mjs`, `prompts/sort*.md`, `.agents/skills/confidant-sort/`, `i18n/notes.*.json`, `test/b-*.test.mjs` |
-| C | Sonnet | `engine/extract/{fathom,fireflies,granola,readai,grain,tldv,recaps}.mjs`, `engine/ingest.mjs`, `engine/keys.mjs`, `engine/lib/c-*.mjs` (http, keys, transcribe), `.agents/skills/confidant-install/recipes/`, `test/c-*.test.mjs` |
-| D | Sonnet | `personas/*.json`, `engine/{init,tasks,digest,update}.mjs`, `engine/lib/d-*.mjs`, `prompts/tasks/`, `templates/vault/`, `.agents/skills/confidant-agents/`, `i18n/{vault,agents}.*.json`, `test/d-*.test.mjs` |
+| A | Opus | `i18n/extract.*.json`, `engine/extract/{imessage,whatsapp,whatsapp-export,mail,calendar,contacts,calls,call-recordings,voice-memos,wispr,zoom-local}.mjs`, `engine/privacy.mjs`, `engine/lib/a-*.mjs` (MIME, protobuf, MP4 atoms), `test/a-*.test.mjs` |
+| B | Opus | `engine/{identity,dossiers,batch,merge,notes,mocs,undo,review,cleanup}.mjs`, `engine/lib/b-*.mjs`, `prompts/sort*.md`, `.agents/skills/confidant-sort/`, `i18n/notes.*.json`, `test/b-*.test.mjs` |
+| C | Sonnet | `engine/extract/{fathom,fireflies,granola,readai,grain,tldv,recaps}.mjs`, `engine/ingest.mjs`, `engine/keys.mjs`, `engine/support.mjs`, `engine/lib/c-*.mjs` (http, keys, transcribe), `.agents/skills/confidant-install/recipes/`, `test/c-*.test.mjs` |
+| D | Sonnet | `personas/*.json`, `engine/{init,tasks,digest,update,health,usage}.mjs`, `engine/lib/d-*.mjs`, `prompts/tasks/`, `templates/vault/`, `.agents/skills/confidant-agents/`, `i18n/{vault,agents}.*.json`, `test/d-*.test.mjs` |
 | E | Sonnet | `AGENTS.md`, `CUSTOMER_PROMPT.md`, `README.md`, `scripts/release.mjs`, `.agents/skills/confidant-install/SKILL.md`, `engine/{doctor,config,status,welcome}.mjs`, `engine/lib/e-*.mjs`, `templates/welcome/`, `i18n/{welcome,install}.*.json`, `test/e-*.test.mjs` |
 
 U0 (the orchestrator) owns `engine/cli.mjs`, `engine/lib/{paths,files,handles,time,hash,lock,store,sqlite,schema,frontmatter,folders,sources,i18n,context}.mjs`, `engine/extract/index.mjs`, `schemas/`, `bin/`, `package.json`, `CONTRACTS.md` and `test/lib.test.mjs`.
