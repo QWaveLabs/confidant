@@ -93,6 +93,19 @@ function writeObsidianConfigIfAbsent(vault) {
   writeFileAtomic(dest, readFileSync(src, 'utf8'));
 }
 
+// Types every date-shaped frontmatter key across the whole vault as a real
+// Obsidian date, not plain text, so it sorts and filters correctly: `due`
+// and `date` on commitments/decisions/meetings/ideas/opportunities/
+// knowledge, `updated` on every note, `last_contact` on person notes, and
+// `first_seen`/`last_seen` wherever identity data surfaces them.
+function writeObsidianTypesIfAbsent(vault) {
+  const dest = join(vault, '.obsidian', 'types.json');
+  if (existsSync(dest)) return;
+  const src = join(REPO_ROOT, 'templates', 'vault', 'obsidian-types.json');
+  ensureDir(join(vault, '.obsidian'));
+  writeFileAtomic(dest, readFileSync(src, 'utf8'));
+}
+
 function writeVaultAgentsIfAbsent(vault, lang) {
   const dest = join(vault, 'AGENTS.md');
   if (existsSync(dest)) return;
@@ -263,6 +276,7 @@ export async function run(args, ctx) {
     copyAgentSkills(vault);
     writeVaultAgentsIfAbsent(vault, effectiveLang);
     writeObsidianConfigIfAbsent(vault);
+    writeObsidianTypesIfAbsent(vault);
     writeHomeIfAbsent(vault, effectiveLang);
   }
 

@@ -150,7 +150,7 @@ function keepWarm(ctx, identity, days = 21) {
         const file = join(ctx.vault, p.note_path);
         if (existsSync(file)) {
           try {
-            topic = timelineBullets(parseNote(readFileSync(file, 'utf8')).body, 1)[0]?.text ?? '';
+            topic = timelineBullets(parseNote(readFileSync(file, 'utf8')).body, ctx.lang, 1)[0]?.text ?? '';
           } catch { /* note not readable yet; skip its topic, not the whole run */ }
         }
       }
@@ -233,7 +233,7 @@ function attendeeSection(ctx, identity, strings, personName, handle) {
     noteData.company ? `Company: ${noteData.company}` : null,
     noteData.tier ? `Tier: ${noteData.tier}` : null,
   ].filter(Boolean).map((s) => String(s).replace(/\.\s*$/, '')).join('. ');
-  const history = timelineBullets(noteBody, 3).map((b) => `- ${b.date}, ${b.text}`);
+  const history = timelineBullets(noteBody, ctx.lang, 3).map((b) => `- ${b.date}, ${b.text}`);
   const commitments = openCommitments(ctx, (n) => mentionsPerson(n.data.counterpart, name));
   const promises = commitments.map((n) => `- ${n.data.direction === 'i_owe' ? 'You owe them' : n.data.direction === 'owed_to_me' ? 'They owe you' : 'Delegated'}: ${firstLine(n.body, n.data.confidant_id)}${n.data.due ? ` (due ${n.data.due})` : ''}`);
   const decisions = notesOfType(ctx.vault, 'decision').filter((n) => mentionsPerson(n.data.decided_by, name));
