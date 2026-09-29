@@ -152,6 +152,12 @@ function humanHealth(v) {
   return v.problems.map((p) => `- ${p.message}\n  Fix: ${p.fix}`).join('\n');
 }
 
+// Alias for `confidant support` (Unit C), which imports this module
+// dynamically and calls `checkHealth(ctx)`, falling back to `buildHealth`.
+// Same object `confidant health --json` prints; `opts` stays optional so
+// the single-argument call it actually makes works unchanged.
+export const checkHealth = buildHealth;
+
 export async function run(args, ctx) {
   // Like `doctor`, this always exits 0: finding a problem is a successful
   // check, not a failed run. The `ok` field in the JSON carries the verdict.
