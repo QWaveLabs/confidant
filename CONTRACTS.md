@@ -273,7 +273,7 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   - decision: `date, project, company, decided_by[]`
   - commitment: `direction (i_owe|owed_to_me|delegated), counterpart ("[[Name]]"), company, project, due, status (open|done|dropped), date, fingerprint`
   - idea: `date, status`
-  - opportunity: `type, status (open|won|lost|stale), counterpart, company, value, date, next_step`
+  - opportunity: `opportunity_type, status (open|won|lost|stale), counterpart, company, value, date, next_step` (`type` is always the note kind, so the category is `opportunity_type`)
   - knowledge: `date`
 - Dated bullets in bodies look like `- 2026-09-01, text. _(iMessage)_`. Newest
   bullets go first, under `## Timeline`.
@@ -292,12 +292,15 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   - no model pinned
 - After each create it runs `confidant tasks record --key <k> --id <automation id>`.
 - Task keys:
-  - `brain_update`: "Commitment Tracker + Brain Update", every 3 hours on the hour
+  - `brain_update`: "Commitment Tracker + Brain Update", every 3 hours at :10 (00:10, 03:10, 06:10 ... so it never collides with tasks on the hour)
   - `opportunity_scanner`: weekdays, brief time minus 15 minutes
   - `morning_brief`: "Morning Chief of Staff", weekdays at brief time
   - `meeting_prep`: weekdays at :30, scaled by meetingsPerWeek
   - `follow_up_radar`: weekdays at 16:00
   - `weekly_review`: "Weekly CEO Review", Fridays at 15:00
+  - `health_check`: "Health Check", daily 08:20, silent unless something is broken
+  - `brain_cleanup`: "Brain Cleanup", Sundays 20:40
+  - `check_in`: "Confidant Check-in", Thursdays 11:40, decides each week whether to speak (first impressions, one improvement question every 2 weeks, monthly value receipt, gentle nudge when usage is low)
   - `finish_sorting`: temporary, only if the install hit usage limits
 - Every task prompt ends with the heartbeat block:
   `<heartbeat><decision>NOTIFY|DONT_NOTIFY</decision><message>one line</message></heartbeat>`.
@@ -308,6 +311,15 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   3. identity, then dossiers with changedSince, then batch next (scope update, plus one backlog batch)
   4. print the batches for Codex
 - `confidant update --finish` then runs `mocs` and writes `state.lastUpdate`.
+
+## Trust, cleanup, support (added 9/28)
+
+- **Review queue (B).** When the sorter is unsure (which person, which project, whether something is a commitment), it does not guess. Contributions may carry `review: [{ question, options?, source_refs }]`; merge appends them to `.confidant/review.json` and renders `Needs review.md` at the vault root. `confidant review` lists them; `confidant review --resolve <id> --answer <text>` records the answer so the next sort follows it.
+- **Context rules (B sort prompt, D brain_update prompt).** Match people by handles before names; reuse existing notes (the batch `known` list, aliases, company, shared participants); attach to projects by context (participants, company, topic, recent meetings); never create a project from one passing mention; never overwrite the person's own text.
+- **Cleanup (B).** `confidant cleanup --plan --json` lists: exact duplicates (same handle or fingerprint), probable duplicates (name similarity plus shared company or participants), broken wikilinks, commitments later marked done in newer records, projects with no activity in 30 days, sensitive strings that `scrubText` would now catch. `cleanup --apply` applies only the safe ones (exact duplicates, broken links to renamed notes, scrub, index rebuild) with a backup run id; probable duplicates go to the review queue.
+- **Health (D).** `confidant health --json`: last successful update age, each source's readability and last cursor move, key validity (probe), disk space, backlog progress, vault writable. Each problem comes with a plain fix.
+- **Usage (D).** `confidant usage --json`: counts only, never content. Briefs written and whether their scheduled runs were opened (Codex `inbox_items` read state for this vault's tasks, read-only from `~/.codex/sqlite/codex-dev.db`), notes opened recently (`.obsidian/workspace.json` lastOpenFiles), questions asked in the vault project this week (session count), and value delivered (commitments tracked, meetings prepped, opportunities flagged, follow-ups caught). Every read is defensive: missing or changed files give nulls, never errors.
+- **Support and feedback (C).** `confidant support --kind support|feedback --message-file <path> [--include-diagnostics]` prints a preview of exactly what would be sent. `--send --yes` sends it. Diagnostics are doctor + health + status counts; they never include message content, contacts, file names from sources or keys. Rate limits: 3 sends a day and 10 a month per install (state.support.sent), and the server enforces its own. It posts JSON to `https://meetconfidant.com/api/confidant/report` with `{ install_id, kind, message, diagnostics, version, language }`. If the network fails, it prints a `mailto:support@meetconfidant.com` link with the same text. `install_id` is a random id created at init (config.installId). Codex sends only when the person explicitly asks, after showing the preview.
 
 ## State (.confidant/state.json)
 

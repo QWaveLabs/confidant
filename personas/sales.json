@@ -1,0 +1,29 @@
+{
+  "id": "sales",
+  "label": { "en": "Sales professional", "es": "Profesional de ventas" },
+  "focus": {
+    "en": "You never lose a follow-up, a buying signal or a relationship detail. Watch for pricing asks that never got answered, deals gone quiet after a demo, and any renewal date coming up.",
+    "es": "Nunca pierdes un seguimiento, una señal de compra ni un detalle de una relación. Vigila las solicitudes de precio que nunca se respondieron, los tratos que se quedaron en silencio después de una demo, y cualquier fecha de renovación que se acerque."
+  },
+  "subfolders": [
+    { "folder": "opportunities", "name": { "en": "Pipeline", "es": "Pipeline" }, "rule": "status in [open]", "kinds": [] },
+    { "folder": "companies", "name": { "en": "Accounts", "es": "Cuentas" }, "rule": "kind in [account]", "kinds": ["account"] }
+  ],
+  "personKinds": ["prospect", "customer", "champion", "economic_buyer"],
+  "companyKinds": ["account", "prospect"],
+  "opportunityFocus": ["pricing_ask", "upsell", "stalled_proposal", "renewal", "lead"],
+  "agents": {
+    "opportunity_scanner": {
+      "en": "A pricing ask with no reply is the highest priority. Surface it before anything else.",
+      "es": "Una solicitud de precio sin respuesta es la prioridad más alta. Muéstrala antes que cualquier otra cosa."
+    },
+    "follow_up_radar": {
+      "en": "Rank prospects who went quiet after a demo above ordinary follow-ups.",
+      "es": "Da prioridad a los prospectos que se quedaron en silencio después de una demo, por encima de los seguimientos normales."
+    }
+  },
+  "bases": [
+    { "file": "Pipeline.base", "title": { "en": "Pipeline", "es": "Pipeline" }, "folder": "Opportunities/Pipeline", "filter": "status == \"open\"" },
+    { "file": "Accounts.base", "title": { "en": "Accounts", "es": "Cuentas" }, "folder": "Companies/Accounts", "filter": "kind == \"account\"" }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "founder",
+  "label": { "en": "Founder", "es": "Fundador" },
+  "focus": {
+    "en": "You are running the whole company at once: customers, employees, investors, ideas and a dozen decisions a day. Put revenue and hiring first, never let a customer thread go quiet, and always know what an investor is waiting to hear from you.",
+    "es": "Manejas toda la empresa al mismo tiempo: clientes, empleados, inversionistas, ideas y decenas de decisiones al día. Prioriza los ingresos y la contratación, nunca dejes un hilo de un cliente sin respuesta, y ten siempre claro qué espera saber de ti un inversionista."
+  },
+  "subfolders": [
+    { "folder": "companies", "name": { "en": "Customers", "es": "Clientes" }, "rule": "kind in [customer]", "kinds": ["customer"] },
+    { "folder": "companies", "name": { "en": "Investors", "es": "Inversionistas" }, "rule": "kind in [investor]", "kinds": ["investor"] },
+    { "folder": "people", "name": { "en": "Team", "es": "Equipo" }, "rule": "kind in [team]", "kinds": ["team"] }
+  ],
+  "personKinds": ["customer", "investor", "team", "advisor", "vendor", "candidate"],
+  "companyKinds": ["customer", "investor", "partner", "vendor"],
+  "opportunityFocus": ["upsell", "stalled_proposal", "renewal", "lead", "introduction", "possible_product"],
+  "agents": {
+    "morning_brief": {
+      "en": "Lead with any investor waiting on an update and any customer who has gone quiet. Hiring commitments come next.",
+      "es": "Empieza con cualquier inversionista que espere una actualización y cualquier cliente que se haya quedado en silencio. Los compromisos de contratación van después."
+    },
+    "weekly_review": {
+      "en": "Call out runway-relevant decisions, investor updates sent or owed, and any customer at risk of churning.",
+      "es": "Destaca las decisiones que afectan el runway, las actualizaciones a inversionistas enviadas o pendientes, y cualquier cliente en riesgo de irse."
+    }
+  },
+  "bases": [
+    { "file": "Customers.base", "title": { "en": "Customers", "es": "Clientes" }, "folder": "Companies/Customers", "filter": "kind == \"customer\"" },
+    { "file": "Investors.base", "title": { "en": "Investors", "es": "Inversionistas" }, "folder": "Companies/Investors", "filter": "kind == \"investor\"" }
+  ]
+}

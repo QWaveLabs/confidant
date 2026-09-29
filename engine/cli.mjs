@@ -28,6 +28,11 @@ export const COMMANDS = {
   config: { module: './config.mjs', needsVault: true, help: 'Sandbox, trust, wake schedule and login item setup' },
   keys: { module: './keys.mjs', needsVault: false, help: 'Store or check API keys in Keychain' },
   status: { module: './status.mjs', needsVault: true, help: 'What is connected, counts, backlog, tasks' },
+  health: { module: './health.mjs', needsVault: true, help: 'Is everything still working? Sources, keys, last update, disk' },
+  cleanup: { module: './cleanup.mjs', needsVault: true, help: 'Find duplicates, broken links and stale items; apply safe fixes' },
+  review: { module: './review.mjs', needsVault: true, help: 'Items the sorter was unsure about, for the person to confirm' },
+  usage: { module: './usage.mjs', needsVault: true, help: 'How Confidant is being used (counts only) and value delivered' },
+  support: { module: './support.mjs', needsVault: false, help: 'Preview or send a sanitized report or feedback to the Confidant team' },
 };
 
 // Flags that never take a value, so `--dry-run foo` keeps foo positional.

@@ -3,17 +3,60 @@
   "type": "array",
   "items": {
     "type": "object",
-    "required": ["key", "name", "rrule", "prompt", "notify", "cwd"],
+    "required": [
+      "key",
+      "name",
+      "rrule",
+      "prompt",
+      "notify",
+      "cwd"
+    ],
     "additionalProperties": false,
     "properties": {
-      "key": { "enum": ["brain_update", "opportunity_scanner", "morning_brief", "meeting_prep", "follow_up_radar", "weekly_review", "finish_sorting"] },
-      "name": { "type": "string" },
-      "rrule": { "type": "string", "pattern": "^FREQ=(HOURLY|DAILY|WEEKLY|MONTHLY)(;[A-Z]+=[A-Z0-9,+-]+)*$" },
-      "fallbackRrules": { "type": "array", "items": { "type": "string" }, "$comment": "create one task per rule if the combined rule is rejected" },
-      "prompt": { "type": "string", "minLength": 40 },
-      "notify": { "enum": ["heartbeat", "failed_runs_only"] },
-      "cwd": { "type": "string" },
-      "temporary": { "type": "boolean" }
+      "key": {
+        "enum": [
+          "brain_update",
+          "opportunity_scanner",
+          "morning_brief",
+          "meeting_prep",
+          "follow_up_radar",
+          "weekly_review",
+          "health_check",
+          "brain_cleanup",
+          "check_in",
+          "finish_sorting"
+        ]
+      },
+      "name": {
+        "type": "string"
+      },
+      "rrule": {
+        "type": "string",
+        "pattern": "^FREQ=(HOURLY|DAILY|WEEKLY|MONTHLY)(;[A-Z]+=[A-Z0-9,+-]+)*$"
+      },
+      "fallbackRrules": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "$comment": "create one task per rule if the combined rule is rejected"
+      },
+      "prompt": {
+        "type": "string",
+        "minLength": 40
+      },
+      "notify": {
+        "enum": [
+          "heartbeat",
+          "failed_runs_only"
+        ]
+      },
+      "cwd": {
+        "type": "string"
+      },
+      "temporary": {
+        "type": "boolean"
+      }
     }
   }
 }

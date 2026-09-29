@@ -1,0 +1,30 @@
+{
+  "id": "investor",
+  "label": { "en": "Investor", "es": "Inversionista" },
+  "focus": {
+    "en": "You keep deep memory across companies, founders and opportunities. Watch for a founder waiting on a reply, a portfolio company sharing bad news, and a pipeline deal going quiet before a decision.",
+    "es": "Mantienes una memoria profunda de empresas, fundadores y oportunidades. Vigila a un fundador que espere una respuesta, una empresa del portafolio que comparta una mala noticia, y una operación en el pipeline que se quede en silencio antes de decidir."
+  },
+  "subfolders": [
+    { "folder": "companies", "name": { "en": "Portfolio", "es": "Portafolio" }, "rule": "kind in [portfolio]", "kinds": ["portfolio"] },
+    { "folder": "companies", "name": { "en": "Pipeline", "es": "Pipeline" }, "rule": "kind in [pipeline]", "kinds": ["pipeline"] },
+    { "folder": "people", "name": { "en": "Founders", "es": "Fundadores" }, "rule": "kind in [founder]", "kinds": ["founder"] }
+  ],
+  "personKinds": ["founder", "co-investor", "lp", "advisor"],
+  "companyKinds": ["portfolio", "pipeline", "co-investor"],
+  "opportunityFocus": ["introduction", "lead", "possible_product", "other"],
+  "agents": {
+    "opportunity_scanner": {
+      "en": "Flag a pipeline company asking for a decision, and any founder introduction that never got a reply.",
+      "es": "Señala a una empresa del pipeline que pida una decisión, y cualquier presentación de un fundador que no haya recibido respuesta."
+    },
+    "weekly_review": {
+      "en": "Separate portfolio developments from pipeline developments, and note anything that should reach a co-investor.",
+      "es": "Separa las novedades del portafolio de las del pipeline, y anota cualquier cosa que deba llegar a un coinversionista."
+    }
+  },
+  "bases": [
+    { "file": "Portfolio.base", "title": { "en": "Portfolio", "es": "Portafolio" }, "folder": "Companies/Portfolio", "filter": "kind == \"portfolio\"" },
+    { "file": "Pipeline.base", "title": { "en": "Pipeline", "es": "Pipeline" }, "folder": "Companies/Pipeline", "filter": "kind == \"pipeline\"" }
+  ]
+}

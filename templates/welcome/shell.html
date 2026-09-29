@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="{{lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f7f8fa;
+    --surface: #fdfdfe;
+    --sunken: #f0f1f3;
+    --ink: #1c1e23;
+    --ink-2: #5a5f69;
+    --ink-3: #868a93;
+    --line: #e5e7ea;
+    --signal: #e0572f;
+    --on-signal: #fdfdfe;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #15171b;
+      --surface: #1c1f24;
+      --sunken: #22262c;
+      --ink: #f2f3f5;
+      --ink-2: #b8bcc4;
+      --ink-3: #8c919b;
+      --line: #2c313a;
+      --signal: #ef6a44;
+      --on-signal: #1c1f24;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 80px; }
+  header.top { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+  header.top svg { flex: none; border-radius: 22%; }
+  header.top .name { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+  .tagline { color: var(--ink-2); font-size: 15px; margin: 0 0 36px; }
+  h1 { font-size: 26px; letter-spacing: -0.01em; margin: 0 0 6px; }
+  .subtitle { color: var(--ink-2); font-size: 16px; margin: 0 0 40px; }
+  section { margin: 0 0 40px; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); margin: 0 0 14px; font-weight: 600; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
+  .card + .card { margin-top: 10px; }
+  p { margin: 0 0 12px; }
+  p:last-child { margin-bottom: 0; }
+  ul { margin: 0; padding-left: 20px; }
+  li { margin: 0 0 8px; }
+  li:last-child { margin-bottom: 0; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  .row .label { font-weight: 500; }
+  .row .meta { color: var(--ink-3); font-size: 13px; white-space: nowrap; }
+  .muted { color: var(--ink-2); font-size: 14px; }
+  .small { color: var(--ink-3); font-size: 13px; }
+  .badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 100px; }
+  .badge.connected { background: color-mix(in srgb, var(--signal) 16%, transparent); color: var(--signal); }
+  .badge.partial { background: var(--sunken); color: var(--ink-2); }
+  .badge.skipped { background: var(--sunken); color: var(--ink-3); }
+  .badge.blocked { background: var(--sunken); color: var(--ink-3); }
+  .badge.unused { background: var(--sunken); color: var(--ink-3); }
+  .diagram { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 18px; flex-wrap: wrap; }
+  .diagram .box { flex: 1 1 0; min-width: 120px; text-align: center; background: var(--sunken); border: 1px solid var(--line); border-radius: 12px; padding: 14px 10px; font-size: 13px; }
+  .diagram .arrow { color: var(--ink-3); font-size: 18px; padding: 0 2px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; background: var(--sunken); border-radius: 5px; padding: 1px 6px; }
+  a { color: var(--signal); }
+  hr { border: none; border-top: 1px solid var(--line); margin: 40px 0; }
+  footer.bottom { color: var(--ink-3); font-size: 13px; }
+  @media (max-width: 480px) {
+    .wrap { padding: 28px 16px 60px; }
+    .row { flex-direction: column; align-items: flex-start; gap: 2px; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <svg width="34" height="34" viewBox="0 0 512 512" role="img" aria-label="Confidant">
+        <rect width="512" height="512" rx="116" fill="#16181d"/>
+        <g transform="translate(64 64) scale(16)">
+          <path d="M18.39 6.25A8.6 8.6 0 1 0 18.39 17.75" fill="none" stroke="#f9fafb" stroke-width="2.4" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="2.5" fill="#e4512c"/>
+        </g>
+      </svg>
+      <span class="name">Confidant</span>
+    </header>
+    <p class="tagline">{{tagline}}</p>
+    <h1>{{title}}</h1>
+    <p class="subtitle">{{subtitle}}</p>
+{{body}}
+    <hr>
+    <footer class="bottom">
+      <p>{{supportLine}}</p>
+    </footer>
+  </div>
+</body>
+</html>
