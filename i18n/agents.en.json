@@ -6,6 +6,9 @@
     "meeting_prep": "Meeting Prep",
     "follow_up_radar": "Follow-Up Radar",
     "weekly_review": "Weekly CEO Review",
+    "health_check": "Health Check",
+    "brain_cleanup": "Brain Cleanup",
+    "check_in": "Confidant Check-in",
     "finish_sorting": "Finish Sorting"
   },
   "headings": {
@@ -14,7 +17,8 @@
       "commitments": "Commitments due",
       "meetings": "Today's meetings",
       "stalled": "Stalled projects",
-      "opportunities": "Opportunities"
+      "opportunities": "Opportunities",
+      "keepWarm": "Keep warm"
     },
     "follow_up_radar": {
       "i_owe": "I owe",
@@ -61,6 +65,40 @@
   },
   "empty": "Nothing to report.",
   "briefs": {
-    "weeklyFileName": "Weekly {date}"
+    "weeklyFileName": "Weekly {date}",
+    "cleanupFileName": "Cleanup {date}"
+  },
+  "health": {
+    "healthy": "Everything looks healthy.",
+    "neverUpdated": "The Brain Update has never run successfully.",
+    "fixNeverUpdated": "Run `confidant update` once by hand to see what happens, or check that the Commitment Tracker + Brain Update scheduled task is still active.",
+    "staleUpdate": "The last successful update was {hours} hours ago.",
+    "fixStaleUpdate": "Run `confidant update` by hand, or check that the Commitment Tracker + Brain Update scheduled task is still active and has not been paused.",
+    "sourceBroken": "{source} is not readable right now.",
+    "fixFullDiskAccess": "Grant Full Disk Access to the ChatGPT app in System Settings > Privacy & Security, then run `confidant extract` again.",
+    "fixKey": "The {source} key looks invalid or missing. Run `confidant keys set {source}` with a fresh key.",
+    "fixSourceGeneric": "Run `confidant extract --source {source} --probe` to see the exact error.",
+    "backlogStuck": "The sorting backlog has not moved in {days} days.",
+    "fixBacklogStuck": "Run `confidant update` by hand and read what it prints; the backlog only grows if merging keeps failing.",
+    "lowDisk": "This Mac is low on disk space.",
+    "fixLowDisk": "Free up space on this Mac. Confidant needs room for the vault database to keep growing.",
+    "notWritable": "The vault folder cannot be written to right now.",
+    "fixNotWritable": "Check that the vault folder still exists at its original path and has not had its permissions changed.",
+    "taskInactive": "The {task} scheduled task is not active.",
+    "fixTaskInactive": "Recreate the {task} task, or check Automations in the ChatGPT app to see whether it was paused or removed."
+  },
+  "checkIn": {
+    "questions": [
+      "What could Confidant do for you that it isn't doing yet?",
+      "What's the one thing you wish your brief told you that it doesn't?",
+      "Is there a habit Confidant has that's more annoying than useful?",
+      "What would make you trust Confidant with more of your history?"
+    ],
+    "monthlyReceipt": {
+      "commitmentsTracked": "promises tracked",
+      "meetingsPrepped": "meetings prepped",
+      "opportunitiesFlagged": "opportunities flagged",
+      "followUpsCaught": "follow-ups caught"
+    }
   }
 }

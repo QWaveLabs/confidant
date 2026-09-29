@@ -1,6 +1,6 @@
 ---
 name: confidant-agents
-description: How a scheduled Confidant task should behave inside a person's Second Brain vault: what each of the six agents writes, where it writes it, the heading format for each brief, and the heartbeat rule every run ends with. Load this before running any task in prompts/tasks/.
+description: How a scheduled Confidant task should behave inside a person's Second Brain vault: what each agent writes, where it writes it, the heading format for each brief, the heartbeat rule every run ends with, and how to handle a person's reply in a Health Check, Brain Cleanup or Check-in thread. Load this before running any task in prompts/tasks/.
 ---
 
 # Confidant's scheduled agents
@@ -10,19 +10,23 @@ person's vault. You read context with
 `.confidant/engine/bin/confidant digest <key>`, you write into `Briefs/`
 (`Resúmenes/` in a Spanish vault) or into a note's own managed section, and
 you end with a heartbeat line. The task's own prompt (in `prompts/tasks/`)
-gives the exact steps; this file gives the shape they all share and the
-brief formats, so a person's brief looks the same from one day to the next.
+gives the exact steps; this file gives the shape they all share, the brief
+formats, and how to handle a reply in a thread, so a person's experience is
+the same from one day to the next.
 
-## The six agents, plus one temporary one
+## The nine agents, plus one temporary one
 
 | Key | Name (EN / ES) | Runs |
 |---|---|---|
-| `brain_update` | Commitment Tracker + Brain Update / Registro de compromisos y actualización del cerebro | every 3 hours, every day |
+| `brain_update` | Commitment Tracker + Brain Update / Registro de compromisos y actualización del cerebro | every 3 hours, every day, at :10 |
 | `opportunity_scanner` | Opportunity Scanner / Detector de oportunidades | weekdays, 15 minutes before the brief |
 | `morning_brief` | Morning Chief of Staff / Mano derecha matutina | weekdays, at the person's brief time |
 | `meeting_prep` | Meeting Prep / Preparación de reuniones | weekdays, scaled to how many meetings a week |
 | `follow_up_radar` | Follow-Up Radar / Radar de seguimiento | weekdays, 4:00 PM |
-| `weekly_review` | Weekly CEO Review / Revisión semanal de dirección | Fridays, mid-afternoon |
+| `weekly_review` | Weekly CEO Review / Revisión semanal de dirección | Fridays, 3:00 PM |
+| `health_check` | Health Check / Revisión de estado | daily, 8:20 AM, silent unless something is broken |
+| `brain_cleanup` | Brain Cleanup / Limpieza del cerebro | Sundays, 8:40 PM |
+| `check_in` | Confidant Check-in / Seguimiento de Confidant | Thursdays, 11:40 AM, at most once a week, often silent |
 | `finish_sorting` | Finish Sorting / Finalizar clasificación | temporary, only while the install's own history backlog is still sorting |
 
 ## Never, on any run
@@ -43,6 +47,8 @@ brief formats, so a person's brief looks the same from one day to the next.
   own `## Heading` section. Do not overwrite a section another agent wrote
   earlier the same day; append or extend it.
 - `weekly_review` writes its own file for the week rather than a section.
+- `brain_cleanup` writes its own file, `Briefs/Cleanup YYYY-MM-DD.md`
+  (`Resúmenes/Limpieza YYYY-MM-DD.md` in Spanish).
 - `meeting_prep` writes inside the meeting's own note, in a
   `<!-- confidant:start meeting_prep --> ... <!-- confidant:end meeting_prep -->`
   managed section, when that note already exists; otherwise as its own
@@ -64,6 +70,15 @@ projects / Opportunities.
 
 Name the first meeting of the day explicitly, with who it is with and what
 it is about.
+
+On Mondays, add a sixth section:
+
+**EN**: Keep warm.
+**ES**: Mantener el contacto.
+
+One line per person, each with a short, specific, warm suggested opener as
+plain text, using their note's last topic when there is one. This is a
+draft the person can send themselves; never send it for them.
 
 ### Follow-Up Radar (`follow_up_radar`)
 
@@ -112,6 +127,56 @@ conversations. That is working material for you, not an eleventh section:
 use it to infer team blockers, recurring problems and biggest developments,
 the three headings above with no note type behind them, then write only the
 ten sections in the file.
+
+### Health Check (`health_check`)
+
+No brief section: silence when `confidant health` reports everything is
+fine. When it reports a problem, notify with the plain fix `health` already
+gave you, and end with the support offer described in the task's own
+prompt. See "Replying in a thread" below for what happens next.
+
+### Brain Cleanup (`brain_cleanup`)
+
+Two short lists in `Briefs/Cleanup <today>.md`: what was fixed, and what
+still needs a decision. A notification only goes out for the second list,
+each item phrased as a short, specific question.
+
+### Confidant Check-in (`check_in`)
+
+One message, at most once a week, in whichever of four shapes
+`usage --json --check-in` decided this run: a first-impressions question, a
+monthly value receipt plus a question, a low-usage nudge anchored to one
+real fact from the person's own data, or a rotating improvement question.
+Never a brief section; this always lives only in the thread.
+
+## Replying in a thread
+
+Health Check, Brain Cleanup and Confidant Check-in can each start a short
+back-and-forth. The same rules govern all three:
+
+- Thank the person for replying before anything else.
+- Never send, forward or share anything on your own judgment. Always show
+  what would go out, and ask a direct yes-or-no question before sending it.
+- **Health Check**, on "send to support" or similar: preview with
+  `.confidant/engine/bin/confidant support --kind support --message-file
+  <path> --include-diagnostics` (write the person's own words, unedited, to
+  that file first), show the person exactly what the preview contains, and
+  only on their clear yes run it again with `--send --yes`. Diagnostics
+  never include message content, contacts, file names from sources, or
+  keys; if you are not sure a detail is safe, leave it out and say so.
+- **Brain Cleanup**, on an answer to a review-queue question: record it
+  with `.confidant/engine/bin/confidant review --resolve <id> --answer
+  <text>`. This is a private answer for the sorter, never sent anywhere.
+- **Confidant Check-in**, on any reply: thank them, then ask "Can I share
+  this with the Confidant team?" in {language}. Only on a clear yes, write
+  their reply, exactly as they wrote it, to a file and preview it with
+  `.confidant/engine/bin/confidant support --kind feedback --message-file
+  <path>`, show the preview, and only then run it again with `--send
+  --yes`. A vague or unclear answer is not a yes; ask once, plainly, and
+  otherwise let it go.
+- If `confidant support` reports the network failed, it prints a `mailto:`
+  link with the same text prepared; give the person that link instead of
+  trying again.
 
 ## The heartbeat
 

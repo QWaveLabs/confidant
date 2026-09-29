@@ -36,6 +36,9 @@ test('the default 06:45 brief, no meetings, produces the documented schedule', (
   assert.equal(byKey.meeting_prep.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7,12;BYMINUTE=30');
   assert.equal(byKey.follow_up_radar.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=0');
   assert.equal(byKey.weekly_review.rrule, 'FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0');
+  assert.equal(byKey.health_check.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=8;BYMINUTE=20');
+  assert.equal(byKey.brain_cleanup.rrule, 'FREQ=WEEKLY;BYDAY=SU;BYHOUR=20;BYMINUTE=40');
+  assert.equal(byKey.check_in.rrule, 'FREQ=WEEKLY;BYDAY=TH;BYHOUR=11;BYMINUTE=40');
 });
 
 test('a brief time that lands opportunity_scanner on brain_update\'s own :10 minute gets nudged, not brain_update', () => {
@@ -47,6 +50,15 @@ test('a brief time that lands opportunity_scanner on brain_update\'s own :10 min
   assert.equal(byKey.morning_brief.rrule, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=25');
   assert.notEqual(byKey.opportunity_scanner.minute, 10);
   assertNoCollisions(schedule);
+});
+
+test('health_check, brain_cleanup and check_in never collide with the six core tasks, at any meeting volume or brief time', () => {
+  const briefTimes = ['06:45', '08:20', '11:40', '20:40'];
+  for (const briefTime of briefTimes) {
+    for (const meetingsPerWeek of [0, 10, 40]) {
+      assertNoCollisions(buildSchedule({ briefTime, meetingsPerWeek }, { includeFinish: true }));
+    }
+  }
 });
 
 test('meeting_prep scales with meetingsPerWeek', () => {
@@ -82,7 +94,7 @@ test('buildTaskSpec produces schema-valid tasks with real prompt text, in the va
   const config = { language: 'en', role: 'founder', briefTime: '06:45', timezone: 'America/New_York', meetingsPerWeek: 3 };
   const spec = buildTaskSpec(config, { vault: '/tmp/some-vault' });
   assert.deepEqual(check('task', spec), []);
-  assert.equal(spec.length, 6); // finish_sorting only appears with includeFinish
+  assert.equal(spec.length, 9); // finish_sorting only appears with includeFinish
   for (const task of spec) {
     assert.equal(task.cwd, '/tmp/some-vault');
     assert.ok(task.prompt.length >= 40);

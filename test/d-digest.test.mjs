@@ -180,3 +180,42 @@ test('Spanish vault digests use Spanish headings', () => {
   assert.match(text, /## Me deben/);
   assert.match(text, /## Delegué/);
 });
+
+test('morning_brief adds a Keep warm section on Mondays only, for inner or active people gone quiet 21+ days', () => {
+  const monday = new Date('2026-09-28T14:00:00.000Z'); // Monday, America/New_York
+  const vault = mkdtempSync(join(tmpdir(), 'cf-digest-warm-'));
+  const paths = statePaths(vault);
+  mkdirSync(paths.root, { recursive: true });
+  writeJson(paths.config, { version: 1, vault, language: 'en', role: 'founder', briefTime: '06:45', timezone: 'America/New_York', sources: {} });
+  writeJson(paths.state, { phase: 'done', history: [], tasks: [], backlog: { remaining_batches: 0, oldest_sorted: null, done: false } });
+  writeJson(join(paths.root, 'identity.json'), {
+    owner: { person_id: 'me', name: 'Rob', handles: [] },
+    people: [
+      // Talked to 5 days ago: not stale, must not appear.
+      { id: 'p1', name: 'Mike Brennan', kind: 'customer', handles: [], sources: ['imessage'], tier: 'active', last_seen: '2026-09-23T00:00:00.000Z', note_path: null },
+      // Silent 40+ days, inner tier, has a note with a timeline: must appear, with its last topic.
+      { id: 'p2', name: 'Priya Raman', kind: 'investor', handles: [], sources: ['email'], tier: 'inner', last_seen: '2026-08-15T00:00:00.000Z', note_path: 'People/Priya Raman.md' },
+      // Silent just as long, but cold tier: must not appear.
+      { id: 'p3', name: 'John Okafor', kind: 'vendor', handles: [], sources: ['email'], tier: 'cold', last_seen: '2026-08-10T00:00:00.000Z', note_path: null },
+    ],
+    groups: [],
+    generated_at: monday.toISOString(),
+  });
+  mkdirSync(join(vault, 'People'), { recursive: true });
+  writeFileSync(join(vault, 'People', 'Priya Raman.md'), '---\ntype: person\nconfidant_id: p2\nupdated: 2026-08-15\ntags: []\nsources: 1\nname: Priya Raman\nkind: investor\ntier: inner\n---\n# Priya Raman\n\n## Timeline\n- 2026-08-15, Asked about the implementation timeline. _(Zoom)_\n');
+
+  const ctx = createContext({ vault, now: monday, json: false });
+  const mondayText = buildDigest(ctx, 'morning_brief');
+  assert.match(mondayText, /## Keep warm/);
+  assert.match(mondayText, /\[\[Priya Raman\]\]/);
+  assert.match(mondayText, /Asked about the implementation timeline/);
+  assert.ok(!mondayText.includes('Mike Brennan'), 'a person contacted recently must not appear');
+  assert.ok(!mondayText.includes('John Okafor'), 'a cold-tier person must not appear');
+  ctx.close();
+
+  const friday = new Date('2026-09-25T14:00:00.000Z');
+  const ctx2 = createContext({ vault, now: friday, json: false });
+  const fridayText = buildDigest(ctx2, 'morning_brief');
+  ctx2.close();
+  assert.ok(!fridayText.includes('Keep warm'), 'Keep warm only appears on Mondays');
+});

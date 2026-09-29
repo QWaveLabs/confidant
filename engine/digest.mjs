@@ -67,7 +67,9 @@ function firstLine(body, fallback) {
 
 // ---- morning_brief -------------------------------------------------------
 
-function peopleWaitingOnYou(ctx, identity, hours = 20) {
+// Exported for usage.mjs, which reuses it as the low-usage check-in's
+// "someone is waiting on you" hook.
+export function peopleWaitingOnYou(ctx, identity, hours = 20) {
   const cutoff = ctx.now.getTime() - hours * 3600 * 1000;
   return latestPerThread(ctx)
     .filter((r) => !r.is_from_me && r.from?.handle && new Date(r.ts).getTime() <= cutoff)
@@ -114,13 +116,46 @@ function morningBrief(ctx, identity, strings) {
   // something, already wrote this section into today's brief.
   const scanned = readBriefSection(ctx.vault, ctx.lang, today, strings('headings.opportunity_scanner.open'));
 
-  return [
+  const sections = [
     section(h.waiting, list(waiting)),
     section(h.commitments, list(due)),
     section(h.meetings, list(meetingLines)),
     section(h.stalled, list(stalled)),
     section(h.opportunities, list([...opps, ...(scanned ? [scanned] : [])])),
-  ].join('\n');
+  ];
+  // Mondays only: inner or active people the person has not actually
+  // talked to in 3 weeks, oldest first, with whatever their note's own
+  // timeline last said. The prompt drafts an opener; this only surfaces
+  // who and why.
+  if (localWeekday(ctx.now, ctx.tz) === 'Mon') {
+    const warm = keepWarm(ctx, identity).map(({ name, days, topic }) => `- ${personLine(name, identity)}: ${days}d${topic ? `, last topic: ${topic}` : ''}`);
+    sections.push(section(h.keepWarm, list(warm)));
+  }
+  return sections.join('\n');
+}
+
+const localWeekday = (date, tz) => new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(date);
+
+// Inner and active tier people with no contact in 21+ days: a note's own
+// timeline gives the "last topic" when a note already exists for them.
+function keepWarm(ctx, identity, days = 21) {
+  const cutoff = ctx.now.getTime() - days * DAY_MS;
+  return identity.people
+    .filter((p) => (p.tier === 'inner' || p.tier === 'active') && p.last_seen && new Date(p.last_seen).getTime() < cutoff)
+    .sort((a, b) => new Date(a.last_seen) - new Date(b.last_seen))
+    .slice(0, 8)
+    .map((p) => {
+      let topic = '';
+      if (p.note_path) {
+        const file = join(ctx.vault, p.note_path);
+        if (existsSync(file)) {
+          try {
+            topic = timelineBullets(parseNote(readFileSync(file, 'utf8')).body, 1)[0]?.text ?? '';
+          } catch { /* note not readable yet; skip its topic, not the whole run */ }
+        }
+      }
+      return { name: p.name, days: Math.floor((ctx.now.getTime() - new Date(p.last_seen).getTime()) / DAY_MS), topic };
+    });
 }
 
 // ---- follow_up_radar -------------------------------------------------------

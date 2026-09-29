@@ -82,6 +82,9 @@ function rawSlots(config, { includeFinish = false } = {}) {
     { key: 'meeting_prep', notify: 'heartbeat', days: WEEKDAYS, hours: meetingHours, minute: 30, fallback: 'split' },
     { key: 'follow_up_radar', notify: 'heartbeat', days: WEEKDAYS, hours: [16], minute: 0 },
     { key: 'weekly_review', notify: 'heartbeat', days: ['FR'], hours: [15], minute: 0 },
+    { key: 'health_check', notify: 'heartbeat', days: ALL_DAYS, hours: [8], minute: 20 },
+    { key: 'brain_cleanup', notify: 'heartbeat', days: ['SU'], hours: [20], minute: 40 },
+    { key: 'check_in', notify: 'heartbeat', days: ['TH'], hours: [11], minute: 40 },
     // Derived from the brief time, so it is the one most free to move.
     { key: 'opportunity_scanner', notify: 'heartbeat', days: WEEKDAYS, hours: [scan.hour], minute: scan.minute },
   ];

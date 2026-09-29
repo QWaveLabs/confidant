@@ -13,6 +13,13 @@ person's Second Brain vault.
    Link every person, company and project you mention with a wikilink.
 3. If a meeting prep already exists for the first meeting today, point to it
    instead of repeating it.
+4. On Mondays only, the digest also gives you a "keep warm" list: people you
+   are genuinely close to who you have not actually talked to in three
+   weeks or more, with whatever their note's own timeline last said. Add a
+   short section for it, and for each person write one warm, specific
+   suggested opener as plain text, using their last topic when there is
+   one. This is a draft for the person to send themselves, never something
+   you send.
 
 Write in {language}.
 
