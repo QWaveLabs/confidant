@@ -44,13 +44,13 @@ test('sandbox toml has the verified keys and toggles network_access', () => {
 
 test('trust append is idempotent and never touches unrelated content', () => {
   const original = '# my other stuff\n[mcp_servers.docs]\ncommand = "docs-server"\n';
-  const first = appendTrustedProject(original, '/Users/rob/Second Brain');
+  const first = appendTrustedProject(original, '/Users/alex/Second Brain');
   assert.ok(first.changed);
   assert.ok(first.text.startsWith(original), 'existing content is preserved verbatim at the start');
-  assert.ok(hasTrustedProject(first.text, '/Users/rob/Second Brain'));
-  assert.ok(!hasTrustedProject(first.text, '/Users/rob/Other Vault'), 'a different path is not considered trusted');
+  assert.ok(hasTrustedProject(first.text, '/Users/alex/Second Brain'));
+  assert.ok(!hasTrustedProject(first.text, '/Users/alex/Other Vault'), 'a different path is not considered trusted');
 
-  const second = appendTrustedProject(first.text, '/Users/rob/Second Brain');
+  const second = appendTrustedProject(first.text, '/Users/alex/Second Brain');
   assert.equal(second.changed, false);
   assert.equal(second.text, first.text, 'a second call makes no further changes');
 });

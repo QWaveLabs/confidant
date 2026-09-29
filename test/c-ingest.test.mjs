@@ -43,13 +43,13 @@ test('gmail: maps a raw Gmail API message resource (base64url body, headers)', a
       headers: [
         { name: 'Subject', value: 'Re: Tuesday' },
         { name: 'From', value: 'Ana Ruiz <ana@acme.com>' },
-        { name: 'To', value: 'rob@qwavelabs.io' },
+        { name: 'To', value: 'owner@example.com' },
       ],
       mimeType: 'text/plain',
       body: { data: bodyText },
     },
   };
-  const ctx = fakeCtx({ config: { owner: { emails: ['rob@qwavelabs.io'] } } });
+  const ctx = fakeCtx({ config: { owner: { emails: ['owner@example.com'] } } });
   const path = tempFile(JSON.stringify([message]));
   const { code, out } = await run1(ctx, { source: 'gmail', file: path });
   assert.equal(code, 0);
@@ -64,8 +64,8 @@ test('gmail: maps a raw Gmail API message resource (base64url body, headers)', a
 });
 
 test('gmail: maps a flattened search/read tool shape', async () => {
-  const item = { id: 'msg2', thread_id: 'th2', subject: 'Invoice', from: 'rob@qwavelabs.io', to: 'client@example.com', date: '2026-09-01T10:00:00Z', body: 'Attached is the invoice.' };
-  const ctx = fakeCtx({ config: { owner: { emails: ['rob@qwavelabs.io'] } } });
+  const item = { id: 'msg2', thread_id: 'th2', subject: 'Invoice', from: 'owner@example.com', to: 'client@example.com', date: '2026-09-01T10:00:00Z', body: 'Attached is the invoice.' };
+  const ctx = fakeCtx({ config: { owner: { emails: ['owner@example.com'] } } });
   const path = tempFile(JSON.stringify({ messages: [item] })); // wrapper shape
   const { out } = await run1(ctx, { source: 'gmail', file: path });
   assert.equal(out.inserted, 1);
@@ -84,11 +84,11 @@ test('gcal: maps a raw Calendar event resource', async () => {
     hangoutLink: 'https://meet.google.com/abc',
     start: { dateTime: '2026-09-05T15:00:00Z' },
     end: { dateTime: '2026-09-05T15:30:00Z' },
-    organizer: { email: 'rob@qwavelabs.io', displayName: 'Rob' },
+    organizer: { email: 'owner@example.com', displayName: 'Alex' },
     attendees: [{ email: 'client@example.com', displayName: 'Client' }],
     status: 'confirmed',
   };
-  const ctx = fakeCtx({ config: { owner: { emails: ['rob@qwavelabs.io'] } } });
+  const ctx = fakeCtx({ config: { owner: { emails: ['owner@example.com'] } } });
   const path = tempFile(JSON.stringify([event]));
   const { out } = await run1(ctx, { source: 'gcal', file: path });
   assert.equal(out.inserted, 1);
@@ -107,10 +107,10 @@ test('drive: maps a Drive file plus exported text, including a Meet notes doc', 
     mimeType: 'application/vnd.google-apps.document',
     modifiedTime: '2026-09-06T12:00:00Z',
     webViewLink: 'https://docs.google.com/document/d/file1',
-    owners: [{ emailAddress: 'rob@qwavelabs.io', displayName: 'Rob' }],
+    owners: [{ emailAddress: 'owner@example.com', displayName: 'Alex' }],
     text: 'Notes: we agreed on scope.',
   };
-  const ctx = fakeCtx({ config: { owner: { emails: ['rob@qwavelabs.io'] } } });
+  const ctx = fakeCtx({ config: { owner: { emails: ['owner@example.com'] } } });
   const path = tempFile(JSON.stringify([file]));
   const { out } = await run1(ctx, { source: 'drive', file: path });
   assert.equal(out.inserted, 1);
@@ -202,7 +202,7 @@ test('privacy.filterRecord is honored when engine/privacy.mjs exists', async () 
   const alreadyExists = existsSync(privacyPath);
   if (!alreadyExists) write(privacyPath, "export function filterRecord(record) { return { keep: !/exclude/i.test(record.title ?? '') }; }\n");
   try {
-    const item = { id: 'msg3', subject: 'please exclude me', from: 'rob@qwavelabs.io', body: 'x' };
+    const item = { id: 'msg3', subject: 'please exclude me', from: 'owner@example.com', body: 'x' };
     const ctx = fakeCtx({});
     const path = tempFile(JSON.stringify([item]));
     const { out } = await run1(ctx, { source: 'gmail', file: path });
