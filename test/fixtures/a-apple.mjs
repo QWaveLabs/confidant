@@ -2,7 +2,7 @@
 // and column names (subsets). All data is invented.
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { createDb, insert, appleSeconds, appleNanos } from './a-fixtures.mjs';
+import { createDb, insert, writeFile, appleSeconds, appleNanos } from './a-fixtures.mjs';
 import { encodeField, encodeMessage } from '../../engine/lib/a-protobuf.mjs';
 
 // ---------- AddressBook ----------
@@ -145,4 +145,153 @@ export function addWa(db, { chat, text = null, at, fromMe = false, type = 0, mem
   });
   if (caption !== undefined || duration !== undefined) insert(db, 'ZWAMEDIAITEM', { Z_PK: pk, Z_ENT: 10, ZMESSAGE: pk, ZTITLE: caption ?? null, ZMOVIEDURATION: duration ?? null });
   return pk;
+}
+
+// ---------- Apple Mail (Envelope Index + .emlx) ----------
+export const MAIL_WORK = 'AAAAAAAA-1111-4111-8111-111111111111';
+export const MAIL_HOME = 'BBBBBBBB-2222-4222-8222-222222222222';
+export const MAIL_STORE = 'CCCCCCCC-3333-4333-8333-333333333333';
+const unixSeconds = (iso) => Math.floor(new Date(iso).getTime() / 1000);
+const mailShard = (rowid) => String(Math.floor(rowid / 1000)).split('').reverse().join('/');
+
+// "<byte count>\n" + the RFC 822 message (CRLF) + Apple's plist trailer.
+export function emlx(message) {
+  const body = Buffer.from(message.replace(/\r?\n/g, '\r\n'));
+  return Buffer.concat([Buffer.from(`${body.length}\n`), body, Buffer.from('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>flags</key><integer>8590195713</integer></dict></plist>\n')]);
+}
+
+// A Mail store under <home>/Library/Mail/V10.
+//   mailboxes  [{ id, account (UUID), path ('INBOX', '[Gmail]/Sent Mail') }]
+//   addresses  { key: [address, display name] }; add() also takes raw addresses or { address, name }
+//   accounts   Accounts4 rows: [{ uuid, address, viaParent }] (viaParent puts the address on a parent account)
+// add({ rowid, box, from, subject, prefix, at, to, cc, conv, file, partial, mid, listId, labels, summary, deleted, messageId })
+//   box is a mailbox id; file is the raw message text (written as .emlx in Mail's shard folder).
+export function mailStore(home, { mailboxes = [{ id: 1, account: MAIL_WORK, path: 'INBOX' }, { id: 2, account: MAIL_WORK, path: 'Sent Messages' }], addresses = {}, accounts = [] } = {}) {
+  const root = join(home, 'Library/Mail/V10');
+  const db = createDb(
+    join(root, 'MailData/Envelope Index'),
+    `CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url UNIQUE, total_count INTEGER DEFAULT 0, unread_count INTEGER DEFAULT 0, source INTEGER);
+     CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject COLLATE RTRIM);
+     CREATE TABLE summaries (ROWID INTEGER PRIMARY KEY, summary TEXT);
+     CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address COLLATE NOCASE, comment);
+     CREATE TABLE message_global_data (ROWID INTEGER PRIMARY KEY, message_id INTEGER, model_category INTEGER, message_id_header TEXT);
+     CREATE TABLE messages (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL DEFAULT 0, global_message_id INTEGER, remote_id INTEGER,
+       document_id TEXT, sender INTEGER, subject_prefix TEXT, subject INTEGER NOT NULL, summary INTEGER, date_sent INTEGER, date_received INTEGER,
+       mailbox INTEGER NOT NULL, remote_mailbox INTEGER, flags INTEGER NOT NULL DEFAULT 0, read INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0,
+       deleted INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, conversation_id INTEGER NOT NULL DEFAULT 0, list_id_hash INTEGER, unsubscribe_type INTEGER);
+     CREATE TABLE recipients (ROWID INTEGER PRIMARY KEY, message INTEGER NOT NULL, address INTEGER NOT NULL, type INTEGER, position INTEGER);
+     CREATE TABLE labels (message_id INTEGER NOT NULL, mailbox_id INTEGER NOT NULL, PRIMARY KEY (message_id, mailbox_id));`,
+  );
+  const boxes = new Map();
+  for (const b of mailboxes) {
+    insert(db, 'mailboxes', { ROWID: b.id, url: `imap://${b.account}/${b.path.split('/').map(encodeURIComponent).join('/')}` });
+    boxes.set(b.id, b);
+  }
+  const ids = new Map();
+  let nextAddress = 1;
+  const addAddress = (address, name = null) => {
+    const key = String(address).toLowerCase();
+    if (!ids.has(key)) {
+      insert(db, 'addresses', { ROWID: nextAddress, address, comment: name ?? '' });
+      ids.set(key, nextAddress++);
+    }
+    return ids.get(key);
+  };
+  for (const [key, [address, name]] of Object.entries(addresses)) ids.set(`key:${key}`, addAddress(address, name));
+  const addressId = (who) => {
+    if (who && typeof who === 'object') return addAddress(who.address, who.name);
+    return ids.get(`key:${who}`) ?? addAddress(who);
+  };
+  if (accounts.length) {
+    const adb = createDb(join(home, 'Library/Accounts/Accounts4.sqlite'), 'CREATE TABLE ZACCOUNT (Z_PK INTEGER PRIMARY KEY, ZIDENTIFIER VARCHAR, ZUSERNAME VARCHAR, ZPARENTACCOUNT INTEGER, ZACCOUNTDESCRIPTION VARCHAR);');
+    let pk = 1;
+    for (const a of accounts) {
+      if (a.viaParent) {
+        insert(adb, 'ZACCOUNT', { Z_PK: pk, ZIDENTIFIER: `PARENT-${pk}`, ZUSERNAME: a.address, ZACCOUNTDESCRIPTION: 'Parent' });
+        insert(adb, 'ZACCOUNT', { Z_PK: pk + 1, ZIDENTIFIER: a.uuid, ZUSERNAME: null, ZPARENTACCOUNT: pk });
+        pk += 2;
+      } else insert(adb, 'ZACCOUNT', { Z_PK: pk++, ZIDENTIFIER: a.uuid, ZUSERNAME: a.address });
+    }
+  }
+  let subjects = 0;
+  const add = ({ rowid, box = 1, from, subject, prefix = null, at, to = [], cc = [], conv = 0, deleted = 0, summary = null, file, partial = false, mid, listId = null, labels = [], messageId }) => {
+    insert(db, 'subjects', { ROWID: ++subjects, subject });
+    if (summary) insert(db, 'summaries', { ROWID: subjects, summary });
+    if (mid) insert(db, 'message_global_data', { ROWID: rowid, message_id: rowid * 7, message_id_header: mid });
+    insert(db, 'messages', {
+      ROWID: rowid, message_id: messageId ?? 9007199254740993n + BigInt(rowid), global_message_id: mid ? rowid : null, sender: addressId(from), subject_prefix: prefix,
+      subject: subjects, summary: summary ? subjects : null, date_sent: unixSeconds(at), date_received: unixSeconds(at) + 5, mailbox: box, deleted, conversation_id: conv, list_id_hash: listId,
+    });
+    to.forEach((a, i) => insert(db, 'recipients', { message: rowid, address: addressId(a), type: 0, position: i }));
+    cc.forEach((a, i) => insert(db, 'recipients', { message: rowid, address: addressId(a), type: 1, position: i }));
+    for (const l of labels) insert(db, 'labels', { message_id: rowid, mailbox_id: l });
+    if (!file) return null;
+    const b = boxes.get(box);
+    const path = join(root, b.account, ...b.path.split('/').map((s) => `${s}.mbox`), MAIL_STORE, 'Data', mailShard(rowid), 'Messages', `${rowid}${partial ? '.partial' : ''}.emlx`);
+    return writeFile(path, emlx(file));
+  };
+  return { db, root, add };
+}
+
+// ---------- Calendar.sqlitedb ----------
+// calendarStore(home, { stores, calendars }) -> { db, item(row), addEvent(event) }
+//   item(row)      raw CalendarItem insert (event defaults filled in)
+//   addEvent({ rowid, title, start, end, allDay, uuid, uid, calendar, location (text or { title, address }), description, conferenceUrl, status,
+//              organizer: { email, name } | 'self', attendees: [{ email, name, status, self }], occurrences: [iso start] })
+//   start/end are ISO times, or YYYY-MM-DD with allDay. Returns the CalendarItem ROWID.
+export function calendarStore(home, { stores = [{ ROWID: 1, name: 'iCloud', type: 1, disabled: 0 }], calendars = [{ ROWID: 1, store_id: 1, title: 'Work' }] } = {}) {
+  const db = createDb(
+    join(home, 'Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb'),
+    `CREATE TABLE Store (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, type INTEGER, disabled INTEGER, external_id TEXT);
+     CREATE TABLE Calendar (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER, title TEXT, flags INTEGER, color TEXT, type TEXT, UUID TEXT);
+     CREATE TABLE CalendarItem (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT, location_id INTEGER, description TEXT, start_date REAL, start_tz TEXT,
+       end_date REAL, end_tz TEXT, all_day INTEGER, calendar_id INTEGER, orig_item_id INTEGER, orig_date REAL, organizer_id INTEGER, self_attendee_id INTEGER,
+       status INTEGER, invitation_status INTEGER, availability INTEGER, url TEXT, last_modified REAL, birthday_id INTEGER, external_id TEXT,
+       unique_identifier TEXT, hidden INTEGER, has_recurrences INTEGER, has_attendees INTEGER, UUID TEXT, entity_type INTEGER, conference_url TEXT,
+       conference_url_detected TEXT);
+     CREATE TABLE Participant (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, entity_type INTEGER, type INTEGER, status INTEGER, pending_status INTEGER, role INTEGER,
+       identity_id INTEGER, owner_id INTEGER, UUID TEXT, email TEXT, phone_number TEXT, is_self INTEGER, comment TEXT);
+     CREATE TABLE Identity (display_name TEXT, address TEXT, first_name TEXT, last_name TEXT);
+     CREATE TABLE Location (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, address TEXT, latitude REAL, longitude REAL, item_owner_id INTEGER);
+     CREATE TABLE OccurrenceCache (day REAL, event_id INTEGER, calendar_id INTEGER, store_id INTEGER, occurrence_date REAL, occurrence_start_date REAL, occurrence_end_date REAL);`,
+  );
+  insert(db, 'Store', stores);
+  insert(db, 'Calendar', calendars);
+  const lastId = () => Number(db.prepare('SELECT last_insert_rowid() AS id').get().id);
+  const item = (row) => {
+    insert(db, 'CalendarItem', { entity_type: 2, hidden: 0, calendar_id: 1, start_tz: 'America/New_York', all_day: 0, last_modified: appleSeconds('2026-08-01T00:00:00Z'), ...row });
+    return row.ROWID ?? lastId();
+  };
+  const participant = (owner, p, extra = {}) => {
+    let identity = null;
+    if (p.name) {
+      insert(db, 'Identity', { display_name: p.name, address: p.email ? `mailto:${p.email}` : null });
+      identity = lastId();
+    }
+    insert(db, 'Participant', { owner_id: owner, identity_id: identity, email: p.email ?? null, status: p.status ?? 2, is_self: p.self ? 1 : 0, ...extra });
+    return lastId();
+  };
+  const when = (value, allDay) => (allDay ? appleSeconds(`${value}T00:00:00Z`) : appleSeconds(value));
+  const addEvent = ({ rowid, title, start, end, allDay = false, uuid, uid, calendar = 1, location, description, conferenceUrl, status, organizer, attendees = [], occurrences = [] }) => {
+    let locationId = null;
+    if (location) {
+      insert(db, 'Location', typeof location === 'string' ? { title: location } : { title: location.title, address: location.address ?? null });
+      locationId = lastId();
+    }
+    const id = item({
+      ...(rowid ? { ROWID: rowid } : {}), summary: title, calendar_id: calendar, start_date: when(start, allDay), end_date: end ? when(end, allDay) : null,
+      all_day: allDay ? 1 : 0, start_tz: allDay ? '_float' : 'America/New_York', location_id: locationId, description: description ?? null,
+      conference_url: conferenceUrl ?? null, status: status ?? null, has_recurrences: occurrences.length ? 1 : 0,
+    });
+    db.prepare('UPDATE CalendarItem SET UUID = ?, unique_identifier = ? WHERE ROWID = ?').run(uuid ?? `EV-${id}`, uid ?? null, id);
+    if (organizer && organizer !== 'self') db.prepare('UPDATE CalendarItem SET organizer_id = ? WHERE ROWID = ?').run(participant(id, organizer, { role: 1 }), id);
+    for (const a of attendees) participant(id, a);
+    const length = end ? when(end, allDay) - when(start, allDay) : 0;
+    for (const o of occurrences) {
+      const s = when(o, allDay);
+      insert(db, 'OccurrenceCache', { event_id: id, calendar_id: calendar, store_id: 1, occurrence_date: s, occurrence_end_date: s + length });
+    }
+    return id;
+  };
+  return { db, item, addEvent };
 }

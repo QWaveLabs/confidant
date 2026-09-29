@@ -9,8 +9,10 @@
 import { existsSync } from 'node:fs';
 import { toHandle, nameHandle } from '../lib/handles.mjs';
 import { fromAppleTime } from '../lib/time.mjs';
+import { canRead } from '../lib/sqlite.mjs';
 import { libraryPath, unreadable, openCopy, columns, pageByKey, ownerParty } from '../lib/a-local.mjs';
 import { contactNames } from '../lib/a-addressbook.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'calls';
 export const dbPath = (ctx) => libraryPath(ctx, 'Application Support', 'CallHistoryDB', 'CallHistory.storedata');
@@ -29,9 +31,9 @@ export function summary(lang, direction, service, seconds) {
   return `${w[direction]} ${kind}${length}`;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'call history');
+  const bad = unreadable(ctx, id, path, 'call history');
   if (bad) return bad;
   const db = openCopy(ctx, path);
   return { ok: true, count: db.prepare('SELECT COUNT(*) AS n FROM ZCALLRECORD').get().n };
@@ -59,7 +61,7 @@ function statements(db) {
 // The call closest to an Apple timestamp, for call recordings. null if none.
 export function callNear(ctx, appleSeconds, windowS = 180) {
   const path = dbPath(ctx);
-  if (!existsSync(path) || unreadable(path, 'call history')) return null;
+  if (!existsSync(path) || !canRead(path).ok) return null;
   try {
     const row = statements(openCopy(ctx, path)).near.get(appleSeconds - windowS, appleSeconds + windowS, appleSeconds);
     if (!row) return null;
@@ -106,7 +108,7 @@ function toRecords(ctx, rows) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const s = statements(openCopy(ctx, path));
@@ -118,3 +120,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
     toRecords: (rows) => toRecords(ctx, rows),
   });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

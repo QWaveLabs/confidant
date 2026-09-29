@@ -1,0 +1,25 @@
+{
+  "reasons": {
+    "needs_full_disk_access": "{source} necesita Acceso total al disco. Actívalo para la app de ChatGPT en Configuración del Sistema, Privacidad y seguridad, y vuelve a intentarlo.",
+    "not_installed": "{source} no está configurado en este Mac, así que no hay nada que leer.",
+    "no_data": "{source} está configurado, pero todavía no hay nada que leer.",
+    "needs_key": "{source} necesita una clave de API. Agrégala cuando quieras y se conectará.",
+    "unreadable": "No se pudo leer {source} en este momento. No se cambió nada y se volverá a intentar en la próxima actualización.",
+    "schema_changed": "{source} cambió de formato tras una actualización de macOS. No se leyó nada y una actualización de Segundo cerebro lo resolverá."
+  },
+  "bySource": {
+    "whatsapp_export": {
+      "no_data": "Todavía no hay chats exportados de WhatsApp. Exporta un chat desde WhatsApp y deja el archivo en la carpeta de exportaciones para sumar historial más antiguo."
+    },
+    "call_recordings": {
+      "no_data": "Todavía no hay grabaciones de llamadas. Las llamadas que grabes en tu iPhone aparecen aquí cuando se sincronizan con Notas."
+    },
+    "zoom_local": {
+      "not_installed": "No hay una carpeta de grabaciones de Zoom en este Mac, así que no hay nada que leer.",
+      "no_data": "La carpeta de Zoom está aquí, pero todavía no tiene grabaciones locales."
+    },
+    "wispr": {
+      "not_installed": "Wispr Flow no está instalado en este Mac, así que no hay nada que leer."
+    }
+  }
+}

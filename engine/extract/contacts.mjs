@@ -6,23 +6,19 @@ import { canRead } from '../lib/sqlite.mjs';
 import { fromAppleTime } from '../lib/time.mjs';
 import { addressBookDbs, readCards } from '../lib/a-addressbook.mjs';
 import { openCopy, readCursor, writeCursor, afterMark, ownerOf, accessError } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'contacts';
 
-export async function probe(ctx) {
-  let dbs;
-  try {
-    dbs = addressBookDbs(ctx);
-  } catch (err) {
-    return { ok: false, reason: 'needs Full Disk Access', needsFullDiskAccess: !!err.needsFullDiskAccess };
-  }
-  if (!dbs.length) return { ok: false, reason: 'Contacts database not found on this Mac' };
+async function runProbe(ctx) {
+  const dbs = addressBookDbs(ctx);
+  if (!dbs.length) return notOk(ctx, id, 'not_installed', 'Contacts database not found on this Mac');
   let count = 0;
   let readable = 0;
   for (const { path } of dbs) {
     const access = canRead(path);
     if (!access.ok) {
-      if (access.needsFullDiskAccess) return { ok: false, reason: 'needs Full Disk Access', needsFullDiskAccess: true };
+      if (access.needsFullDiskAccess) return notOk(ctx, id, 'needs_full_disk_access');
       continue;
     }
     readable++;
@@ -30,7 +26,7 @@ export async function probe(ctx) {
       count += readCards(openCopy(ctx, path)).length;
     } catch {}
   }
-  return readable ? { ok: true, count } : { ok: false, reason: 'Contacts database not readable' };
+  return readable ? { ok: true, count } : notOk(ctx, id, 'unreadable', 'Contacts database not readable');
 }
 
 function toRecord(ctx, card, key, owner) {
@@ -61,7 +57,7 @@ function toRecord(ctx, card, key, owner) {
   };
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const marks = readCursor(cursor)?.marks ?? {};
   const owner = ownerOf(ctx);
   const records = [];
@@ -85,3 +81,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
   }
   return { records, cursor: writeCursor({ marks }), done };
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

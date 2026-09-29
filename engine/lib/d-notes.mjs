@@ -4,6 +4,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { parseNote } from './frontmatter.mjs';
+import { t } from './i18n.mjs';
 
 const SKIP_DIRS = new Set(['.confidant', '.agents', '.obsidian', '.git']);
 
@@ -41,10 +42,19 @@ export function notesOfType(vault, type) {
   return listNotes(vault).filter((n) => n.data.type === type);
 }
 
-// Dated bullets under "## Timeline" in a note's body, newest first, exactly
-// as merge.mjs (B) writes them: "- 2026-09-01, text. _(Source)_".
-export function timelineBullets(body, limit = 5) {
-  const m = /^##\s*Timeline\s*$([\s\S]*?)(?=^##\s|\s*$(?!\s))/m.exec(`${body}\n`);
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Dated bullets under the Timeline section in a note's body, newest first,
+// exactly as merge.mjs (B) writes them: "- 2026-09-01, text. _(Source)_".
+// The heading itself is localized (i18n/notes.*.json's headings.timeline:
+// "Timeline" in English, "Cronología" in Spanish); this reads that heading
+// for `lang` and always also accepts the English spelling, so a note
+// carried over from a language change still parses.
+export function timelineBullets(body, lang = 'en', limit = 5) {
+  const localized = t('notes', lang)('headings.timeline');
+  const headings = [...new Set([localized, 'Timeline'].filter(Boolean))].map(escapeRegExp).join('|');
+  const re = new RegExp(`^##\\s*(?:${headings})\\s*$([\\s\\S]*?)(?=^##\\s|\\s*$(?!\\s))`, 'm');
+  const m = re.exec(`${body}\n`);
   const section = m ? m[1] : body;
   const bullets = [];
   for (const line of section.split('\n')) {

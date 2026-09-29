@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { nameHandle } from '../lib/handles.mjs';
 import { shortHash } from '../lib/hash.mjs';
 import { homeOf, pendingPage, cleanText, clip, zonedToUtc, transcribeFile, listDir } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'zoom_local';
 const MAX_TRANSCRIBE = 3;
@@ -105,11 +106,11 @@ function folders(ctx) {
   return out;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const root = zoomDir(ctx);
-  if (!existsSync(root)) return { ok: false, reason: 'no Zoom recordings folder on this Mac' };
+  if (!existsSync(root)) return notOk(ctx, id, 'not_installed', 'no Zoom recordings folder on this Mac');
   const n = folders(ctx).length;
-  return n ? { ok: true, count: n } : { ok: false, reason: 'no Zoom recordings yet', count: 0 };
+  return n ? { ok: true, count: n } : notOk(ctx, id, 'no_data', 'no Zoom recordings yet', { count: 0 });
 }
 
 async function build(ctx, items) {
@@ -176,7 +177,10 @@ async function build(ctx, items) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   if (!existsSync(zoomDir(ctx))) return { records: [], cursor, done: true };
   return pendingPage(cursor, folders(ctx), { limit, build: (items) => build(ctx, items) });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

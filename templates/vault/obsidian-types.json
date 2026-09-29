@@ -1,0 +1,10 @@
+{
+  "types": {
+    "due": "date",
+    "date": "date",
+    "last_contact": "date",
+    "updated": "date",
+    "first_seen": "date",
+    "last_seen": "date"
+  }
+}

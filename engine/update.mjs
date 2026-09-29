@@ -29,7 +29,7 @@ async function runExtract(ctx) {
     try {
       results.push(await extractSource(ctx, src));
     } catch (err) {
-      results.push({ id: src.id, ok: false, reason: err.message, needsFullDiskAccess: !!err.needsFullDiskAccess });
+      results.push({ id: src.id, ok: false, reason: err.message, reason_code: err.reason_code, message: err.localized, needsFullDiskAccess: !!err.needsFullDiskAccess });
     }
   }
   return results;

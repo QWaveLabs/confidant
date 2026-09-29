@@ -48,6 +48,9 @@ test('init creates the nine folders, config, state and vault contract for a fres
   assert.ok(existsSync(join(vault, '.obsidian', 'app.json')));
   assert.ok(isConfidantVault(vault));
 
+  const types = readJson(join(vault, '.obsidian', 'types.json'));
+  assert.deepEqual(types.types, { due: 'date', date: 'date', last_contact: 'date', updated: 'date', first_seen: 'date', last_seen: 'date' });
+
   const config = readJson(join(vault, '.confidant', 'config.json'));
   assert.equal(config.role, 'founder');
   assert.equal(config.briefTime, '07:15');
