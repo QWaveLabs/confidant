@@ -603,7 +603,7 @@ export async function mergeBatch(ctx, batchId, { contribution } = {}) {
     throw err;
   }
   if (contrib.batch_id !== batchId) throw Object.assign(new Error(`${paths.contribution(batchId)} says batch_id "${contrib.batch_id}", expected "${batchId}".`), { code: 'ESCHEMA' });
-  const scrub = await loadScrub();
+  const scrub = await loadScrub(ctx);
   contrib = cleanContribution(contrib, scrub);
   const release = takeLock(ctx, 'vault');
   try {

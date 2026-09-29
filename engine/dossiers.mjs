@@ -113,7 +113,7 @@ function fitItems(items, budget) {
 
 export async function buildDossiers(ctx, { since, until, changedSince, frontier, write = true, identity } = {}) {
   identity ??= loadIdentity(ctx, { build: true });
-  const scrub = await loadScrub();
+  const scrub = await loadScrub(ctx);
   const db = bTables(ctx.store);
   const { tz, lang } = ctx;
   const tr = t('notes', lang);
@@ -300,7 +300,9 @@ export async function buildDossiers(ctx, { since, until, changedSince, frontier,
       const secs = Number(r.meta?.duration_s ?? r.meta?.duration ?? 0);
       if (!usable(other) || secs < 30 || isCtx) continue;
       const mins = Math.max(1, Math.round(secs / 60));
-      personBucket(other).items.push({ ...base, type: 'call', dir: r.is_from_me ? 'out' : 'in', text: `${oneLine(r.text || r.title || ch)} (${mins} min)` });
+      // Call history already says what kind of call and how long.
+      const said = oneLine(r.kind === 'call' && !callTranscript && r.source === 'calls' ? r.text : '');
+      personBucket(other).items.push({ ...base, type: 'call', dir: r.is_from_me ? 'out' : 'in', text: said || `${oneLine(r.title || ch)} (${mins} min)` });
       stats.used++;
       continue;
     }

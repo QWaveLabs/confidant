@@ -10,6 +10,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { FOLDERS, folderName } from './lib/folders.mjs';
 import { t, fill } from './lib/i18n.mjs';
+import { DEFAULT_VAULT_NAME } from './lib/paths.mjs';
 import { sha1 } from './lib/hash.mjs';
 import { takeLock, readText } from './lib/b-common.mjs';
 import { loadPersona, personaText } from './lib/b-persona.mjs';
@@ -307,7 +308,10 @@ export async function buildMocs(ctx, { writer } = {}) {
     // The review queue, once there has ever been something in it.
     if (loadReview(ctx).items.length) writeReviewNote(w);
 
-    // Home.
+    // Home. The placeholder init writes is the engine's, not the person's:
+    // replace it outright the first time.
+    const placeholder = `# ${DEFAULT_VAULT_NAME[ctx.lang] ?? DEFAULT_VAULT_NAME.en}\n\n${t('vault', ctx.lang)('home.body')}\n`;
+    if (readText(join(ctx.vault, 'Home.md')) === placeholder) w.deleteFile('Home.md');
     w.writeManaged('Home.md', {
       fm: { type: 'home', confidant_id: 'home', tags: ['home'] },
       title: tr('home.title'),

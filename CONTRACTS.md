@@ -241,8 +241,27 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 - `planBatches(ctx, { scope: install|update|backlog, maxTokens = 40000, count })` returns `[{ id, path, kind, est_tokens }]`.
   - It writes `.confidant/batches/<id>.json` (schemas/batch.schema.json).
 - **Codex's job.** Codex (or a subagent) reads a batch file, follows
-  `prompts/sort.md` (named in `batch.instructions`), and writes
-  `.confidant/contrib/<id>.json` (schemas/contribution.schema.json).
+  `prompts/sort.md` (named in `batch.instructions`, an absolute path so it
+  opens from any working folder), and writes the contribution to
+  `batch.output`, which is `.confidant/contrib/<id>.json`
+  (schemas/contribution.schema.json).
+- **`batch.known`**: what the second brain already holds, so the sorter
+  reuses names instead of making near copies.
+  - `people`: `[{ name, person_id?, aliases?, company? }]`. Everyone with a
+    note, batch participants first; up to 300.
+  - `companies`: `[name]`.
+  - `projects`: `[{ name, status, company?, people?, last_activity? }]`.
+  - `meetings`: `[{ title, date, project?, people }]`. Recent meetings with
+    this batch's people.
+  - `commitments`: `[{ text, direction, counterpart, due? }]`. The open
+    ones with this batch's people. Closing one means repeating its `text`
+    and `counterpart` with a new `status`.
+  - `opportunities`: `[{ title, type, counterpart? }]`, open.
+  - `resolutions`: `[{ question, answer, subject? }]`. The owner's answers
+    from the review queue, newest first. The sorter must follow them.
+- **Privacy.** Dossiers and merges scrub text with `privacy.scrubText`.
+  `ctx.scrubText` (same signature), when set, overrides it for that context
+  only.
 - `mergeBatch(ctx, batchId)` handles the rest:
   - validates the contribution and scrubs it
   - fingerprints items, then creates or updates notes
@@ -253,9 +272,11 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 - CLI:
   - `confidant batch next [--scope] [--count] [--max-tokens]`
   - `confidant batch status`
-  - `confidant merge --batch <id>`
+  - `confidant merge --batch <id>` or `confidant merge --all`
   - `confidant mocs`
-  - `confidant undo --run <id>`
+  - `confidant undo --run <id>`, `--last` or `--list`
+  - `confidant review [--resolve <id> --answer <text> | --dismiss <id>]`
+  - `confidant cleanup --plan` or `--apply`
 
 ## Note frontmatter (B writes, D and E read)
 
