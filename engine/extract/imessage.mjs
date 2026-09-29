@@ -10,8 +10,9 @@ import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { toHandle, groupHandle, nameHandle } from '../lib/handles.mjs';
 import { toBuffer } from '../lib/sqlite.mjs';
-import { libraryPath, unreadable, openCopy, columns, tableNames, pageByKey, ownerParty, cleanText, fileSize } from '../lib/a-local.mjs';
+import { libraryPath, unreadable, openCopy, columns, tableNames, pageByKey, ownerParty, cleanText } from '../lib/a-local.mjs';
 import { contactNames } from '../lib/a-addressbook.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'imessage';
 const APPLE_EPOCH_MS = 978307200000;
@@ -55,11 +56,10 @@ export function decodeAttributedBody(blob) {
   return null;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'Messages database');
+  const bad = unreadable(ctx, id, path, 'Messages database');
   if (bad) return bad;
-  if (fileSize(path) > 4 * 1024 ** 3) return { ok: true, reason: 'large history' };
   const db = openCopy(ctx, path);
   const count = db.prepare('SELECT COUNT(*) AS n FROM message').get().n;
   return { ok: true, count };
@@ -202,7 +202,7 @@ function toRecords(ctx, L, rows) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const db = openCopy(ctx, path);
@@ -215,3 +215,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
     toRecords: (rows) => toRecords(ctx, L, rows),
   });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

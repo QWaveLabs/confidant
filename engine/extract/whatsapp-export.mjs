@@ -15,6 +15,7 @@ import { join, basename, extname } from 'node:path';
 import { groupHandle, nameHandle, phoneHandle } from '../lib/handles.mjs';
 import { shortHash } from '../lib/hash.mjs';
 import { readCursor, writeCursor, zonedToUtc, ownerParty, listDir, cleanText } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'whatsapp_export';
 
@@ -245,14 +246,14 @@ function toRecords(ctx, file, parsed, native) {
 
 const EXPORT_FILE = /\.(zip|txt)$/i;
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const dir = exportDir(ctx);
   const files = existsSync(dir) ? listDir(dir).filter((f) => EXPORT_FILE.test(f)) : [];
-  if (!files.length) return { ok: false, reason: 'no WhatsApp exports yet', count: 0 };
+  if (!files.length) return notOk(ctx, id, 'no_data', 'no WhatsApp exports yet', { count: 0 });
   return { ok: true, count: files.length };
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const dir = exportDir(ctx);
   const c = readCursor(cursor) ?? {};
   const files = c.files ?? {};
@@ -285,3 +286,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
   const done = !cur && list.every((n) => files[n] === fileSig(join(dir, n)));
   return { records, cursor: writeCursor({ files, cur }), done };
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

@@ -14,6 +14,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { nameHandle } from '../lib/handles.mjs';
 import { libraryPath, unreadable, openCopy, columns, tableNames, pendingPage, readCursor, writeCursor, ownerParty, cleanText, clip, looseDate } from '../lib/a-local.mjs';
+import { guardProbe, guardExtract } from '../lib/a-reasons.mjs';
 
 export const id = 'wispr';
 export const appDir = (ctx) => libraryPath(ctx, 'Application Support', 'Wispr Flow');
@@ -162,9 +163,9 @@ function dictationRecord(ctx, h) {
   return { id: `wispr:h:${h.id}`, source: 'wispr', kind: 'dictation', thread: null, ts, from: ownerParty(ctx), to: [], is_from_me: true, title: null, text, url: null, meta };
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'Wispr Flow database');
+  const bad = unreadable(ctx, id, path, 'Wispr Flow database');
   if (bad) return bad;
   const db = openCopy(ctx, path);
   return { ok: true, count: readMeetings(db).length };
@@ -178,7 +179,7 @@ const markOf = (...values) => {
   return 0;
 };
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const db = openCopy(ctx, path);
@@ -194,3 +195,6 @@ export async function extract(ctx, { cursor, limit = 2000 } = {}) {
   }
   return { records, cursor: writeCursor({ mt: mt.cursor, hs: hs.cursor }), done: mt.done && hs.done };
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);

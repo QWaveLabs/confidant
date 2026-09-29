@@ -21,6 +21,7 @@ import { decodeNoteBody } from '../lib/a-protobuf.mjs';
 import { libraryPath, unreadable, openCopy, columns, pendingPage, ownerParty, cleanText, transcribeFile } from '../lib/a-local.mjs';
 import { contactNames } from '../lib/a-addressbook.mjs';
 import { callNear } from './calls.mjs';
+import { guardProbe, guardExtract, notOk } from '../lib/a-reasons.mjs';
 
 export const id = 'call_recordings';
 const MAX_TRANSCRIBE = 5;
@@ -33,7 +34,7 @@ export const dbPath = (ctx) => libraryPath(ctx, ...NOTES, 'NoteStore.sqlite');
 const fold = (s) => String(s ?? '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
 // Notes in the call recordings folder, with their audio attachment.
-function readNotes(db) {
+export function readNotes(db) {
   const c = columns(db, 'ZICCLOUDSYNCINGOBJECT');
   if (!c.has('ZTITLE2')) return [];
   const folders = db
@@ -66,7 +67,7 @@ function readNotes(db) {
   });
 }
 
-function findMedia(ctx, mediaIdent, filename) {
+export function findMedia(ctx, mediaIdent, filename) {
   if (!mediaIdent) return null;
   const accounts = libraryPath(ctx, ...NOTES, 'Accounts');
   let dirs = [];
@@ -96,12 +97,12 @@ function findMedia(ctx, mediaIdent, filename) {
   return null;
 }
 
-export async function probe(ctx) {
+async function runProbe(ctx) {
   const path = dbPath(ctx);
-  const bad = unreadable(path, 'Notes database');
+  const bad = unreadable(ctx, id, path, 'Notes database');
   if (bad) return bad;
   const notes = readNotes(openCopy(ctx, path));
-  return notes.length ? { ok: true, count: notes.length } : { ok: false, reason: 'no call recordings in Notes yet', count: 0 };
+  return notes.length ? { ok: true, count: notes.length } : notOk(ctx, id, 'no_data', 'no call recordings in Notes yet', { count: 0 });
 }
 
 function otherParty(ctx, title, created) {
@@ -170,9 +171,12 @@ async function build(ctx, notes) {
   return out;
 }
 
-export async function extract(ctx, { cursor, limit = 2000 } = {}) {
+async function runExtract(ctx, { cursor, limit = 2000 } = {}) {
   const path = dbPath(ctx);
   if (!existsSync(path)) return { records: [], cursor, done: true };
   const notes = readNotes(openCopy(ctx, path)).map((n) => ({ ...n, id: n.ident, mark: Number(n.modified ?? n.created ?? 0) }));
   return pendingPage(cursor, notes, { limit, build: (items) => build(ctx, items) });
 }
+
+export const probe = guardProbe(id, runProbe);
+export const extract = guardExtract(id, runExtract);
