@@ -15,7 +15,7 @@
   "sections": {
     "whatItIs": {
       "heading": "Qué es",
-      "body": "Confidant es un segundo cerebro privado construido con tu propio historial de trabajo: mensajes, reuniones, correos y notas, organizado en una carpeta de notas sencilla en esta Mac. Seis agentes la revisan según un horario y te dicen qué necesita tu atención, para que dejes de tener que recordarlo todo tú."
+      "body": "Confidant es un segundo cerebro privado construido con tu propio historial de trabajo: mensajes, reuniones, correos y notas, organizado en una carpeta de notas sencilla en esta Mac. Sus agentes la revisan según un horario y te dicen qué necesita tu atención, para que dejes de tener que recordarlo todo tú."
     },
     "whatItDoes": {
       "heading": "Qué hace",
@@ -24,8 +24,8 @@
     },
     "howItWorks": {
       "heading": "Cómo funciona",
-      "body": "Tus fuentes conectadas alimentan una carpeta privada de notas en esta Mac. Los seis agentes de arriba revisan esa carpeta según su horario y escriben en ella: resúmenes, radar, y notas actualizadas de personas, proyectos y compromisos.",
-      "diagram": { "sources": "Tus fuentes", "vault": "Segundo cerebro (esta Mac)", "agents": "Seis agentes" }
+      "body": "Tus fuentes conectadas alimentan una carpeta privada de notas en esta Mac. Los agentes de arriba revisan esa carpeta según su horario y escriben en ella: resúmenes, radar, y notas actualizadas de personas, proyectos y compromisos.",
+      "diagram": { "sources": "Tus fuentes", "vault": "Segundo cerebro (esta Mac)", "agents": "Tus agentes" }
     },
     "howToUse": {
       "heading": "Cómo usarlo",
@@ -73,7 +73,7 @@
         { "q": "Se desactivó el Acceso completo al disco", "a": "Abre Ajustes del Sistema, luego Privacidad y Seguridad, luego Acceso completo al disco, y vuelve a activar ChatGPT. Reinicia ChatGPT y dile a Codex \"continúa configurando mi segundo cerebro\"." },
         { "q": "Una app conectada se desconectó", "a": "Vuelve a conectarla desde los ajustes de conectores de la app de ChatGPT y dile a Codex \"continúa configurando mi segundo cerebro\"." },
         { "q": "Una clave de API venció", "a": "Pídele a Codex que ejecute confidant keys set para esa fuente otra vez." },
-        { "q": "Pausar o cambiar una tarea", "a": "Abre la vista Programado dentro de la app de ChatGPT: ahí puedes pausar, editar o eliminar cualquiera de los seis agentes directamente." },
+        { "q": "Pausar o cambiar una tarea", "a": "Abre la vista Programado dentro de la app de ChatGPT: ahí puedes pausar, editar o eliminar cualquiera de sus tareas directamente." },
         { "q": "La configuración se interrumpió", "a": "Dile a Codex \"continúa configurando mi segundo cerebro\" en el proyecto de este segundo cerebro. Retoma justo donde se quedó." },
         { "q": "Quieres dejar de usar Confidant", "a": "Elimina las tareas programadas de este segundo cerebro desde la vista Programado y luego borra la carpeta del segundo cerebro. Nada más en tu Mac depende de ella." }
       ]

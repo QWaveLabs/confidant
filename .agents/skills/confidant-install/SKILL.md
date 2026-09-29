@@ -130,7 +130,7 @@ sorts the most recent 60 days: identity, then dossiers, then batches that
 you or a subagent write contributions for, then merge, then mocs.
 
 Tell the person the rest of their history keeps filling in automatically,
-oldest first, roughly every 3 hours, once the scheduled tasks below are
+newest first and all the way back to the beginning, roughly every 3 hours, once the scheduled tasks below are
 running.
 
 If you hit a usage or rate limit partway through sorting, stop cleanly,
@@ -181,7 +181,8 @@ way.
    `obsidian://open?path=<url-encoded vault path>`.
 3. Send one final chat message covering, plainly:
    - what's connected, with real counts, and what's still backfilling;
-   - the six scheduled agents and when they run;
+   - the nine scheduled tasks (the six agents plus Health Check, Brain Cleanup
+     and Confidant Check-in) and when they run;
    - anything skipped or blocked, and why;
    - next steps: open Obsidian, check the Scheduled view in the ChatGPT
      app tomorrow morning, and keep the Mac on and ChatGPT open so the

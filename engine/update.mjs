@@ -130,8 +130,7 @@ export async function run(args, ctx) {
     const dossiers = await runDossiers(ctx, ctx.state?.lastUpdate?.at);
     const batches = await runBatches(ctx);
 
-    ctx.state.backlog = { ...(ctx.state.backlog ?? { oldest_sorted: null, done: false }), remaining_batches: batches.length };
-    ctx.saveState();
+    // batch.mjs owns state.backlog (its estimate of history left); don't overwrite it here.
 
     const inserted = extracted.reduce((n, r) => n + (r.inserted ?? 0), 0);
     const out = {

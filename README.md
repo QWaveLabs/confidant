@@ -6,7 +6,7 @@ Codex, inside the ChatGPT desktop app. Codex clones this repo at a pinned tag
 and commit, reads `AGENTS.md`, and follows
 `.agents/skills/confidant-install/SKILL.md` end to end: it asks a short setup
 question, connects the sources the person wants, extracts and sorts their
-history into an Obsidian vault, creates six scheduled agents, locks down the
+history into an Obsidian vault, creates nine scheduled tasks (the six agents plus health, cleanup and check-in), locks down the
 sandbox, and hands back a plain-English "Confidant Guide.html".
 
 This repository is the installer: engine code, prompts, schemas and the
@@ -40,8 +40,8 @@ left off, from `.confidant/state.json` in their vault.
    `.agents/skills/confidant-install/recipes/`.
 4. **Sort.** `.agents/skills/confidant-sort/SKILL.md` builds identity,
    dossiers, and notes for the most recent 60 days. The rest of the person's
-   history keeps filling in afterward, oldest first, roughly every 3 hours.
-5. **Tasks.** Six scheduled agents are created with the ChatGPT app's own
+   history keeps filling in afterward, newest first and all the way back, roughly every 3 hours.
+5. **Tasks.** Nine scheduled tasks are created with the ChatGPT app's own
    `automation_update` tool, running against the vault.
 6. **Config.** The vault gets its own sandboxed `.codex/config.toml`
    (workspace-write, no browsing, no destructive app tools), the project is

@@ -1,6 +1,6 @@
 // Shared "what's actually connected" reporting, used by both `confidant
 // status` and the welcome guide so the two never disagree.
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SOURCES } from './sources.mjs';
 import { FOLDERS, BRIEFS, folderName } from './folders.mjs';
@@ -35,6 +35,17 @@ export function sourceRows(ctx) {
   });
 }
 
+// Folder index notes (type: index) are navigation, not knowledge, so they
+// don't count as notes written.
+function isIndexNote(file) {
+  try {
+    const head = readFileSync(file, 'utf8').slice(0, 400);
+    return /^---[\s\S]*?\ntype: index\s*\n/.test(head);
+  } catch {
+    return false;
+  }
+}
+
 // Recursively counts .md files under a vault folder (0 if it doesn't exist
 // yet, e.g. a fresh vault before the first sort has run).
 function countMarkdown(dir) {
@@ -45,7 +56,7 @@ function countMarkdown(dir) {
     const full = join(dir, entry);
     const st = statSync(full);
     if (st.isDirectory()) n += countMarkdown(full);
-    else if (entry.toLowerCase().endsWith('.md')) n += 1;
+    else if (entry.toLowerCase().endsWith('.md') && !isIndexNote(full)) n += 1;
   }
   return n;
 }

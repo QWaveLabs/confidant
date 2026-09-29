@@ -15,7 +15,7 @@
   "sections": {
     "whatItIs": {
       "heading": "What it is",
-      "body": "Confidant is a private second brain built from your own working history: messages, meetings, email and notes, organized into a plain folder of notes on this Mac. Six agents read it on a schedule and tell you what needs your attention, so you stop having to remember everything yourself."
+      "body": "Confidant is a private second brain built from your own working history: messages, meetings, email and notes, organized into a plain folder of notes on this Mac. Its agents read it on a schedule and tell you what needs your attention, so you stop having to remember everything yourself."
     },
     "whatItDoes": {
       "heading": "What it does",
@@ -24,8 +24,8 @@
     },
     "howItWorks": {
       "heading": "How it works",
-      "body": "Your connected sources feed a private folder of notes on this Mac. The six agents above read that folder on their own schedule and write back to it: briefs, radar, and updated notes on people, projects and commitments.",
-      "diagram": { "sources": "Your sources", "vault": "Second Brain (this Mac)", "agents": "Six agents" }
+      "body": "Your connected sources feed a private folder of notes on this Mac. The agents above read that folder on their own schedule and write back to it: briefs, radar, and updated notes on people, projects and commitments.",
+      "diagram": { "sources": "Your sources", "vault": "Second Brain (this Mac)", "agents": "Your agents" }
     },
     "howToUse": {
       "heading": "How to use it",
@@ -73,7 +73,7 @@
         { "q": "Full Disk Access turned off", "a": "Open System Settings, then Privacy & Security, then Full Disk Access, and turn ChatGPT back on. Relaunch ChatGPT, then tell Codex \"continue setting up my second brain\"." },
         { "q": "A connected app disconnected", "a": "Reconnect it from the ChatGPT app's connector settings, then tell Codex \"continue setting up my second brain\"." },
         { "q": "An API key expired", "a": "Ask Codex to run confidant keys set for that source again." },
-        { "q": "Pause or change a task", "a": "Open the Scheduled view inside the ChatGPT app: you can pause, edit, or delete any of the six agents there directly." },
+        { "q": "Pause or change a task", "a": "Open the Scheduled view inside the ChatGPT app: you can pause, edit, or delete any of its tasks there directly." },
         { "q": "Setup was interrupted", "a": "Tell Codex \"continue setting up my second brain\" in this vault's project. It resumes exactly where it left off." },
         { "q": "You want to stop using Confidant", "a": "Delete the scheduled tasks for this vault from the Scheduled view, then delete the vault folder. Nothing else on your Mac depends on it." }
       ]
