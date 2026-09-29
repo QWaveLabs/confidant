@@ -166,6 +166,37 @@ export function afterMark(items, mark) {
   return sorted.filter((it) => it.mark > mark.mark || (it.mark === mark.mark && it.id > mark.id));
 }
 
+// Watermark pages plus a retry list, for recordings that may still be waiting
+// for a transcript. cursor: { m, pending, waiting }.
+//   pending  ids to retry this run (once, at the front of the queue)
+//   waiting  ids that still need a transcript; they move to pending when the
+//            run finishes, so a later run retries them and this one never loops.
+// build(items) -> records; a record with meta.needs_transcript goes to waiting.
+export async function pendingPage(cursorText, items, { limit = 2000, build }) {
+  const c = readCursor(cursorText) ?? {};
+  const ids = new Set(items.map((it) => it.id));
+  const pending = (c.pending ?? []).filter((id) => ids.has(id));
+  const waiting = new Set((c.waiting ?? []).filter((id) => ids.has(id)));
+  const fresh = afterMark(items, c.m);
+  const freshIds = new Set(fresh.map((it) => it.id));
+  const retry = items.filter((it) => pending.includes(it.id) && !freshIds.has(it.id));
+  const queue = [...retry, ...fresh];
+  const take = queue.slice(0, limit);
+  const records = await build(take);
+  const taken = new Set(take.map((it) => it.id));
+  for (const r of records) {
+    const itemId = r.meta?.item_id ?? null;
+    if (r.meta?.needs_transcript && itemId) waiting.add(itemId);
+  }
+  const lastFresh = [...take].reverse().find((it) => freshIds.has(it.id));
+  const m = lastFresh ? { mark: lastFresh.mark, id: lastFresh.id } : c.m ?? null;
+  const restPending = pending.filter((id) => !taken.has(id));
+  const done = queue.length <= take.length;
+  const next = done ? { m, pending: [...new Set([...restPending, ...waiting])], waiting: [] } : { m, pending: restPending, waiting: [...waiting] };
+  for (const r of records) if (r.meta && 'item_id' in r.meta) delete r.meta.item_id;
+  return { records, cursor: writeCursor(next), done };
+}
+
 // The person running Confidant, from config.owner.
 export function ownerOf(ctx) {
   const o = ctx?.config?.owner ?? {};

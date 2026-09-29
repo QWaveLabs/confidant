@@ -38,7 +38,7 @@ function toRecord(ctx, card, key, owner) {
   const name = card.names[0] ?? card.company ?? null;
   const ts = fromAppleTime(card.modified ?? card.created) ?? new Date(ctx.now ?? Date.now()).toISOString();
   return {
-    id: `contacts:${card.uid}`,
+    id: `contacts:${key}:${card.uid}`,
     source: 'contacts',
     kind: 'contact',
     thread: null,

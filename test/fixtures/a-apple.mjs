@@ -113,3 +113,36 @@ export function callHistory(home) {
 }
 
 export { appleSeconds, appleNanos };
+
+// ---------- WhatsApp ChatStorage.sqlite ----------
+export function whatsappDb(home) {
+  const base = join(home, 'Library/Group Containers/group.net.whatsapp.WhatsApp.shared');
+  const db = createDb(
+    join(base, 'ChatStorage.sqlite'),
+    `CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZSESSIONTYPE INTEGER, ZARCHIVED INTEGER, ZCONTACTJID VARCHAR, ZPARTNERNAME VARCHAR, ZLASTMESSAGEDATE TIMESTAMP);
+     CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZCHATSESSION INTEGER, ZISADMIN INTEGER, ZMEMBERJID VARCHAR, ZCONTACTNAME VARCHAR, ZFIRSTNAME VARCHAR);
+     CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZISFROMME INTEGER, ZMESSAGETYPE INTEGER, ZSTARRED INTEGER, ZCHATSESSION INTEGER,
+       ZGROUPMEMBER INTEGER, ZMEDIAITEM INTEGER, ZMESSAGEDATE TIMESTAMP, ZSENTDATE TIMESTAMP, ZFROMJID VARCHAR, ZPUSHNAME VARCHAR, ZSTANZAID VARCHAR,
+       ZTEXT VARCHAR, ZTOJID VARCHAR, ZGROUPEVENTTYPE INTEGER);
+     CREATE TABLE ZWAMEDIAITEM (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZMESSAGE INTEGER, ZFILESIZE INTEGER, ZMOVIEDURATION INTEGER, ZMEDIALOCALPATH VARCHAR, ZTITLE VARCHAR, ZVCARDNAME VARCHAR);
+     CREATE TABLE ZWAPROFILEPUSHNAME (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZJID VARCHAR, ZPUSHNAME VARCHAR);`,
+  );
+  return { db, base };
+}
+
+export function whatsappContacts(base, rows) {
+  const db = createDb(join(base, 'ContactsV2.sqlite'), 'CREATE TABLE ZWAADDRESSBOOKCONTACT (Z_PK INTEGER PRIMARY KEY, ZFULLNAME VARCHAR, ZPHONENUMBER VARCHAR, ZWHATSAPPID VARCHAR, ZLID VARCHAR);');
+  insert(db, 'ZWAADDRESSBOOKCONTACT', rows);
+  return db;
+}
+
+let waPk = 0;
+export function addWa(db, { chat, text = null, at, fromMe = false, type = 0, member = null, fromJid = null, toJid = null, push = null, stanza, caption, duration }) {
+  const pk = ++waPk;
+  insert(db, 'ZWAMESSAGE', {
+    Z_PK: pk, Z_ENT: 9, ZISFROMME: fromMe ? 1 : 0, ZMESSAGETYPE: type, ZCHATSESSION: chat, ZGROUPMEMBER: member, ZMESSAGEDATE: appleSeconds(at),
+    ZFROMJID: fromJid, ZTOJID: toJid, ZPUSHNAME: push, ZSTANZAID: stanza ?? `3EB0${pk}`, ZTEXT: text,
+  });
+  if (caption !== undefined || duration !== undefined) insert(db, 'ZWAMEDIAITEM', { Z_PK: pk, Z_ENT: 10, ZMESSAGE: pk, ZTITLE: caption ?? null, ZMOVIEDURATION: duration ?? null });
+  return pk;
+}

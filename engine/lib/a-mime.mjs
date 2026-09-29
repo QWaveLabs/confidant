@@ -356,7 +356,7 @@ export function htmlToText(html, { cutQuotes = true } = {}) {
     .replace(/<(head|style|script|title|noscript)[^>]*>[\s\S]*?<\/\1>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<li[^>]*>/gi, '\n- ')
-    .replace(/<\/(p|div|tr|h[1-6]|li|ul|ol|table|blockquote|section|article|header|footer)>/gi, '\n')
+    .replace(/<\/(p|div|tr|h[1-6]|ul|ol|table|blockquote|section|article|header|footer)>/gi, '\n')
     .replace(/<(p|div|tr|h[1-6]|table|blockquote)[^>]*>/gi, '\n')
     .replace(/<\/t[dh]>/gi, ' ')
     .replace(/<[^>]+>/g, '');
