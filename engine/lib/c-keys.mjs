@@ -14,11 +14,21 @@ const service = (name) => `confidant-${name}`;
 
 function defaultExec(cmdArgs) {
   try {
-    return execFileSync(SECURITY, cmdArgs, { encoding: 'utf8' }).replace(/\n$/, '');
+    return execFileSync(SECURITY, cmdArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\n$/, '');
   } catch (err) {
     if (err.status === 44) return null; // security's "item not found" exit code
-    throw err;
+    // Node's own message repeats the whole command line, key included.
+    // Rethrow with the subcommand and exit code only.
+    const safe = new Error(`Keychain ${cmdArgs[0]} failed (exit ${err.status ?? 'unknown'})`);
+    safe.status = err.status;
+    throw safe;
   }
+}
+
+// Keys are printable ASCII. A pasted newline or control character would
+// otherwise travel into HTTP headers and error messages.
+export function isValidKey(value) {
+  return typeof value === 'string' && /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && value.length <= 4096;
 }
 
 // The Keychain item's password, or null when it does not exist.
@@ -30,7 +40,14 @@ export function getKey(name, { exec = defaultExec } = {}) {
 // promptForKey uses this. Extractors that must persist a rotated token
 // (Read.ai's refresh token rotates on every use) use it too.
 export function setKey(name, value, { exec = defaultExec } = {}) {
-  exec(['add-generic-password', '-U', '-s', service(name), '-a', ACCOUNT, '-w', value]);
+  if (!isValidKey(value)) throw new Error(`That ${name} key has spaces at the ends, line breaks or other characters keys never have. Nothing was saved.`);
+  try {
+    exec(['add-generic-password', '-U', '-s', service(name), '-a', ACCOUNT, '-w', value]);
+  } catch (err) {
+    const safe = new Error(`Could not save the ${name} key in Keychain (exit ${err.status ?? 'unknown'}).`);
+    safe.status = err.status;
+    throw safe;
+  }
   return true;
 }
 

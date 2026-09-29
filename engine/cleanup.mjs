@@ -14,7 +14,7 @@
 // the uncertain ones in the review queue. Answers from that queue are applied
 // on the next run: a confirmed duplicate is merged, a confirmed done
 // commitment is closed, a stale project gets the status the person chose.
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, lstatSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { t, fill } from './lib/i18n.mjs';
 import { localDate, toMs } from './lib/time.mjs';
@@ -45,8 +45,12 @@ function mdFiles(vault) {
     for (const name of names.sort()) {
       if (name.startsWith('.')) continue;
       const r = rel ? `${rel}/${name}` : name;
-      if (statSync(join(vault, r)).isDirectory()) walk(r);
-      else if (name.endsWith('.md')) out.push(r);
+      // lstat: symlinks are skipped (never followed out of the vault), and a
+      // broken entry is ignored instead of stopping the run.
+      const st = (() => { try { return lstatSync(join(vault, r)); } catch { return null; } })();
+      if (!st || st.isSymbolicLink()) continue;
+      if (st.isDirectory()) walk(r);
+      else if (st.isFile() && name.endsWith('.md')) out.push(r);
     }
   };
   walk('');
@@ -192,7 +196,9 @@ class Cleanup {
       for (const name of readdirSync(join(this.ctx.vault, rel || '.'))) {
         if (name.startsWith('.')) continue;
         const r = rel ? `${rel}/${name}` : name;
-        if (statSync(join(this.ctx.vault, r)).isDirectory()) walk(r);
+        const st = (() => { try { return lstatSync(join(this.ctx.vault, r)); } catch { return null; } })();
+        if (!st || st.isSymbolicLink()) continue;
+        if (st.isDirectory()) walk(r);
         else {
           files.add(name.toLowerCase());
           if (name.endsWith('.md')) files.add(basename(name, '.md').toLowerCase());

@@ -44,14 +44,14 @@ import { check } from './lib/schema.mjs';
 import { emailHandle, nameHandle, slackHandle } from './lib/handles.mjs';
 import { toIso, fromUnix } from './lib/time.mjs';
 
+// Fails closed: without the privacy filter nothing is stored.
 async function loadPrivacy() {
-  try {
-    const mod = await import('./privacy.mjs');
-    return mod?.filterRecord ? mod : { filterRecord: () => ({ keep: true }) };
-  } catch {
-    return { filterRecord: () => ({ keep: true }) };
-  }
+  const mod = await import('./privacy.mjs');
+  if (!mod?.filterRecord) throw new Error('The privacy filter (engine/privacy.mjs) is missing, so nothing was stored.');
+  return mod;
 }
+
+const MAX_TEXT = 200000;
 
 function* jsonlItems(text) {
   for (const line of text.split('\n')) {
@@ -146,8 +146,8 @@ function parseAddressList(raw) {
     .filter((p) => p.handle);
 }
 
-function mapGmail(item, { ownerHandles }) {
-  if (isFullRecord(item)) return item;
+function mapGmail(item, { ownerHandles, account }) {
+  if (isFullRecord(item)) return account ? { ...item, meta: { ...(item.meta ?? {}), account } } : item;
   const headers = item.payload?.headers;
   const subject = headers ? gmailHeader(headers, 'Subject') : (item.subject ?? item.title ?? null);
   const fromRaw = headers ? gmailHeader(headers, 'From') : item.from;
@@ -171,7 +171,8 @@ function mapGmail(item, { ownerHandles }) {
     title: subject,
     text: text || '',
     url: item.id ? `https://mail.google.com/mail/u/0/#all/${item.id}` : null,
-    meta: { labels: item.labelIds ?? item.labels ?? [] },
+    // The connected Gmail account, so emailAccounts exclusions apply to it.
+    meta: { labels: item.labelIds ?? item.labels ?? [], ...(account ? { account } : {}) },
   };
 }
 
@@ -303,18 +304,30 @@ export async function run(args, ctx) {
   const raw = filePath === '-' ? readFileSync(0, 'utf8') : readFileSync(filePath, 'utf8');
   const items = readItems(raw);
   const ownerHandles = new Set((ctx.config?.owner?.emails ?? []).map(emailHandle).filter(Boolean));
+  const account = typeof args.account === 'string' ? args.account.trim().toLowerCase() : null;
   const privacy = await loadPrivacy();
+  if (args.cursorKey && !String(args.cursorKey).startsWith(source)) {
+    ctx.log.error(`--cursor-key must start with "${source}" so it can never move another source's cursor.`);
+    return 2;
+  }
 
   const totals = { source, read: items.length, inserted: 0, updated: 0, unchanged: 0, excluded: 0, invalid: 0 };
   const keep = [];
   for (const item of items) {
     let record;
     try {
-      record = MAPPERS[source](item, { ownerHandles });
+      record = MAPPERS[source](item, { ownerHandles, account });
     } catch {
       totals.invalid++;
       continue;
     }
+    // A record read through the <source> app can only be a <source> record:
+    // it can never overwrite iMessage or email rows, or carry an id it made up.
+    if (!record || record.source !== source || typeof record.id !== 'string' || !record.id.startsWith(`${source}:`) || /:undefined(:|$)/.test(record.id)) {
+      totals.invalid++;
+      continue;
+    }
+    if (typeof record.text === 'string' && record.text.length > MAX_TEXT) record.text = `${record.text.slice(0, MAX_TEXT)}\n[...]`;
     if (check('record', record).length) {
       totals.invalid++;
       continue;

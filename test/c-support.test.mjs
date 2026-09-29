@@ -78,9 +78,14 @@ test('--include-diagnostics collects doctor, health and status counts, sanitized
   assert.equal(diagnostics.status.totalRecords, 5);
   assert.equal(diagnostics.status.notesWritten, 5);
   assert.equal(diagnostics.status.agentsScheduled, 1);
-  assert.equal(diagnostics.doctor.mail.names[0], '[redacted email]');
-  assert.equal(diagnostics.doctor.vaults.confidant[0], '~/Second Brain');
-  assert.equal(diagnostics.health.phone, 'call me at [redacted phone]');
+  // Allowlisted: account names, vault paths and free text never leave, not
+  // even masked. Only counts, booleans and codes do.
+  assert.equal(diagnostics.doctor.confidantVaults, 1);
+  assert.equal(diagnostics.doctor.mail, undefined);
+  assert.equal(diagnostics.health.ok, true);
+  assert.equal(diagnostics.health.phone, undefined);
+  const sent = JSON.stringify(diagnostics);
+  for (const leak of ['alex@example.com', 'Second Brain', '555-123-4567', homedir()]) assert.ok(!sent.includes(leak), leak);
   assert.deepEqual(Object.keys(diagnostics).sort(), ['doctor', 'health', 'status']);
 });
 
@@ -94,7 +99,8 @@ test('collectDiagnostics tolerates a missing health module without throwing', as
     loadStatus: async () => ({ buildStatus: () => ({}) }),
   });
   assert.equal(diagnostics.health, null);
-  assert.deepEqual(diagnostics.doctor, { ok: true });
+  assert.equal(typeof diagnostics.doctor, 'object');
+  assert.equal(diagnostics.doctor.mailAccounts, null);
 });
 
 test('sanitizeDiagnostics strips emails, phone numbers and home-directory paths anywhere in a nested shape', () => {

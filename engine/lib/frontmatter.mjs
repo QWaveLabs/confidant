@@ -1,7 +1,7 @@
 // Note frontmatter: a small YAML subset that Obsidian reads natively.
 // Supported values: strings, numbers, booleans, null, and lists of those
 // (block "- item" or inline "[a, b]"). Wikilinks stay quoted strings.
-const NEEDS_QUOTES = /^$|^[\s\-?:,[\]{}#&*!|>'"%@`]|: |\s#|^(true|false|null|yes|no|~)$|^[\d.+-]+$|\s$/i;
+const NEEDS_QUOTES = /^$|^[\s\-?:,[\]{}#&*!|>'"%@`]|: |:$|[\r\n]|\s#|^(true|false|null|yes|no|~)$|^[\d.+-]+$|\s$/i;
 
 function scalarOut(v) {
   if (v === null || v === undefined) return 'null';
@@ -51,7 +51,8 @@ function splitInline(inner) {
 }
 
 // Returns { data, body }. Notes without frontmatter give data = {}.
-export function parseNote(text) {
+export function parseNote(raw) {
+  const text = String(raw).replace(/^\uFEFF/, '');
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
   if (!m) return { data: {}, body: text };
   const data = {};

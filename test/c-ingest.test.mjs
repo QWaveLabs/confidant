@@ -208,8 +208,11 @@ test('privacy.filterRecord is honored: an excluded keyword keeps the email out',
 test('--cursor-key stores the given --cursor-value in the store cursors', async () => {
   const ctx = fakeCtx({});
   const path = tempFile(JSON.stringify([{ id: 'r9', title: 'X', created_at: '2026-09-10T00:00:00Z', transcript: 't' }]));
-  await run1(ctx, { source: 'plaud', file: path, cursorKey: 'gmail_window', cursorValue: '2026-08-01' });
-  assert.equal(ctx.store.getCursor('gmail_window'), '2026-08-01');
+  await run1(ctx, { source: 'plaud', file: path, cursorKey: 'plaud_window', cursorValue: '2026-08-01' });
+  assert.equal(ctx.store.getCursor('plaud_window'), '2026-08-01');
+  // Another source's cursor is never moved from here.
+  await run1(ctx, { source: 'plaud', file: path, cursorKey: 'imessage', cursorValue: '1' });
+  assert.equal(ctx.store.getCursor('imessage'), null);
 });
 
 test('dryRun counts records but does not write to the store', async () => {

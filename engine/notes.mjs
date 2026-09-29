@@ -8,8 +8,9 @@
 // and the frontmatter keys listed in OWNED are ever rewritten. When the
 // person edits one of the EDITABLE fields in Obsidian (a commitment's status,
 // a due date), their value wins and is adopted into the tables.
-import { closeSync, copyFileSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { closeSync, copyFileSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, lstatSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
 import { ensureDir, writeFileAtomic, writeJson } from './lib/files.mjs';
 import { folderPath, folderName, FOLDERS } from './lib/folders.mjs';
 import { localDate } from './lib/time.mjs';
@@ -275,7 +276,7 @@ export class NoteWriter {
   loadBasenames() {
     if (this.basenames) return this.basenames;
     this.basenames = new Set();
-    for (const r of this.db.prepare('SELECT path FROM b_notes WHERE path IS NOT NULL').all()) this.basenames.add(basename(r.path, '.md').toLowerCase());
+    for (const r of this.db.prepare('SELECT path FROM b_notes WHERE path IS NOT NULL').all()) this.basenames.add(pathKey(basename(r.path, '.md')));
     this.basenames.add('home');
     for (const f of FOLDERS) this.basenames.add(folderName(f.key, this.lang).toLowerCase());
     return this.basenames;
@@ -303,8 +304,9 @@ export class NoteWriter {
     for (let n = 2; n < 50; n++) candidates.push(`${base} ${n}`);
     for (const c of candidates) {
       const rel = `${folder}/${c}.md`;
-      if (taken.has(c.toLowerCase()) || existsSync(join(this.ctx.vault, rel))) continue;
-      taken.add(c.toLowerCase());
+      const key = pathKey(c);
+      if (taken.has(key) || existsSync(join(this.ctx.vault, rel))) continue;
+      taken.add(key);
       return rel;
     }
     return `${folder}/${base} ${row.id}.md`;
@@ -326,8 +328,10 @@ export class NoteWriter {
           for (const name of names) {
             const rel = `${dir}/${name}`;
             const abs = join(this.ctx.vault, rel);
-            if (statSync(abs).isDirectory()) walk(rel);
-            else if (name.endsWith('.md')) {
+            const st = (() => { try { return lstatSync(abs); } catch { return null; } })();
+            if (!st || st.isSymbolicLink()) continue;
+            if (st.isDirectory()) walk(rel);
+            else if (st.isFile() && name.endsWith('.md')) {
               const fd = openSync(abs, 'r');
               const buf = Buffer.alloc(2000);
               const n = readSync(fd, buf, 0, 2000, 0);
@@ -367,6 +371,9 @@ export class NoteWriter {
     const text = readText(abs);
     if (text == null) return;
     const { data: fm } = splitNote(text);
+    // No frontmatter (or not ours): nothing to adopt, rather than reading
+    // every field as cleared by the person.
+    if (fm?.confidant_id == null) return;
     const adopt = {};
     for (const f of editable) {
       if (same(fm[f], written[f])) continue;
@@ -545,7 +552,7 @@ export class NoteWriter {
   preserve(rel) {
     if (this.fileSeen.has(rel)) return;
     this.fileSeen.add(rel);
-    const abs = join(this.ctx.vault, rel);
+    const abs = insideDir(this.ctx.vault, rel);
     const existed = existsSync(abs);
     this.files.push({ path: rel, existed });
     if (existed && !this.ctx.dryRun) {
@@ -556,7 +563,7 @@ export class NoteWriter {
   }
 
   deleteFile(rel) {
-    const abs = join(this.ctx.vault, rel);
+    const abs = insideDir(this.ctx.vault, rel);
     if (!existsSync(abs)) return false;
     this.preserve(rel);
     if (!this.ctx.dryRun) unlinkSync(abs);
@@ -582,7 +589,7 @@ export class NoteWriter {
 
   // Any vault file, with a pre-image backup the first time a run touches it.
   writeFile(rel, content) {
-    const abs = join(this.ctx.vault, rel);
+    const abs = insideDir(this.ctx.vault, rel);
     if (readText(abs) === content) return false;
     this.preserve(rel);
     if (!this.ctx.dryRun) writeFileAtomic(abs, content);
@@ -629,7 +636,11 @@ export class NoteWriter {
         kind: this.kind,
         batch_id: this.batchId,
         at: isoNow(this.ctx),
-        files: this.files,
+        // What this run left in each file, so undo can tell later edits apart.
+        files: this.files.map((f) => {
+          const abs = join(this.ctx.vault, f.path);
+          return { ...f, after: existsSync(abs) ? fileHash(readFileSync(abs)) : null };
+        }),
         notes: Object.fromEntries([...this.preimages].filter(([id]) => this.dirty.has(id) || this.removed.has(id))),
         items: this.itemsAdded,
         items_before: [...this.itemPre.values()],
@@ -911,16 +922,29 @@ const RENDER = {
 
 // ---------- undo ----------
 
+// Undo never destroys: whatever is in the vault right now is copied to
+// backups/<run>/undone/ before a pre-image replaces it or a created note is
+// removed, and notes changed since the run are reported as edited_after.
+// Manifest paths are contained in the vault and the backup folder, so an
+// edited manifest cannot reach anywhere else.
 export function restoreRun(ctx, runId) {
   const dir = join(bPaths(ctx).backups, runId);
   const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'));
   const db = bTables(ctx.store);
   const restored = [];
-  for (const f of manifest.files) {
-    const abs = join(ctx.vault, f.path);
+  const editedAfter = [];
+  const plan = manifest.files.map((f) => ({ f, abs: insideDir(ctx.vault, f.path), src: f.existed ? insideDir(join(dir, 'files'), f.path) : null }));
+  for (const { f, abs, src } of plan) {
+    if (existsSync(abs)) {
+      const now = readFileSync(abs);
+      if (f.after && fileHash(now) !== f.after) editedAfter.push(f.path);
+      const keep = insideDir(join(dir, 'undone'), f.path);
+      ensureDir(dirname(keep));
+      writeFileAtomic(keep, now);
+    }
     if (f.existed) {
       ensureDir(dirname(abs));
-      copyFileSync(join(dir, 'files', f.path), abs);
+      writeFileAtomic(abs, readFileSync(src));
     } else if (existsSync(abs)) unlinkSync(abs);
     restored.push(f.path);
   }
@@ -950,5 +974,22 @@ export function restoreRun(ctx, runId) {
     db.exec('ROLLBACK');
     throw err;
   }
-  return { run_id: runId, restored, manifest };
+  return { run_id: runId, restored, edited_after: editedAfter, kept_in: join(dir, 'undone'), manifest };
+}
+
+// APFS treats "José" typed as NFC or NFD, and any letter case, as one file
+// name, so collisions are checked on this key.
+export const pathKey = (name) => String(name).normalize('NFC').toLowerCase();
+
+export const fileHash = (buf) => createHash('sha1').update(buf).digest('hex');
+
+// The absolute path of rel inside root. Throws for absolute paths and for
+// anything that climbs out (../), so no manifest or row can point elsewhere.
+export function insideDir(root, rel) {
+  const base = resolve(root);
+  const abs = resolve(base, String(rel));
+  if (typeof rel !== 'string' || !rel || isAbsolute(rel) || rel.includes('\0') || (abs !== base && !abs.startsWith(base + sep))) {
+    throw new Error(`Refusing a path outside ${base}: ${JSON.stringify(rel)}`);
+  }
+  return abs;
 }

@@ -26,8 +26,8 @@ export function undoRun(ctx, runId, { force = false } = {}) {
   if (ctx.dryRun) return { run_id: runId, restored: [...mine], dry_run: true };
   const release = takeLock(ctx, 'vault');
   try {
-    const { restored, manifest } = restoreRun(ctx, runId);
-    return { run_id: runId, batch_id: manifest.batch_id ?? null, restored };
+    const { restored, manifest, edited_after: editedAfter, kept_in: keptIn } = restoreRun(ctx, runId);
+    return { run_id: runId, batch_id: manifest.batch_id ?? null, restored, edited_after: editedAfter, kept_in: keptIn };
   } finally {
     release();
   }
@@ -46,6 +46,7 @@ export async function run(args, ctx) {
     return 2;
   }
   const out = undoRun(ctx, String(id), { force: !!args.force });
-  ctx.log.out(out, `Restored ${out.restored.length} files from before run ${out.run_id}.${out.batch_id ? ` Batch ${out.batch_id} can be merged again.` : ''}`);
+  const edited = out.edited_after?.length ? ` ${out.edited_after.length} of them had changes made after that run; those versions are kept in ${out.kept_in}.` : '';
+  ctx.log.out(out, `Restored ${out.restored.length} files from before run ${out.run_id}.${edited}${out.batch_id ? ` Batch ${out.batch_id} can be merged again.` : ''}`);
   return 0;
 }

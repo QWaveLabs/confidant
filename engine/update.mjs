@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireLock } from './lib/lock.mjs';
 import { enabledSources } from './lib/sources.mjs';
-import { extractSource } from './extract/index.mjs';
+import { extractSource, purgeExcluded } from './extract/index.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +32,8 @@ async function runExtract(ctx) {
       results.push({ id: src.id, ok: false, reason: err.message, reason_code: err.reason_code, message: err.localized, needsFullDiskAccess: !!err.needsFullDiskAccess });
     }
   }
+  // Exclusions added since the last update also clear what is already stored.
+  await purgeExcluded(ctx);
   return results;
 }
 

@@ -92,13 +92,13 @@ test('wake and login-item never touch the system unless --yes is passed, and val
 
   await run({ _: ['wake'], time: '06:45', yes: true }, ctx, { exec });
   assert.equal(calls.length, 2, 'runs osascript, then verifies with pmset -g sched');
-  assert.equal(calls[0][0], 'osascript');
+  assert.equal(calls[0][0], '/usr/bin/osascript');
   assert.match(calls[0][1][1], /pmset repeat wakeorpoweron MTWRFSU 06:30:00/, '15 minutes before the brief time');
 
   calls.length = 0;
   await run({ _: ['login-item'], yes: true }, ctx, { exec });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], 'osascript');
+  assert.equal(calls[0][0], '/usr/bin/osascript');
   assert.match(calls[0][1][1], /System Events/);
 
   assert.throws(() => buildWakeCommand('not a time'), /Refusing to build a wake command/);

@@ -17,9 +17,18 @@ async function loadModule(rel) {
   return existsSync(path) ? import(path) : null;
 }
 
+// Fails closed: without the privacy filter nothing is stored.
 async function loadPrivacy() {
   const mod = await loadModule('./privacy.mjs');
-  return mod?.filterRecord ? mod : { filterRecord: () => ({ keep: true }) };
+  if (!mod?.filterRecord) throw new Error('The privacy filter (engine/privacy.mjs) is missing, so nothing was stored.');
+  return mod;
+}
+
+// Drops stored records that exclusions added since the last run now cover.
+export async function purgeExcluded(ctx) {
+  if (ctx.dryRun) return null;
+  const privacy = await loadPrivacy();
+  return privacy.purgeExcluded ? privacy.purgeExcluded(ctx) : null;
 }
 
 export async function probeSources(ctx, ids) {
@@ -95,6 +104,7 @@ export async function run(args, ctx) {
       results.push({ id, ok: false, reason: err.message, reason_code: err.reason_code, message: err.localized, needsFullDiskAccess: !!err.needsFullDiskAccess });
     }
   }
-  ctx.log.out({ results }, (v) => v.results.map((r) => (r.ok ? `${r.id}: +${r.inserted} new, ${r.updated} updated, ${r.excluded} left out` : `${r.id}: skipped (${r.reason})`)).join('\n'));
+  const purged = await purgeExcluded(ctx);
+  ctx.log.out({ results, purged }, (v) => v.results.map((r) => (r.ok ? `${r.id}: +${r.inserted} new, ${r.updated} updated, ${r.excluded} left out` : `${r.id}: skipped (${r.reason})`)).join('\n'));
   return results.some((r) => !r.ok && r.reason !== 'not built') ? 5 : 0;
 }
