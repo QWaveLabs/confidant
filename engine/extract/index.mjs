@@ -33,7 +33,7 @@ export async function probeSources(ctx, ids) {
     try {
       out.push({ id: src.id, method: src.method, ...(await mod.probe(ctx)) });
     } catch (err) {
-      out.push({ id: src.id, method: src.method, ok: false, reason: err.message, needsFullDiskAccess: !!err.needsFullDiskAccess });
+      out.push({ id: src.id, method: src.method, ok: false, reason: err.message, reason_code: err.reason_code, message: err.localized, needsFullDiskAccess: !!err.needsFullDiskAccess });
     }
   }
   return out;
@@ -92,7 +92,7 @@ export async function run(args, ctx) {
     try {
       results.push(await extractSource(ctx, src, { limit: args.limit ? Number(args.limit) : undefined, full: !!args.full, maxPages: args.maxPages ? Number(args.maxPages) : Infinity }));
     } catch (err) {
-      results.push({ id, ok: false, reason: err.message, needsFullDiskAccess: !!err.needsFullDiskAccess });
+      results.push({ id, ok: false, reason: err.message, reason_code: err.reason_code, message: err.localized, needsFullDiskAccess: !!err.needsFullDiskAccess });
     }
   }
   ctx.log.out({ results }, (v) => v.results.map((r) => (r.ok ? `${r.id}: +${r.inserted} new, ${r.updated} updated, ${r.excluded} left out` : `${r.id}: skipped (${r.reason})`)).join('\n'));
