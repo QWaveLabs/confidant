@@ -160,6 +160,9 @@ async function install(language) {
   const vaultOut = await ok(null, ['init', '--role', 'founder', '--language', language, '--brief-time', '07:30', '--timezone', 'America/New_York', '--owner-name', OWNER.name, '--owner-email', OWNER.email]);
   const vault = vaultOut.vault;
   for (const id of SOURCES) await ok(vault, ['config', 'source', '--id', id, '--status', 'connected']);
+  // Exclusions are reviewed before anything is read; extract refuses until then.
+  await ok(vault, ['chats']);
+  await ok(vault, ['config', 'phase', 'exclusions']);
   const extracted = await ok(vault, ['extract']);
   for (const id of SOURCES) {
     const r = extracted.results.find((x) => x.id === id);

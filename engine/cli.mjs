@@ -13,6 +13,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const COMMANDS = {
   doctor: { module: './doctor.mjs', needsVault: false, help: 'Check this Mac: runtime, Full Disk Access, apps, keys, Obsidian' },
   init: { module: './init.mjs', needsVault: false, help: 'Create a new vault (never reuses an existing second brain)' },
+  chats: { module: './chats.mjs', needsVault: false, help: 'Group chats and most messaged people (names and counts only), to choose exclusions before extracting' },
   extract: { module: './extract/index.mjs', needsVault: true, help: 'Pull new records from local and API sources' },
   ingest: { module: './ingest.mjs', needsVault: true, help: 'Store records Codex read through a connected app' },
   apps: { module: './apps.mjs', needsVault: true, help: 'Connected Codex apps to refresh this run, with their recipes and saved cursors' },

@@ -10,12 +10,19 @@ A person pastes one prompt into Codex (inside the ChatGPT desktop app on a Mac).
 Codex clones this repo (pinned tag + SHA) and follows `AGENTS.md` and
 `.agents/skills/confidant-install/SKILL.md`:
 
-1. It asks one setup message: role, brief time, exclusions and language.
-   A pasted "My blueprint:" line fills these in.
+1. Privacy first: where data goes, turning off ChatGPT's "Improve the
+   model for everyone", and that exclusions come before any reading
+   (recorded with `config privacy --training off|workspace|on`). Then one
+   setup message: role, brief time, exclusions and language. A pasted "My
+   blueprint:" line fills these in.
 2. It connects everything: `extract --probe` finds every source already on
    the Mac, then one list covers Full Disk Access and the plugins (Gmail,
    Google Calendar, Google Drive, Slack, Plaud) before a single ChatGPT
    restart, then API keys. Each step is recorded with `config phase`.
+   Then `confidant chats` (group chats and most messaged people, names and
+   counts only) lets the person pick exclusions, applied with `init
+   --resume --exclude-*` and recorded as `config phase exclusions`.
+   During an install, `extract` and `ingest` refuse to run before that.
 3. It extracts everything: local and API sources go through deterministic
    code, and the Codex apps go through `confidant ingest`.
 4. It sorts: `identity`, then `dossiers`, then `batch next`. Codex subagents
@@ -378,7 +385,8 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 ## State (.confidant/state.json)
 
 ```
-{ phase: start|setup|connect|extract|sort|tasks|finish|done, history: [{phase, at}],   // last finished step, set by `config phase <name>`
+{ phase: start|setup|connect|exclusions|extract|sort|tasks|finish|done, history: [{phase, at}],   // last finished step, set by `config phase <name>`
+  privacy: { training: off|workspace|on, at },   // the person's answer, `config privacy`
   tasks: [{ key, name, rrule, automation_id, created_at }],
   backlog: { remaining_batches, oldest_sorted, done },
   lastUpdate: { at, inserted, merged }, welcome: { path, at }, install: { started_at, finished_at } }

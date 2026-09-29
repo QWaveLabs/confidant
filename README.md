@@ -30,31 +30,40 @@ left off, from `.confidant/state.json` in their vault.
 
 ## How the install works
 
-1. **Setup.** One message: role, brief time, language, what to never touch.
-2. **Connect.** `bin/confidant extract --probe` finds every source already
+1. **Privacy first.** Before anything else, the person hears where their
+   data goes (their Mac, and OpenAI's models through their own ChatGPT
+   account), turns off "Improve the model for everyone" in ChatGPT's Data
+   controls, and learns they choose what stays out before anything is
+   read. `bin/confidant config privacy` records their answer.
+2. **Setup.** One message: role, brief time, language, what to never touch.
+3. **Connect.** `bin/confidant extract --probe` finds every source already
    on the Mac and connects it. Then one list covers Full Disk Access and the
    plugins for Gmail, Google Calendar, Google Drive, Slack and Plaud, done
    before a single ChatGPT restart, then API keys for whichever notetakers
    the person uses. Nothing is recorded as connected until it actually
    reads.
-3. **Extract.** Local and API sources go through deterministic code
+4. **Leave people and chats out.** `bin/confidant chats` lists their group
+   chats and most messaged people (names and counts, never content) so they
+   pick what to exclude. `extract` and `ingest` refuse to run during an
+   install until this step is recorded.
+5. **Extract.** Local and API sources go through deterministic code
    (`bin/confidant extract`); connected Codex apps go through
    `bin/confidant ingest`, guided by the recipes in
    `.agents/skills/confidant-install/recipes/`. The 3-hour Brain Update
    refreshes those apps too (`bin/confidant apps` lists them with their
    saved cursors), so they never go stale after the install.
-4. **Sort.** `.agents/skills/confidant-sort/SKILL.md` builds identity,
+6. **Sort.** `.agents/skills/confidant-sort/SKILL.md` builds identity,
    dossiers, and notes for the most recent 60 days. The rest of the person's
    history keeps filling in afterward, newest first and all the way back, roughly every 3 hours.
-5. **Tasks.** Nine standalone scheduled tasks are created with the ChatGPT
+7. **Tasks.** Nine standalone scheduled tasks are created with the ChatGPT
    app's own `automation_update` tool on the vault's own project, then
    checked with `bin/confidant tasks verify`. Every run is its own chat in
    Scheduled, and that chat shows the full brief, not just a note that it
    was saved to Obsidian.
-6. **Config.** The vault gets its own sandboxed `.codex/config.toml`
+8. **Config.** The vault gets its own sandboxed `.codex/config.toml`
    (workspace-write, no browsing, no destructive app tools), the project is
    marked trusted, and an optional wake schedule and login item are set up.
-7. **Finish.** `bin/confidant welcome` writes `Confidant Guide.html`
+9. **Finish.** `bin/confidant welcome` writes `Confidant Guide.html`
    (`Guía de Confidant.html` in Spanish) into the vault, and Codex reports
    plainly what's connected, what's still backfilling, and what's skipped or
    blocked.

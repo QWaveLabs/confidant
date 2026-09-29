@@ -58,7 +58,7 @@
       "neverSees": "What it never sees",
       "neverSeesEmpty": "You have not excluded anything specific yet. Ask Codex to update your setup any time to add banking, health, family chats, or anyone else you want left out.",
       "whereItLives": "Where your data lives",
-      "whereItLivesBody": "Your notes live in a plain folder on this Mac, at {vault}. To do its work, Codex sends the context it needs to OpenAI's models through your own ChatGPT account. You control that account's own data settings from inside ChatGPT.",
+      "whereItLivesBody": "Your notes live in a plain folder on this Mac, at {vault}. To do its work, Codex sends the context it needs to OpenAI's models through your own ChatGPT account. Keep \"Improve the model for everyone\" turned off in ChatGPT's Settings, under Data controls, so those chats are not used to train OpenAI's models (Business, Enterprise and Edu workspaces are off by default), and avoid rating the scheduled runs with a thumbs up or down, which can share that conversation for training.",
       "control": "Your controls",
       "controlBody": "Every source stays read-only: Confidant never writes back to Gmail, Slack, or anywhere else it reads from. You can disconnect a source, add an exclusion, or change what it never sees at any time by asking Codex to update your setup."
     },

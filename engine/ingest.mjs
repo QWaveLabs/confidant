@@ -43,6 +43,7 @@ import { readFileSync } from 'node:fs';
 import { check } from './lib/schema.mjs';
 import { emailHandle, nameHandle, slackHandle } from './lib/handles.mjs';
 import { toIso, fromUnix } from './lib/time.mjs';
+import { exclusionsPending, EXCLUSIONS_FIRST } from './lib/f-install.mjs';
 
 // Fails closed: without the privacy filter nothing is stored.
 async function loadPrivacy() {
@@ -326,6 +327,10 @@ export async function run(args, ctx) {
   if (!source || !MAPPERS[source]) {
     ctx.log.error(`--source must be one of ${Object.keys(MAPPERS).join(', ')}.`);
     return 2;
+  }
+  if (exclusionsPending(ctx.state)) {
+    ctx.log.error(EXCLUSIONS_FIRST);
+    return 7;
   }
   const filePath = args.file;
   if (!filePath) {

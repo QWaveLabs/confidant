@@ -3,6 +3,12 @@
 Read the person's own DMs and the channels they are already in, through the
 Codex Slack app. Do not join a new channel.
 
+Before reading, check the person's exclusions in `.confidant/config.json`
+(`exclusions.people`, `.chats`, `.handles`, `.keywords`). Skip any DM with an
+excluded person and any channel whose name is excluded, and never open it;
+ingest also filters what it stores, but an excluded conversation should
+never be read at all.
+
 `confidant` below means `bin/confidant` during the install (run from the
 repo) and the `command` path that `confidant apps --json` prints during a
 scheduled run (inside the vault it is `.confidant/engine/bin/confidant`).

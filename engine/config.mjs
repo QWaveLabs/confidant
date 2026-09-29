@@ -1,4 +1,4 @@
-// `confidant config <sandbox|trust|wake|login-item|source|phase> ...`
+// `confidant config <sandbox|trust|wake|login-item|source|phase|privacy> ...`
 // Sandbox, trust, wake schedule and login item setup, plus recording a
 // source's real status in config.json. Every subcommand supports --dry-run
 // and prints exactly what it will change before it changes anything.
@@ -10,6 +10,7 @@ import { HOME, expandHome } from './lib/paths.mjs';
 import { getSource } from './lib/sources.mjs';
 import { assertValid } from './lib/schema.mjs';
 import { buildSandboxToml, hasTrustedProject, appendTrustedProject } from './lib/e-toml.mjs';
+import { PHASES } from './lib/f-install.mjs';
 
 const STATUSES = ['connected', 'partial', 'skipped', 'blocked', 'unused'];
 
@@ -153,8 +154,6 @@ function runSource(args, ctx) {
 
 // Records the install step just finished, so a resumed install (after the
 // Full Disk Access relaunch, or a usage limit) knows where to pick up.
-export const PHASES = ['start', 'setup', 'connect', 'extract', 'sort', 'tasks', 'finish', 'done'];
-
 function runPhase(args, ctx) {
   const phase = args._[1];
   if (!PHASES.includes(phase)) {
@@ -171,6 +170,29 @@ function runPhase(args, ctx) {
   return 0;
 }
 
+// --- privacy ------------------------------------------------------------
+
+// What the person said about ChatGPT's "Improve the model for everyone"
+// setting: off (they turned it off), workspace (a Business, Enterprise or
+// Edu workspace, not trained on by default), or on (they chose to keep it).
+// Only their answer is recorded; nothing here can read the setting itself.
+const TRAINING = ['off', 'workspace', 'on'];
+
+function runPrivacy(args, ctx) {
+  const training = args.training;
+  if (!TRAINING.includes(training)) {
+    ctx.log.error(`Use: confidant config privacy --training <${TRAINING.join('|')}>`);
+    return 2;
+  }
+  const privacy = { training, at: new Date().toISOString() };
+  if (!ctx.dryRun) {
+    ctx.state = { ...(ctx.state ?? {}), privacy };
+    ctx.saveState();
+  }
+  ctx.log.out(privacy, () => `Model training setting recorded: ${training}\n`);
+  return 0;
+}
+
 export async function run(args, ctx, deps = {}) {
   const sub = args._[0];
   switch (sub) {
@@ -180,8 +202,9 @@ export async function run(args, ctx, deps = {}) {
     case 'login-item': return runLoginItem(args, ctx, deps);
     case 'source': return runSource(args, ctx);
     case 'phase': return runPhase(args, ctx);
+    case 'privacy': return runPrivacy(args, ctx);
     default:
-      ctx.log.error(`Unknown "confidant config ${sub ?? ''}". Use sandbox, trust, wake, login-item, source or phase.`);
+      ctx.log.error(`Unknown "confidant config ${sub ?? ''}". Use sandbox, trust, wake, login-item, source, phase or privacy.`);
       return 2;
   }
 }

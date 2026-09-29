@@ -12,8 +12,10 @@ placeholders for you and writes the result to `dist/customer-prompt.txt`.
 > commands. Ask me only one question at a time, and only when you need my
 > choice: a sign-in, a permission, or something about how I work. Keep every
 > source read-only, and never send, post or reply to anything on my
-> behalf. Before you finish, tell me plainly what's connected, what's
-> still filling in, and what's skipped or blocked.
+> behalf. Before you read anything, walk me through the privacy settings,
+> including turning off model training, and let me choose which people and
+> group chats to leave out. Before you finish, tell me plainly what's
+> connected, what's still filling in, and what's skipped or blocked.
 >
 > My blueprint: role=founder, brief=06:45, language=en, never=banking, health
 
@@ -35,4 +37,5 @@ without touching their notes.
 > {SHA}. If it isn't, stop and tell me instead of continuing. Then open the
 > folder and follow its AGENTS.md instructions to upgrade my second brain.
 > Keep every source read-only, never send, post or reply to anything on my
-> behalf, and tell me plainly what changed when you're done.
+> behalf, check my privacy settings with me, and tell me plainly what
+> changed when you're done.

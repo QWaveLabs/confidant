@@ -54,7 +54,43 @@ way (cloning this repo, trusting it so `bin/confidant` can run without
 asking every time, creating a project for their vault, one prompt per
 scheduled agent you create, and one for the wake schedule if they want it).
 Also tell them none of these approvals sends, posts or replies to anyone,
-so they should decline any prompt that would. Then move to **Setup**.
+so they should decline any prompt that would. Then move to **Privacy
+first**.
+
+## Privacy first
+
+Before Setup, and before anything is read, make sure the person
+understands where their information goes. One short, plain message:
+
+- **Where it lives.** Their second brain is a plain folder on this Mac.
+  Confidant, the company, never receives their messages, emails or notes.
+- **Who reads it.** To sort their history and write their briefs, the
+  ChatGPT app sends what it reads to OpenAI's models through their own
+  ChatGPT account. That is why the next two points matter.
+- **Turn off model training.** In the ChatGPT app: Settings, then Data
+  controls, then turn off "Improve the model for everyone" (in Spanish:
+  Configuración, Controles de datos, "Mejorar el modelo para todos"). On a
+  personal plan (Free, Go, Plus, Pro) this one switch also covers Codex and
+  every scheduled task, and their new chats are no longer used to train
+  OpenAI's models. On a ChatGPT Business, Enterprise or Edu workspace,
+  training is already off by default. One more thing: rating a response
+  with a thumbs up or down can still send that whole conversation to OpenAI
+  for training, so it's best not to rate the scheduled runs.
+- **They decide what stays out, before anything is read.** Next they'll
+  name categories, people and group chats to leave out, and once the Mac is
+  readable they'll see a list of their group chats and the people they
+  message most to pick from. Messages on this Mac (iMessage, WhatsApp,
+  Mail) from anything they exclude are filtered out in code, before any AI
+  sees them, and never stored. For apps read through ChatGPT (Gmail,
+  Slack), Codex leaves excluded people and chats out of its searches.
+- **Read-only.** Nothing is ever sent, posted, replied to or deleted in any
+  of their accounts.
+
+Ask them to confirm the training switch is off (or that they're on a
+Business, Enterprise or Edu workspace) before you continue. If they choose
+to keep it on after hearing this, respect that and continue. Remember their
+answer and record it right after `init` in Setup, since the vault doesn't
+exist yet: `bin/confidant config privacy --training off|workspace|on`.
 
 ## Setup (`config phase setup`)
 
@@ -65,8 +101,11 @@ Ask **one** message that gathers all of this together:
 - what time they want their morning brief (default 06:45);
 - their language, en or es;
 - what it should never see: default to banking, health, and passwords, and
-  ask them to name any family chats or specific people or clients (for
-  example someone under an NDA) to leave out completely; and
+  ask them to name any family chats, group chats, specific people or
+  clients (for example someone under an NDA) to leave out completely. Tell
+  them this is decided now, before anything is read, and that they'll also
+  get a list of their group chats and most messaged people to pick from
+  before anything is extracted; and
 - which tools they use for work, in their own words: email (and which
   accounts), calendar, Slack, WhatsApp, a notetaker (Fathom, Fireflies,
   Granola, Read.ai, Grain, tl;dv, Zoom, Google Meet notes, Plaud), voice
@@ -86,7 +125,9 @@ email addresses, keywords, or whole accounts they name go in
 <HH:MM> --language en|es`, adding one repeatable flag per item they named:
 `--exclude-category`, `--exclude-person`, `--exclude-chat`,
 `--exclude-domain`, `--exclude-handle`, `--exclude-keyword`, or
-`--exclude-email-account`. Keep their list of tools for Connect, and the
+`--exclude-email-account`. Then record their training answer from
+**Privacy first** with `bin/confidant config privacy --training
+off|workspace|on`. Keep their list of tools for Connect, and the
 "blueprint" line's values for later, since they also shape the scheduled
 tasks.
 
@@ -94,7 +135,9 @@ If the person names a new exclusion later, after the vault already exists,
 run `bin/confidant init --role <role> --resume` again with just the new
 `--exclude-*` flags: it unions them into the existing
 `.confidant/config.json`'s `exclusions` and touches nothing else in the
-vault.
+vault. From then on it is never read, and the next update removes what was
+already stored about it from Confidant's database. Notes already written
+about that person stay until they delete them; say so plainly.
 
 ## Connect (`config phase connect`)
 
@@ -163,9 +206,11 @@ plugins needed), skip the restart and carry on.
 1. Run `bin/confidant extract --probe --json` again, and record every
    source that now probes `ok` as `connected`.
 2. For each plugin they installed, confirm you can see its tools in this
-   chat, then make one small read (list one recent email, one calendar
-   event, one file in the "Google Meet" folder, one Slack conversation).
-   Only after that read works, record it:
+   chat, then make one small read that returns no message content (the
+   connected Gmail address, the list of calendars, the "Google Meet"
+   folder's name, the names of their Slack channels). Nothing is read
+   from any of them until the exclusions step below is done. Only after
+   that read works, record it:
    `bin/confidant config source --id gmail|gcal|drive|slack|plaud --status connected`.
    If the tools aren't there, the plugin isn't installed or signed in:
    record `blocked` with a note, and tell them plainly what to do.
@@ -182,6 +227,40 @@ person needs to do something else first, `skipped` when they chose not to,
 and `unused` for tools they don't have. Never mark a source `connected`
 before it actually is. Finish this step with one short list, in their
 language, of everything connected and anything still blocked and why.
+
+## Leave people and chats out (`config phase exclusions`)
+
+Nothing is read until this step is done: during an install, `extract` and
+`ingest` refuse to run until it is recorded.
+
+1. Run `bin/confidant chats --json`. It lists their group chats and the
+   people they message most, from iMessage and WhatsApp on this Mac: names,
+   message counts and the date of the last message only, never a word of
+   any message.
+2. Show both lists in one message, numbered, most active first, and ask
+   which to leave out completely. Offer the usual ones without presuming:
+   family and partner chats, close friends, personal groups (school
+   parents, sports, neighbors), anyone under an NDA, medical or legal
+   contacts. Remind them what they already excluded in Setup. Leaving
+   something out means it is never read, never sorted and never appears in
+   a brief; they can change it later.
+3. For each row they pick, pass its `exclude` flags exactly as listed to
+   `bin/confidant init --resume --vault <vault>`, all in one call. For
+   anything not in the lists (a work email thread, a Slack channel, a
+   whole email account, a domain, a topic), use `--exclude-person`,
+   `--exclude-chat`, `--exclude-email-account`, `--exclude-domain` or
+   `--exclude-keyword`.
+4. Read back, in one short message, everything that will be left out, and
+   let them adjust. When they're happy, or say nothing else needs leaving
+   out, record it with `bin/confidant config phase exclusions`.
+
+If `chats` reports iMessage and WhatsApp aren't readable (no Full Disk
+Access, or they don't use them), ask about people and group chats by name
+instead, then record the step the same way.
+
+When reading through Slack in the next step, skip any DM or channel whose
+name, or other person, is in their exclusions (`.confidant/config.json`,
+`exclusions`), and never open it.
 
 ## Extract (`config phase extract`)
 
@@ -286,6 +365,8 @@ spec with `bin/confidant tasks spec --include-finish --json`) the same way.
    `obsidian://open?path=<url-encoded vault path>`.
 3. Send one final chat message covering, plainly:
    - what's connected, with real counts, and what's still backfilling;
+   - privacy: the model training setting as they confirmed it, and what
+     they chose to leave out;
    - the scheduled tasks `tasks verify` reported `ok` (the six agents plus
      Health Check, Brain Cleanup and Confidant Check-in) and when they run;
    - anything skipped or blocked, and why;
@@ -310,7 +391,8 @@ continue with the one after it:
 |---|---|
 | `start` or missing | Setup |
 | `setup` | Connect (step 3 if they just restarted for Full Disk Access or plugins) |
-| `connect` | Extract |
+| `connect` | Leave people and chats out |
+| `exclusions` | Extract |
 | `extract` | Sort |
 | `sort` | Tasks |
 | `tasks` | Config |
@@ -349,7 +431,12 @@ Confidant's own engine and brings every scheduled task up to date.
 5. Run `tasks verify` again, then, if they use Gmail, Google Calendar,
    Google Drive, Slack or Plaud and those aren't recorded yet, walk through
    **Connect** steps 2 and 3 for just those.
-6. Tell them, in two or three plain sentences, what changed: every
+6. **Privacy check.** If `.confidant/state.json` has no `privacy` entry,
+   walk them through the training switch from **Privacy first** and record
+   their answer. Then run `bin/confidant chats --json` and offer the
+   **Leave people and chats out** review, so they can add anything they
+   missed the first time.
+7. Tell them, in two or three plain sentences, what changed: every
    scheduled run now shows its full brief in Scheduled, the connected apps
    refresh every 3 hours, and anything still blocked.
 

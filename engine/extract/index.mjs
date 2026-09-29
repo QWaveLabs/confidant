@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SOURCES, getSource, enabledSources } from '../lib/sources.mjs';
 import { check } from '../lib/schema.mjs';
+import { exclusionsPending, EXCLUSIONS_FIRST } from '../lib/f-install.mjs';
 
 const ENGINE = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -96,6 +97,10 @@ export async function run(args, ctx) {
     const results = await probeSources(ctx, args.source ? ids : SOURCES.map((s) => s.id));
     ctx.log.out({ probes: results }, (v) => v.probes.map((p) => `${p.ok ? 'ok  ' : 'no  '} ${p.id}${p.reason ? `: ${p.reason}` : ''}`).join('\n'));
     return 0;
+  }
+  if (exclusionsPending(ctx.state)) {
+    ctx.log.error(EXCLUSIONS_FIRST);
+    return 7;
   }
   const results = [];
   for (const id of ids) {

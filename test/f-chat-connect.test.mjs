@@ -16,18 +16,19 @@ import { verifyTasks, run as runTasks } from '../engine/tasks.mjs';
 import { connectedApps, run as runApps } from '../engine/apps.mjs';
 import { run as runIngest } from '../engine/ingest.mjs';
 import { run as runConfig } from '../engine/config.mjs';
+import { run as runExtract } from '../engine/extract/index.mjs';
 import { buildHealth } from '../engine/health.mjs';
 import { fakeCtx } from './c-shared.test.mjs';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const NOW = new Date('2026-09-30T14:00:00.000Z');
 
-function vaultCtx({ sources = {}, tasks = [] } = {}) {
+function vaultCtx({ sources = {}, tasks = [], phase = 'sort', lastUpdate = true } = {}) {
   const vault = mkdtempSync(join(tmpdir(), 'cf-chat-'));
   const paths = statePaths(vault);
   mkdirSync(paths.root, { recursive: true });
   writeJson(paths.config, { version: 1, vault, language: 'en', role: 'founder', briefTime: '06:45', timezone: 'America/New_York', sources });
-  writeJson(paths.state, { phase: 'sort', history: [], tasks, backlog: { remaining_batches: 0, oldest_sorted: null, done: true }, lastUpdate: { at: '2026-09-30T12:00:00.000Z', inserted: 0, merged: 0 } });
+  writeJson(paths.state, { phase, history: [], tasks, backlog: { remaining_batches: 0, oldest_sorted: null, done: true }, ...(lastUpdate ? { lastUpdate: { at: '2026-09-30T12:00:00.000Z', inserted: 0, merged: 0 } } : {}) });
   return createContext({ vault, now: NOW, json: true, quiet: true });
 }
 
@@ -193,6 +194,35 @@ test('config phase records the last finished install step, and refuses a made-up
   ctx.close();
 });
 
+// ---------- privacy: exclusions before anything is read ----------
+
+test('during an install, extract and ingest refuse until the exclusions review is recorded', async () => {
+  const ctx = vaultCtx({ phase: 'connect', lastUpdate: false });
+  const errors = [];
+  ctx.log.error = (m) => errors.push(m);
+  assert.equal(await runExtract({ _: [] }, ctx), 7);
+  assert.equal(await runIngest({ source: 'gmail', file: '-' }, ctx), 7);
+  assert.match(errors[0], /confidant chats/);
+  assert.equal(await runExtract({ _: [], probe: true }, ctx), 0, 'probing reads no content and is allowed');
+  await runConfig({ _: ['phase', 'exclusions'] }, ctx);
+  assert.equal(await runExtract({ _: [] }, ctx), 0);
+  ctx.close();
+});
+
+test('an older vault that already ran a Brain Update is never held back', async () => {
+  const ctx = vaultCtx({ phase: 'setup', lastUpdate: true });
+  assert.equal(await runExtract({ _: [] }, ctx), 0);
+  ctx.close();
+});
+
+test('config privacy records the model training answer, and only a known one', async () => {
+  const ctx = vaultCtx();
+  assert.equal(await runConfig({ _: ['privacy'], training: 'off' }, ctx), 0);
+  assert.equal(readJson(ctx.paths.state).privacy.training, 'off');
+  assert.equal(await runConfig({ _: ['privacy'], training: 'maybe' }, ctx), 2);
+  ctx.close();
+});
+
 // ---------- prompt, recipe and skill contracts ----------
 
 test('every task prompt ends its run with one ::inbox-item line and shows the result in chat', () => {
@@ -232,4 +262,18 @@ test('the install skill probes every source, and creates standalone tasks on the
   assert.match(text, /tasks verify --json/);
   assert.match(text, /config phase/);
   assert.doesNotMatch(text, /no model pinned/);
+});
+
+test('the install puts privacy first and exclusions before anything is read', () => {
+  const text = readFileSync(join(ROOT, '.agents/skills/confidant-install/SKILL.md'), 'utf8');
+  const at = (s) => text.indexOf(s);
+  assert.ok(at('## Privacy first') > 0 && at('## Privacy first') < at('## Setup'));
+  assert.match(text, /Improve the model for everyone/);
+  assert.match(text, /Mejorar el modelo para todos/);
+  assert.match(text, /config privacy --training/);
+  assert.ok(at('## Leave people and chats out') > at('## Connect') && at('## Leave people and chats out') < at('## Extract'));
+  assert.match(text, /confidant chats --json/);
+  const prompt = readFileSync(join(ROOT, 'CUSTOMER_PROMPT.md'), 'utf8');
+  assert.match(prompt, /turning off model training/);
+  assert.match(prompt, /choose which people and\n> group chats to leave out/);
 });
