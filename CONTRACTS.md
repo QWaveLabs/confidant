@@ -273,7 +273,7 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   - decision: `date, project, company, decided_by[]`
   - commitment: `direction (i_owe|owed_to_me|delegated), counterpart ("[[Name]]"), company, project, due, status (open|done|dropped), date, fingerprint`
   - idea: `date, status`
-  - opportunity: `type, status (open|won|lost|stale), counterpart, company, value, date, next_step`
+  - opportunity: `opportunity_type, status (open|won|lost|stale), counterpart, company, value, date, next_step` (`type` is always the note kind, so the category is `opportunity_type`)
   - knowledge: `date`
 - Dated bullets in bodies look like `- 2026-09-01, text. _(iMessage)_`. Newest
   bullets go first, under `## Timeline`.
@@ -292,7 +292,7 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
   - no model pinned
 - After each create it runs `confidant tasks record --key <k> --id <automation id>`.
 - Task keys:
-  - `brain_update`: "Commitment Tracker + Brain Update", every 3 hours on the hour
+  - `brain_update`: "Commitment Tracker + Brain Update", every 3 hours at :10 (00:10, 03:10, 06:10 ... so it never collides with tasks on the hour)
   - `opportunity_scanner`: weekdays, brief time minus 15 minutes
   - `morning_brief`: "Morning Chief of Staff", weekdays at brief time
   - `meeting_prep`: weekdays at :30, scaled by meetingsPerWeek
