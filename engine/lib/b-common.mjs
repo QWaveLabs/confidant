@@ -146,20 +146,24 @@ export function takeLock(ctx, name = 'vault', { timeoutMs = 120000 } = {}) {
 
 // ---------- privacy scrub (Unit A), with a pass-through fallback ----------
 
-let scrubCache = null;
-export async function loadScrub() {
-  if (scrubCache) return scrubCache;
+const asText = (fn) => (s) => {
+  const out = fn(s);
+  return typeof out === 'string' ? out : (out?.text ?? s);
+};
+
+let moduleScrub = null;
+// ctx.scrubText (same signature as privacy.scrubText) wins when set, so a
+// caller or a test can decide what "scrubbed" means for one context. The
+// module lookup is cached; a ctx override never is.
+export async function loadScrub(ctx) {
+  if (typeof ctx?.scrubText === 'function') return asText(ctx.scrubText);
+  if (moduleScrub) return moduleScrub;
   let fn = (s) => s;
   try {
     const mod = await import('../privacy.mjs');
-    if (typeof mod.scrubText === 'function') {
-      fn = (s) => {
-        const out = mod.scrubText(s);
-        return typeof out === 'string' ? out : (out?.text ?? s);
-      };
-    }
+    if (typeof mod.scrubText === 'function') fn = asText(mod.scrubText);
   } catch {}
-  scrubCache = fn;
+  moduleScrub = fn;
   return fn;
 }
 

@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildIdentity } from '../engine/identity.mjs';
 import { planBatches } from '../engine/batch.mjs';
 import { mergeBatch, run as mergeRun } from '../engine/merge.mjs';
@@ -160,7 +161,8 @@ test('mocs keeps a view the person customized and links the latest brief', async
   assert.ok(note(ctx, 'People/People.md').includes('### Other notes\n- [[My own list]]'));
 });
 
-test('merge scrubs private details through privacy.scrubText', async () => {
+const PRIVACY = join(dirname(fileURLToPath(import.meta.url)), '..', 'engine', 'privacy.mjs');
+test('with the real privacy module, a card number never reaches a note', { skip: !existsSync(PRIVACY) && 'engine/privacy.mjs is not present' }, async () => {
   const { ctx, byKind } = await setup();
   await mergeWith(ctx, byKind.people, {
     people: [{ name: 'Ana Ruiz', relationship: 'Pays with card 4111 1111 1111 1111.', bullets: [{ date: '2026-09-22', text: 'Sent card 4111 1111 1111 1111 for the deposit', source_refs: ['imessage:a1'] }] }],
@@ -168,4 +170,14 @@ test('merge scrubs private details through privacy.scrubText', async () => {
   const ana = note(ctx, 'People/Ana Ruiz.md');
   assert.ok(!ana.includes('4111'));
   assert.ok(ana.includes('Sent card [card] for the deposit.'));
+});
+
+test('ctx.scrubText decides what is scrubbed for that context only', async () => {
+  const { ctx, byKind } = await setup();
+  ctx.scrubText = (text) => ({ text: text.replace(/pilot/gi, '[redacted]'), redactions: ['custom'] });
+  await mergeWith(ctx, byKind.people, { people: [{ name: 'Ana Ruiz', bullets: [{ date: '2026-09-22', text: 'Asked about the pilot budget', source_refs: ['imessage:a1'] }] }] });
+  assert.ok(note(ctx, 'People/Ana Ruiz.md').includes('Asked about the [redacted] budget.'));
+  const other = await setup();
+  await mergeWith(other.ctx, other.byKind.people, { people: [{ name: 'Ana Ruiz', bullets: [{ date: '2026-09-22', text: 'Asked about the pilot budget', source_refs: ['imessage:a1'] }] }] });
+  assert.ok(note(other.ctx, 'People/Ana Ruiz.md').includes('Asked about the pilot budget.'), 'another context is not affected');
 });

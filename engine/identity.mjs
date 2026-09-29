@@ -490,6 +490,8 @@ function computeIdentity(ctx) {
     let kind = 'person';
     if (real.length && real.every((h) => isShortCode(h) || isAutomatedEmail(h))) kind = 'system';
     else if (a.business > 0 && !card && a.outbound === 0) kind = 'system';
+    // Only ever a missed call from a number not in Contacts: almost always spam.
+    else if (!card && a.calls > 0 && a.answered === 0 && a.inbound + a.outbound + a.meetings === 0) kind = 'system';
     else if (!card && a.bulk > 0 && a.bulk * 2 >= a.emails && a.outbound === 0) kind = 'system';
     else if (!card && a.other === 0 && a.outbound === 0 && a.inbound >= 10) kind = 'system';
     if (members.some((h) => excludedHandles.has(h)) || excludedNames.has(normalizeName(name)) || aliases.some((x) => excludedNames.has(normalizeName(x)))) kind = 'excluded';

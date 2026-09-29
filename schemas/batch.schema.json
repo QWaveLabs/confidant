@@ -11,7 +11,7 @@
     "created_at": { "type": "string", "format": "date-time" },
     "owner": { "type": "object" },
     "persona": { "type": "object" },
-    "instructions": { "type": "string", "$comment": "repo-relative path of the prompt to follow" },
+    "instructions": { "type": "string", "$comment": "absolute path of the prompt to follow (prompts/sort.md in the engine that planned the batch)" },
     "known": { "type": "object", "$comment": "existing note names the sorter should reuse: people, companies, projects" },
     "items": { "type": "array" },
     "est_tokens": { "type": "integer" },

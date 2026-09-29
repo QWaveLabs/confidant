@@ -259,7 +259,7 @@ const maskHandle = (h) => {
 
 async function identityItems(ctx, identity, ambiguities) {
   const db = bTables(ctx.store);
-  const scrub = await loadScrub();
+  const scrub = await loadScrub(ctx);
   const samplesFor = (p) => {
     const hs = p.handles.filter((h) => !h.startsWith('name:')).slice(0, 20);
     if (!hs.length) return [];

@@ -498,7 +498,7 @@ class Cleanup {
 async function open(ctx, { scrub } = {}) {
   const identity = loadIdentity(ctx, { build: true });
   const w = new NoteWriter(ctx, { identity, kind: 'cleanup' });
-  const fn = scrub ?? (await loadScrub());
+  const fn = scrub ?? (await loadScrub(ctx));
   return new Cleanup(ctx, w, fn);
 }
 
