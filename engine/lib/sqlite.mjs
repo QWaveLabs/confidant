@@ -3,7 +3,7 @@
 // .confidant/tmp and read the copy. That avoids locking Messages or WhatsApp
 // and works under the Codex sandbox, which blocks writing -shm in place.
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, existsSync, openSync, closeSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, openSync, closeSync, rmSync, constants } from 'node:fs';
 import { basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ensureDir } from './files.mjs';
@@ -29,9 +29,11 @@ export function openSourceCopy(srcPath, tmpRoot) {
   }
   const dir = ensureDir(join(tmpRoot, `copy-${randomUUID().slice(0, 8)}`));
   const dest = join(dir, basename(srcPath));
-  copyFileSync(srcPath, dest);
+  // COPYFILE_FICLONE makes an instant APFS clone when possible and falls back
+  // to a normal copy, so a multi-gigabyte chat.db costs nothing to snapshot.
+  copyFileSync(srcPath, dest, constants.COPYFILE_FICLONE);
   for (const suffix of ['-wal', '-shm']) {
-    if (existsSync(srcPath + suffix)) copyFileSync(srcPath + suffix, dest + suffix);
+    if (existsSync(srcPath + suffix)) copyFileSync(srcPath + suffix, dest + suffix, constants.COPYFILE_FICLONE);
   }
   const db = new DatabaseSync(dest);
   return {

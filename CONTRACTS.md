@@ -190,7 +190,7 @@ export async function extract(ctx, { cursor, limit }) { return { records, cursor
 
 ```js
 export function filterRecord(record, config) { return { keep: boolean, reason?: string } }
-export function scrubText(text) { return { text, redactions } }  // cards (Luhn), IBAN, SSN, one-time codes, "password: x"
+export function scrubText(text) { return { text, redactions } }  // redactions: array of type strings ('card','iban','ssn','code','password')
 export function emailQuery(config) { return string }               // Gmail search suffix for the gmail app recipe (C uses it)
 ```
 

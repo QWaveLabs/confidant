@@ -196,21 +196,13 @@ test('an item that makes the mapper throw is counted invalid, and the run still 
   assert.equal(out.inserted, 1);
 });
 
-test('privacy.filterRecord is honored when engine/privacy.mjs exists', async () => {
-  const privacyPath = new URL('../engine/privacy.mjs', import.meta.url);
-  const { writeFileSync: write, existsSync, unlinkSync } = await import('node:fs');
-  const alreadyExists = existsSync(privacyPath);
-  if (!alreadyExists) write(privacyPath, "export function filterRecord(record) { return { keep: !/exclude/i.test(record.title ?? '') }; }\n");
-  try {
-    const item = { id: 'msg3', subject: 'please exclude me', from: 'owner@example.com', body: 'x' };
-    const ctx = fakeCtx({});
-    const path = tempFile(JSON.stringify([item]));
-    const { out } = await run1(ctx, { source: 'gmail', file: path });
-    assert.equal(out.excluded, 1);
-    assert.equal(out.inserted, 0);
-  } finally {
-    if (!alreadyExists) unlinkSync(privacyPath);
-  }
+test('privacy.filterRecord is honored: an excluded keyword keeps the email out', async () => {
+  const item = { id: 'msg3', subject: 'please exclude me', from: 'owner@example.com', body: 'x' };
+  const ctx = fakeCtx({ config: { exclusions: { keywords: ['exclude me'] } } });
+  const path = tempFile(JSON.stringify([item]));
+  const { out } = await run1(ctx, { source: 'gmail', file: path });
+  assert.equal(out.excluded, 1);
+  assert.equal(out.inserted, 0);
 });
 
 test('--cursor-key stores the given --cursor-value in the store cursors', async () => {

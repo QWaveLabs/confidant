@@ -184,6 +184,10 @@
           "since": {
             "type": "string",
             "format": "date-time"
+          },
+          "dictations": {
+            "type": "boolean",
+            "$comment": "wispr only: also import dictation history (default off)"
           }
         }
       }
