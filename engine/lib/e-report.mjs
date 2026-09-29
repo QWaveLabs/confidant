@@ -60,3 +60,16 @@ export function folderRows(ctx) {
     count: countMarkdown(join(ctx.vault, folderName(key, ctx.lang))),
   }));
 }
+
+// The four real numbers behind the welcome guide's summary strip: how many
+// sources are actually connected (not just enabled or planned), how many
+// notes exist across every folder, and whether the backlog sort is done.
+export function summaryStats(ctx) {
+  const sources = sourceRows(ctx);
+  const folders = folderRows(ctx);
+  return {
+    sourcesConnected: sources.filter((s) => s.status === 'connected').length,
+    notesWritten: folders.reduce((sum, f) => sum + f.count, 0),
+    backlogDone: !!ctx.state?.backlog?.done,
+  };
+}

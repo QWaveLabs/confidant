@@ -34,6 +34,6 @@ test('buildStatus reads real source counts, folder counts, backlog and tasks fro
   assert.equal(status.lastUpdate.inserted, 12);
   const weekly = status.agents.find((a) => a.key === 'weekly_review');
   assert.equal(weekly.scheduled, true);
-  assert.equal(weekly.cadence, 'Fridays at 15:00');
+  assert.equal(weekly.cadence, 'Fridays at 3:00 PM');
   ctx.close();
 });

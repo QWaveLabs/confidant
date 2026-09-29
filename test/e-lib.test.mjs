@@ -68,29 +68,45 @@ test('trust detection only looks inside the matching [projects."..."] table', ()
   assert.equal(hasTrustedProject(text, '/c'), false);
 });
 
-test('describeRrule reads the standard task shapes in both languages', () => {
+test('describeRrule reads the standard task shapes in both languages, always in 12-hour time', () => {
   assert.equal(describeRrule('FREQ=HOURLY;INTERVAL=3'), 'Every 3 hours, on the hour');
-  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=45'), 'Weekdays at 06:45');
-  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0'), 'Fridays at 15:00');
-  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=0', 'es'), 'Lunes a viernes a las 16:00');
-  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0', 'es'), 'los viernes a las 15:00');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=45'), 'Weekdays at 6:45 AM');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0'), 'Fridays at 3:00 PM');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=0', 'es'), 'Lunes a viernes a las 4:00 p. m.');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=FR;BYHOUR=15;BYMINUTE=0', 'es'), 'los viernes a las 3:00 p. m.');
   assert.equal(describeRrule('garbage'), 'garbage', 'an unrecognized rule shows verbatim rather than throwing');
 });
 
-test('agentRows prefers a real created task over the default cadence', () => {
+test('describeRrule derives an "every N hours" sentence from a full-week multi-hour rrule, minute included', () => {
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=0,3,6,9,12,15,18,21;BYMINUTE=10'), 'Every 3 hours, 10 minutes past the hour');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=0,3,6,9,12,15,18,21;BYMINUTE=0'), 'Every 3 hours, on the hour');
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR=0,3,6,9,12,15,18,21;BYMINUTE=10', 'es'), 'Cada 3 horas, 10 minutos después de la hora');
+});
+
+test('describeRrule spells out a short weekday multi-hour cadence and ranges a long contiguous one', () => {
+  assert.equal(describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7,12;BYMINUTE=30'), 'Weekdays, checking at 7:30 AM and 12:30 PM');
+  assert.equal(
+    describeRrule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7,8,9,10,11,12,13,14,15,16;BYMINUTE=30'),
+    'Weekdays, checking every hour from 7:30 AM to 4:30 PM',
+  );
+});
+
+test('agentRows prefers a real created task over tasks.mjs\'s computed spec', () => {
   const config = { briefTime: '07:00' };
   const withoutTasks = agentRows(config, { tasks: [] }, 'en');
   assert.equal(withoutTasks.length, AGENT_KEYS.length);
   const morning = withoutTasks.find((a) => a.key === 'morning_brief');
   assert.equal(morning.scheduled, false);
-  assert.equal(morning.cadence, 'Weekdays at 07:00');
+  assert.equal(morning.cadence, 'Weekdays at 7:00 AM');
   assert.equal(morning.name, 'Morning Chief of Staff');
+  const brainUpdate = withoutTasks.find((a) => a.key === 'brain_update');
+  assert.match(brainUpdate.cadence, /^Every 3 hours, \d+ minutes past the hour$/, 'brain_update runs at a fixed minute past the hour, not "on the hour"');
 
   const state = { tasks: [{ key: 'morning_brief', name: 'Morning Chief of Staff', rrule: 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=6;BYMINUTE=30', automation_id: 'abc' }] };
   const withTask = agentRows(config, state, 'en');
   const morning2 = withTask.find((a) => a.key === 'morning_brief');
   assert.equal(morning2.scheduled, true);
-  assert.equal(morning2.cadence, 'Weekdays at 06:30', 'uses the real created rrule, not the default brief time');
+  assert.equal(morning2.cadence, 'Weekdays at 6:30 AM', 'uses the real created rrule, not the computed default brief time');
 });
 
 test('sourceRows aggregates store counts per source and folderRows counts real files', () => {

@@ -3,6 +3,15 @@
   "tagline": "Lo recuerda todo y lo guarda bien.",
   "subtitle": "Tu segundo cerebro privado ya está configurado en esta Mac. Esto es lo que hace y cómo usarlo.",
   "supportLine": "¿Dudas? Escribe a {email}.",
+  "stats": {
+    "sourcesConnected": "Fuentes conectadas",
+    "notesWritten": "Notas escritas",
+    "nextBrief": "Próximo resumen matutino",
+    "nextBriefNone": "Aún no programado",
+    "history": "Historial",
+    "stillFilling": "Aún llenando tu historial anterior",
+    "caughtUp": "Historial al día"
+  },
   "sections": {
     "whatItIs": {
       "heading": "Qué es",

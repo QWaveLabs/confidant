@@ -7,17 +7,25 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJson, writeFileAtomic } from './lib/files.mjs';
-import { REPO_ROOT } from './lib/paths.mjs';
+import { REPO_ROOT, HOME } from './lib/paths.mjs';
 import { t, fill } from './lib/i18n.mjs';
-import { escapeHtml, renderTemplate } from './lib/e-html.mjs';
-import { sourceRows, folderRows } from './lib/e-report.mjs';
+import { escapeHtml, renderTemplate, brandSvg, faviconLink } from './lib/e-html.mjs';
+import { sourceRows, folderRows, summaryStats } from './lib/e-report.mjs';
 import { agentRows } from './lib/e-agents.mjs';
+import { nextWeeklyTime } from './lib/e-rrule.mjs';
 
 const GUIDE_FILENAME = { en: 'Confidant Guide.html', es: 'Guía de Confidant.html' };
 
 function loadPersona(role) {
   if (!role) return null;
   return readJson(join(REPO_ROOT, 'personas', `${role}.json`), null);
+}
+
+// The vault path as shown to the person: home replaced with ~, the way
+// they'd type it themselves. The Obsidian link still uses the real
+// absolute path; only display text is shortened.
+function displayPath(p) {
+  return p && p.startsWith(HOME) ? `~${p.slice(HOME.length)}` : p;
 }
 
 function formatDate(iso, lang) {
@@ -37,14 +45,31 @@ function card(inner) {
   return `      <div class="card">\n${inner}\n      </div>`;
 }
 
-function buildAgentsSection(tr, config, state, lang) {
-  const rows = agentRows(config, state, lang);
+function buildAgentsSection(tr, rows) {
   const items = rows.map((a) => card(
     `        <div class="row"><span class="label">${escapeHtml(a.name)}</span><span class="meta">${escapeHtml(a.scheduled ? a.cadence : tr('sections.whatItDoes.notScheduledYet'))}</span></div>\n` +
     (a.scheduled ? '' : `        <p class="small">${escapeHtml(fill(tr('sections.whatItDoes.planned'), { cadence: a.cadence }))}</p>\n`) +
     `        <p class="muted">${escapeHtml(a.blurb)}</p>`,
   )).join('\n');
   return section(tr('sections.whatItDoes.heading'), items);
+}
+
+// A compact strip of real numbers under the title: sources connected, notes
+// written, when the next morning brief runs, and whether the backlog sort
+// is still filling in. Every value comes from the store, state.json or the
+// real (or about-to-be-real) task schedule; nothing here is a placeholder.
+function buildStats(tr, ctx, rows) {
+  const stats = summaryStats(ctx);
+  const morningBrief = rows.find((a) => a.key === 'morning_brief');
+  const nextBrief = morningBrief?.rrule ? nextWeeklyTime(morningBrief.rrule, { now: ctx.now, tz: ctx.tz, lang: ctx.lang }) : null;
+  const items = [
+    { value: String(stats.sourcesConnected), label: tr('stats.sourcesConnected') },
+    { value: String(stats.notesWritten), label: tr('stats.notesWritten') },
+    { value: nextBrief ?? tr('stats.nextBriefNone'), label: tr('stats.nextBrief') },
+    { value: stats.backlogDone ? tr('stats.caughtUp') : tr('stats.stillFilling'), label: tr('stats.history') },
+  ];
+  const tiles = items.map((i) => `      <div class="stat"><span class="stat-value">${escapeHtml(i.value)}</span><span class="stat-label">${escapeHtml(i.label)}</span></div>`).join('\n');
+  return `    <div class="stats">\n${tiles}\n    </div>`;
 }
 
 function buildHowItWorks(tr) {
@@ -59,7 +84,7 @@ function buildHowItWorks(tr) {
 
 function buildHowToUse(tr, ctx, briefsFolderName) {
   const obsidianLink = `obsidian://open?path=${encodeURIComponent(ctx.vault)}`;
-  const obsidian = fill(tr('sections.howToUse.obsidian'), { link: `<a href="${escapeHtml(obsidianLink)}">${escapeHtml(ctx.vault)}</a>` });
+  const obsidian = fill(tr('sections.howToUse.obsidian'), { link: `<a href="${escapeHtml(obsidianLink)}">${escapeHtml(displayPath(ctx.vault))}</a>` });
   const briefs = fill(tr('sections.howToUse.briefs'), { folder: `<code>${escapeHtml(briefsFolderName)}</code>` });
   const examples = tr('sections.howToUse.examples').map((q) => `        <li>&ldquo;${escapeHtml(q)}&rdquo;</li>`).join('\n');
   const inner = card(
@@ -120,7 +145,7 @@ function buildPrivacy(tr, trInstall, ctx) {
     ? `        <ul>\n${bits.map((b) => `          <li>${escapeHtml(b)}</li>`).join('\n')}\n        </ul>`
     : `        <p class="muted">${escapeHtml(tr('sections.privacy.neverSeesEmpty'))}</p>`;
   const inner = `${card(`        <p class="label">${escapeHtml(tr('sections.privacy.neverSees'))}</p>\n${neverSees}`)}\n` +
-    `${card(`        <p class="label">${escapeHtml(tr('sections.privacy.whereItLives'))}</p>\n        <p>${escapeHtml(fill(tr('sections.privacy.whereItLivesBody'), { vault: ctx.vault }))}</p>`)}\n` +
+    `${card(`        <p class="label">${escapeHtml(tr('sections.privacy.whereItLives'))}</p>\n        <p>${escapeHtml(fill(tr('sections.privacy.whereItLivesBody'), { vault: displayPath(ctx.vault) }))}</p>`)}\n` +
     `${card(`        <p class="label">${escapeHtml(tr('sections.privacy.control'))}</p>\n        <p>${escapeHtml(tr('sections.privacy.controlBody'))}</p>`)}`;
   return section(tr('sections.privacy.heading'), inner);
 }
@@ -139,9 +164,10 @@ export function renderGuide(ctx) {
   const trInstall = t('install', lang);
   const persona = loadPersona(ctx.config?.role);
   const briefsFolderName = folderRows(ctx).find((f) => f.key === 'briefs')?.name ?? 'Briefs';
+  const rows = agentRows(ctx.config, ctx.state, lang);
 
   const body = [
-    buildAgentsSection(tr, ctx.config, ctx.state, lang),
+    buildAgentsSection(tr, rows),
     buildHowItWorks(tr),
     buildHowToUse(tr, ctx, briefsFolderName),
     buildConnected(tr, trInstall, ctx),
@@ -155,9 +181,12 @@ export function renderGuide(ctx) {
   const title = tr('title');
   const html = renderTemplate(shell, {
     lang,
+    favicon: faviconLink(brandSvg()),
+    logo: brandSvg({ size: 34 }),
     title: escapeHtml(title),
     tagline: escapeHtml(tr('tagline')),
     subtitle: escapeHtml(tr('subtitle')),
+    stats: buildStats(tr, ctx, rows),
     body,
     supportLine: escapeHtml(fill(tr('supportLine'), { email: 'support@meetconfidant.com' })),
   });
