@@ -192,7 +192,7 @@ way.
    - next steps: open Obsidian, check the Scheduled view in the ChatGPT
      app tomorrow morning, and keep the Mac on and ChatGPT open so the
      agents can run; and
-   - "Questions? Email support@meetconfidant.com."
+   - "Questions? Email support@qwavelabs.io."
 
 Only ever report real, verified status. `bin/confidant status --json`
 gives you the same numbers the guide shows, if you want to double check

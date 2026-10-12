@@ -208,7 +208,7 @@ function supportMailtoLink(tr, ctx) {
     : [`Version: ${d.version}`, `macOS: ${d.macos}`, `Sources connected: ${d.sourcesConnected}`, `Last update: ${d.lastUpdateAge}`, `Known issues: ${d.issues}`];
   const subject = tr('sections.troubleshooting.emailSubject');
   const body = `${tr('sections.troubleshooting.emailBody')}\n\n${lines.join('\n')}`;
-  return `mailto:support@meetconfidant.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return `mailto:support@qwavelabs.io?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 function buildTroubleshooting(tr, ctx) {
@@ -255,7 +255,7 @@ export function renderGuide(ctx) {
     subtitle: escapeHtml(tr('subtitle')),
     stats: buildStats(tr, ctx, rows),
     body,
-    supportLine: escapeHtml(fill(tr('supportLine'), { email: 'support@meetconfidant.com' })),
+    supportLine: escapeHtml(fill(tr('supportLine'), { email: 'support@qwavelabs.io' })),
   });
   const filename = GUIDE_FILENAME[lang] ?? GUIDE_FILENAME.en;
   return { html, path: join(ctx.vault, filename), title };
