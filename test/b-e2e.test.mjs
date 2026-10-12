@@ -243,7 +243,7 @@ test('end to end: install, three hours later, and Spanish', async () => {
   // nine folder index notes; accept the count with or without them.
   assert.ok(new RegExp(`<span class="stat-value">(${noteCount}|${noteCount - 9})</span>`).test(guide), `real note count (${noteCount})`);
   assert.ok(/7:30/.test(guide), 'task times from the brief time');
-  assert.ok(guide.includes('support@meetconfidant.com'));
+  assert.ok(guide.includes('support@qwavelabs.io'));
 
   // ---- three hours later ----
   const before = { people: notesIn(vault, 'People'), commitments: notesIn(vault, 'Commitments') };

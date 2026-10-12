@@ -21,7 +21,7 @@
 // Rate limited locally (3 sends a day, 10 a month, tracked in
 // state.support.sent) on top of whatever limit the server enforces. On a
 // network failure, a 429, or a local rate limit, this prints a ready
-// mailto:support@meetconfidant.com link with the same text instead of
+// mailto:support@qwavelabs.io link with the same text instead of
 // failing outright.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,7 +30,7 @@ import { HOME, REPO_ROOT } from './lib/paths.mjs';
 import { scrubText } from './privacy.mjs';
 
 const REPORT_URL = 'https://meetconfidant.com/api/confidant/report';
-const SUPPORT_EMAIL = 'support@meetconfidant.com';
+const SUPPORT_EMAIL = 'support@qwavelabs.io';
 const DAILY_LIMIT = 3;
 const MONTHLY_LIMIT = 10;
 const MONTH_MS = 31 * 24 * 3600 * 1000;

@@ -202,7 +202,7 @@ test('a local rate limit hit falls back to a mailto link and never calls the net
   assert.equal(fetchImpl.calls.length, 0);
   const out = ctx.log.out_.at(-1);
   assert.equal(out.sent, false);
-  assert.match(out.mailto, /^mailto:support@meetconfidant\.com\?subject=/);
+  assert.match(out.mailto, /^mailto:support@qwavelabs\.io\?subject=/);
   assert.match(out.mailto, /still%20broken|still\+broken/, 'the message text is present in the mailto body');
 });
 

@@ -22,7 +22,7 @@ Codex clones this repo (pinned tag + SHA) and follows `AGENTS.md` and
    newest first.
 5. It creates the scheduled tasks (ACTIVE) and sets up the sandbox, trust,
    wake schedule and login item. It writes `Confidant Guide.html`, then
-   summarizes in chat with next steps and support@meetconfidant.com.
+   summarizes in chat with next steps and support@qwavelabs.io.
 
 **An install never writes into a second brain it did not create.** If the
 default folder exists, `planNewVaultPath()` picks "Second Brain 2", "3", and
@@ -340,7 +340,7 @@ export async function promptForKey(name, label) { return boolean }  // hidden ma
 - **Cleanup (B).** `confidant cleanup --plan --json` lists: exact duplicates (same handle or fingerprint), probable duplicates (name similarity plus shared company or participants), broken wikilinks, commitments later marked done in newer records, projects with no activity in 30 days, sensitive strings that `scrubText` would now catch. `cleanup --apply` applies only the safe ones (exact duplicates, broken links to renamed notes, scrub, index rebuild) with a backup run id; probable duplicates go to the review queue.
 - **Health (D).** `confidant health --json`: last successful update age, each source's readability and last cursor move, key validity (probe), disk space, backlog progress, vault writable. Each problem comes with a plain fix.
 - **Usage (D).** `confidant usage --json`: counts only, never content. Briefs written and whether their scheduled runs were opened (Codex `inbox_items` read state for this vault's tasks, read-only from `~/.codex/sqlite/codex-dev.db`), notes opened recently (`.obsidian/workspace.json` lastOpenFiles), questions asked in the vault project this week (session count), and value delivered (commitments tracked, meetings prepped, opportunities flagged, follow-ups caught). Every read is defensive: missing or changed files give nulls, never errors.
-- **Support and feedback (C).** `confidant support --kind support|feedback --message-file <path> [--include-diagnostics]` prints a preview of exactly what would be sent. `--send --yes` sends it. Diagnostics are doctor + health + status counts; they never include message content, contacts, file names from sources or keys. Rate limits: 3 sends a day and 10 a month per install (state.support.sent), and the server enforces its own. It posts JSON to `https://meetconfidant.com/api/confidant/report` with `{ install_id, kind, message, diagnostics, version, language }`. If the network fails, it prints a `mailto:support@meetconfidant.com` link with the same text. `install_id` is a random id created at init (config.installId). Codex sends only when the person explicitly asks, after showing the preview.
+- **Support and feedback (C).** `confidant support --kind support|feedback --message-file <path> [--include-diagnostics]` prints a preview of exactly what would be sent. `--send --yes` sends it. Diagnostics are doctor + health + status counts; they never include message content, contacts, file names from sources or keys. Rate limits: 3 sends a day and 10 a month per install (state.support.sent), and the server enforces its own. It posts JSON to `https://meetconfidant.com/api/confidant/report` with `{ install_id, kind, message, diagnostics, version, language }`. If the network fails, it prints a `mailto:support@qwavelabs.io` link with the same text. `install_id` is a random id created at init (config.installId). Codex sends only when the person explicitly asks, after showing the preview.
 
 ## State (.confidant/state.json)
 

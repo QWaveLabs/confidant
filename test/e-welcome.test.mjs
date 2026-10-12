@@ -101,7 +101,7 @@ test('the "Email the Confidant team" button is a mailto link with a short, sanit
   assert.ok(m, 'the email button is present');
   assert.equal(m[2], 'Email the Confidant team');
   const mailto = m[1].replace(/&amp;/g, '&');
-  assert.match(mailto, /^mailto:support@meetconfidant\.com\?subject=/);
+  assert.match(mailto, /^mailto:support@qwavelabs\.io\?subject=/);
   const body = decodeURIComponent(mailto.split('body=')[1]);
   assert.match(body, /Version: /);
   assert.match(body, /macOS: /);
@@ -141,13 +141,13 @@ test('renders the "What it is" intro section (i18n/welcome.*.json defines it; it
 test('includes the support email and picks the right filename per language', () => {
   const en = fixtureVault({ lang: 'en' });
   const guideEn = renderGuide(en);
-  assert.match(guideEn.html, /support@meetconfidant\.com/);
+  assert.match(guideEn.html, /support@qwavelabs\.io/);
   assert.equal(guideEn.path.endsWith('Confidant Guide.html'), true);
   en.close();
 
   const es = fixtureVault({ lang: 'es' });
   const guideEs = renderGuide(es);
-  assert.match(guideEs.html, /support@meetconfidant\.com/);
+  assert.match(guideEs.html, /support@qwavelabs\.io/);
   assert.equal(guideEs.path.endsWith('Guía de Confidant.html'), true);
   assert.match(guideEs.html, /Confidant ya está instalado/);
   es.close();
