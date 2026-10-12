@@ -20,6 +20,7 @@
     "test:qwa-146": "node --test test/approved-record-compiler.test.mjs",
     "test:qwa-147": "node --test test/whatsapp-snapshot.test.mjs",
     "test:qwa-149": "node --test test/source-status.test.mjs",
+    "test:qwa-151": "node --test test/qwa-support-escalation.test.mjs",
     "proof:qwa-149": "node scripts/export-qwa-149-source-status-proof.mjs"
   }
 }

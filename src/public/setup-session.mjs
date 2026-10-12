@@ -8,6 +8,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+import {
+  buildSanitizedQWaveSupportReport,
+  deliverQWaveSupportReport,
+  sanitizeSupportEnvironment
+} from "../support/qwave-support-escalation.mjs";
 
 export const SETUP_STAGES = Object.freeze([
   "environment",
@@ -30,6 +35,8 @@ const DEFAULTS = Object.freeze({
 
 const OFFICIAL_OBSIDIAN_DOWNLOAD_URL = "https://obsidian.md/download";
 const OFFICIAL_INSTALL_APPROVAL = "approve-official-obsidian-install";
+export const SUPPORT_SAFE_REPAIR_ATTEMPT_LIMIT = 2;
+export const CONTACT_QWAVE_SUPPORT_ACTION = "contact-qwave-support";
 
 class CustomerVisibleError extends Error {
   constructor(code, customerMessage) {
@@ -106,6 +113,159 @@ function isoNow(clock) {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
+function isPlainRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function defaultSupportState() {
+  return {
+    environment: sanitizeSupportEnvironment(),
+    repair: null,
+    escalation: null
+  };
+}
+
+/**
+ * Support state is deliberately separate from the ordinary blocker. The
+ * blocker remains local customer-facing setup state; this record contains
+ * only bounded facts that are permitted to enter a QWave support report.
+ */
+function ensureSupportState(state) {
+  let changed = false;
+  if (!isPlainRecord(state.support)) {
+    state.support = defaultSupportState();
+    changed = true;
+  }
+  if (!isPlainRecord(state.support.environment)) {
+    state.support.environment = sanitizeSupportEnvironment();
+    changed = true;
+  } else {
+    const sanitizedEnvironment = sanitizeSupportEnvironment(state.support.environment);
+    if (
+      sanitizedEnvironment.macOSVersion !== state.support.environment.macOSVersion
+      || sanitizedEnvironment.architecture !== state.support.environment.architecture
+      || sanitizedEnvironment.timezone !== state.support.environment.timezone
+    ) {
+      state.support.environment = sanitizedEnvironment;
+      changed = true;
+    }
+  }
+  if (!(state.support.repair === null || isPlainRecord(state.support.repair))) {
+    state.support.repair = null;
+    changed = true;
+  }
+  if (!(state.support.escalation === null || isPlainRecord(state.support.escalation))) {
+    state.support.escalation = null;
+    changed = true;
+  }
+  return changed;
+}
+
+function safeBlockerFingerprint(blocker) {
+  const stage = SETUP_STAGES.includes(blocker?.stage) ? blocker.stage : "environment";
+  const code = typeof blocker?.code === "string" && /^[A-Z0-9_]{3,80}$/.test(blocker.code)
+    ? blocker.code
+    : "SAFE_RETRY_REQUIRED";
+  return `${stage}:${code}`;
+}
+
+function recordSafeRepairFailure(state, blocker, clock) {
+  ensureSupportState(state);
+  const fingerprint = safeBlockerFingerprint(blocker);
+  const previous = state.support.repair;
+  const attempts = previous?.fingerprint === fingerprint && Number.isInteger(previous.attempts)
+    ? Math.min(previous.attempts + 1, 99)
+    : 1;
+  state.support.repair = {
+    fingerprint,
+    stage: blocker.stage,
+    code: blocker.code,
+    attempts,
+    safeActions: [{ id: "resume-blocked-setup-stage", outcome: "failed" }],
+    lastAttemptedAt: isoNow(clock)
+  };
+  return state.support.repair;
+}
+
+function clearResolvedSupportRepair(state, stage) {
+  ensureSupportState(state);
+  if (state.support.repair?.stage === stage) {
+    state.support.repair = null;
+  }
+}
+
+async function escalateQWaveSupport(state, { adapters, clock, reason }) {
+  ensureSupportState(state);
+  const blocker = state.blocker;
+  if (!blocker) return null;
+
+  const fingerprint = safeBlockerFingerprint(blocker);
+  const previous = state.support.escalation;
+  if (previous?.fingerprint === fingerprint && previous.delivery?.status === "sent") {
+    return previous;
+  }
+
+  const report = buildSanitizedQWaveSupportReport({
+    installationId: state.installationId,
+    environment: state.support.environment,
+    blocker,
+    repairAttempts: state.support.repair?.attempts ?? 1,
+    clock
+  });
+  const delivery = await deliverQWaveSupportReport({
+    relay: adapters.support,
+    report,
+    clock
+  });
+  const priorAttempts = previous?.fingerprint === fingerprint && Number.isInteger(previous.delivery?.attempts)
+    ? previous.delivery.attempts
+    : 0;
+  state.support.escalation = {
+    fingerprint,
+    reason: reason === "customer-requested" ? "customer-requested" : "safe-repairs-exhausted",
+    report,
+    localReportRetainedAt: isoNow(clock),
+    delivery: {
+      status: delivery.status,
+      code: delivery.code,
+      attemptedAt: delivery.attemptedAt,
+      attempts: priorAttempts + 1
+    }
+  };
+  return state.support.escalation;
+}
+
+function publicSupportStatus(state) {
+  const escalation = state.support?.escalation;
+  const activeFingerprint = state.status === "blocked"
+    ? safeBlockerFingerprint(state.blocker)
+    : null;
+  if (!escalation?.report || escalation.fingerprint !== activeFingerprint) {
+    return {
+      status: "not-requested",
+      deliveryVerified: false,
+      localReportRetained: false,
+      message: null
+    };
+  }
+
+  const delivered = escalation.delivery?.status === "sent";
+  return {
+    status: delivered ? "sent" : "delivery-unverified",
+    deliveryVerified: delivered,
+    localReportRetained: true,
+    message: delivered
+      ? "I sent a sanitized setup report to QWave support. It did not include your source content, contacts, prompts, credentials, or local file paths."
+      : "I saved a sanitized setup report locally, but I could not verify delivery to QWave support. Your completed setup progress is still saved."
+  };
+}
+
+function isExplicitSupportRequest({ message, action }) {
+  if (action?.kind === CONTACT_QWAVE_SUPPORT_ACTION) return true;
+  if (typeof message !== "string") return false;
+  return /\b(?:contact|email|send|notify)\s+(?:qwave\s+)?support\b/i.test(message);
+}
+
 function defaultInstallationId() {
   return `qsb-${randomUUID()}`;
 }
@@ -132,7 +292,7 @@ function buildInitialState({ message, answers = {}, decisions = {}, clock, insta
   const now = isoNow(clock);
 
   return {
-    version: 2,
+    version: 3,
     installationId: (installationIdFactory ?? defaultInstallationId)(),
     status: "active",
     stage: "bootstrap",
@@ -150,6 +310,7 @@ function buildInitialState({ message, answers = {}, decisions = {}, clock, insta
     pendingAction: null,
     vault: null,
     blocker: null,
+    support: defaultSupportState(),
     stageOutputs: {
       bootstrap: {
         stage: "bootstrap",
@@ -205,6 +366,14 @@ function upgradeStateForObsidianHandoff(state, clock) {
       state.status = "active";
       state.stage = state.completedStages.at(-1) ?? "bootstrap";
     }
+    changed = true;
+  }
+
+  if (ensureSupportState(state)) {
+    changed = true;
+  }
+  if ((state.version ?? 1) < 3) {
+    state.version = 3;
     changed = true;
   }
 
@@ -278,6 +447,8 @@ function buildStatusContent(state) {
 
 async function runEnvironmentStage(state, adapters, clock) {
   const environment = await adapters.environment.inspect();
+  ensureSupportState(state);
+  state.support.environment = sanitizeSupportEnvironment(environment);
   if (!environment?.supported) {
     throw new CustomerVisibleError(
       environment?.code ?? "UNSUPPORTED_ENVIRONMENT",
@@ -575,6 +746,7 @@ async function runPendingStages(state, { adapters, stateStore, clock, stopAfterS
       if (stage === "foundation") await runFoundationStage(state, clock);
       if (stage === "vault") await runVaultStage(state, adapters, clock);
       if (stage === "validation") await runValidationStage(state, adapters, clock);
+      clearResolvedSupportRepair(state, stage);
       await stateStore.save(state);
     } catch (error) {
       if (error instanceof CustomerActionRequired) {
@@ -600,6 +772,19 @@ async function runPendingStages(state, { adapters, stateStore, clock, stopAfterS
         message: customerError.customerMessage,
         recordedAt: isoNow(clock)
       };
+      const repair = recordSafeRepairFailure(state, state.blocker, clock);
+      // An automatic handoff is bounded to one attempt for this blocker. If
+      // delivery cannot be verified, ordinary setup retries retain that local
+      // fallback instead of repeatedly sending in the background. A customer
+      // can still explicitly ask QWave support to retry later.
+      const alreadyEscalatedForThisBlocker = state.support.escalation?.fingerprint === repair.fingerprint;
+      if (repair.attempts >= SUPPORT_SAFE_REPAIR_ATTEMPT_LIMIT && !alreadyEscalatedForThisBlocker) {
+        await escalateQWaveSupport(state, {
+          adapters,
+          clock,
+          reason: "safe-repairs-exhausted"
+        });
+      }
       state.updatedAt = isoNow(clock);
       await stateStore.save(state);
       return state;
@@ -626,20 +811,29 @@ function publicTranscript(state) {
 
 function toPublicView(state) {
   const waitingForCustomerAction = state.status === "waiting_for_approval" || state.status === "waiting_for_customer_action";
+  const support = publicSupportStatus(state);
   const latest = waitingForCustomerAction
     ? state.pendingAction
     : state.status === "blocked"
-    ? { message: state.blocker.message, progress: `${state.completedStages.length} of ${SETUP_STAGES.length} setup steps complete` }
+    ? {
+      message: [state.blocker?.message, support.message].filter(Boolean).join(" "),
+      progress: `${state.completedStages.length} of ${SETUP_STAGES.length} setup steps complete`
+    }
     : state.stageOutputs[state.stage] ?? state.stageOutputs.bootstrap;
-  const nextAction = state.status === "complete"
-    ? "Ask a normal question in this same conversation whenever you want to continue."
-    : state.status === "waiting_for_approval"
-      ? "Review the single official installation request above. Approve it here only if you want to continue."
-      : state.status === "waiting_for_customer_action"
-        ? "Complete the one official action above, then tell me to continue setting up your second brain."
-    : state.status === "blocked"
-      ? "Your completed progress is saved. Resolve the one issue above, then tell me to continue setting up your second brain."
-      : "Your progress is saved. Tell me to continue setting up your second brain when you are ready.";
+  let nextAction = "Your progress is saved. Tell me to continue setting up your second brain when you are ready.";
+  if (state.status === "complete") {
+    nextAction = "Ask a normal question in this same conversation whenever you want to continue.";
+  } else if (state.status === "waiting_for_approval") {
+    nextAction = "Review the single official installation request above. Approve it here only if you want to continue.";
+  } else if (state.status === "waiting_for_customer_action") {
+    nextAction = "Complete the one official action above, then tell me to continue setting up your second brain.";
+  } else if (state.status === "blocked" && support.status === "sent") {
+    nextAction = "QWave support has the sanitized report. Resolve the one issue above, then tell me to continue setting up your second brain.";
+  } else if (state.status === "blocked" && support.status === "delivery-unverified") {
+    nextAction = "The sanitized support report is saved locally, but delivery is unverified. Resolve the one issue above, then tell me to continue setting up your second brain.";
+  } else if (state.status === "blocked") {
+    nextAction = "Your completed progress is saved. Resolve the one issue above, then tell me to continue setting up your second brain.";
+  }
 
   return {
     setupSession: {
@@ -649,7 +843,12 @@ function toPublicView(state) {
       progress: latest.progress,
       message: latest.message,
       nextAction,
-      pendingAction: waitingForCustomerAction ? structuredClone(state.pendingAction) : null
+      pendingAction: waitingForCustomerAction ? structuredClone(state.pendingAction) : null,
+      support: {
+        status: support.status,
+        deliveryVerified: support.deliveryVerified,
+        localReportRetained: support.localReportRetained
+      }
     },
     savedSetup: {
       answers: { ...state.answers },
@@ -685,6 +884,17 @@ async function execute({ message, stateStore, adapters, answers, decisions, acti
     }
   }
 
+  if (state.status === "blocked" && state.blocker && isExplicitSupportRequest({ message, action })) {
+    await escalateQWaveSupport(state, {
+      adapters,
+      clock,
+      reason: "customer-requested"
+    });
+    state.updatedAt = isoNow(clock);
+    await stateStore.save(state);
+    return toPublicView(state);
+  }
+
   if (state.status === "complete" && SETUP_STAGES.every((stage) => state.completedStages.includes(stage))) {
     return toPublicView(state);
   }
@@ -708,7 +918,9 @@ export async function startSetupSession(input) {
  * Public entry point for the customer’s normal-language resume request.
  */
 export async function continueSetupSession(input) {
-  assertNaturalLanguageBootstrap(input?.message);
+  if (!isExplicitSupportRequest(input ?? {})) {
+    assertNaturalLanguageBootstrap(input?.message);
+  }
   return execute(input);
 }
 
